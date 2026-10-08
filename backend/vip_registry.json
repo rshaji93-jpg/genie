@@ -1,0 +1,35 @@
+{
+  "valid_codes": [
+    "GENIE-VIP-01",
+    "GENIE-VIP-02",
+    "GENIE-VIP-03",
+    "GENIE-VIP-04",
+    "GENIE-VIP-05",
+    "GENIE-VIP-06",
+    "GENIE-VIP-07",
+    "GENIE-VIP-08",
+    "GENIE-VIP-09",
+    "GENIE-VIP-10"
+  ],
+  "claimed_slots": {
+    "tester@genie.ai": {
+      "code": "DEV-MOCK",
+      "claimed_at": "2026-10-06T09:55:56.752617+00:00"
+    },
+    "user@gmail.com": {
+      "code": "GENIE-FREE",
+      "space": "Personal",
+      "claimed_at": "2026-10-06T10:00:47.112281+00:00"
+    }
+  },
+  "daily_usage": {
+    "tester@genie.ai": {
+      "count": 1,
+      "date": "2026-10-06"
+    },
+    "user@gmail.com": {
+      "count": 3,
+      "date": "2026-10-06"
+    }
+  }
+}
