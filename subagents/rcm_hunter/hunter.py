@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 def load_candidate_profile():
-    profile_path = Path("profile/candidate_profile.json")
+    profile_path = Path(__file__).resolve().parents[2] / "profile" / "candidate_profile.json"
     if profile_path.exists():
         try:
             with open(profile_path, "r", encoding="utf-8") as f:

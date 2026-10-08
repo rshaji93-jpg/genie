@@ -3,12 +3,6 @@ import json
 import re
 from google import genai
 
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY is not set.")
-
-client = genai.Client(api_key=api_key)
-
 # ----------------- SUBORDINATE AGENTS -----------------
 
 def job_hunt_agent(task_description: str):
@@ -39,6 +33,10 @@ Options:
 """
 
 def route_request(user_input: str, previous_id: str | None = None):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY environment variable is not set.")
+    client = genai.Client(api_key=api_key)
     prompt = f"{ROUTING_PROMPT}\nUser input: {user_input}"
     
     kwargs = {
@@ -50,6 +48,31 @@ def route_request(user_input: str, previous_id: str | None = None):
 
     interaction = client.interactions.create(**kwargs)
     return interaction
+
+
+def run_local_agent(task: str) -> dict:
+    text = task.strip()
+    lowered = text.lower()
+    if any(term in lowered for term in ("job", "career", "resume", "application", "hiring")):
+        route = "job_hunter"
+        next_step = "Select Job Hunter to rank the local sample opportunities against your candidate profile."
+    elif any(term in lowered for term in ("apply", "submit", "application status")):
+        route = "apply_runner"
+        next_step = "Select Apply Runner to preview queued applications. Submission remains a user-confirmed local action."
+    elif any(term in lowered for term in ("hub", "lead", "operations", "rcm")):
+        route = "hub"
+        next_step = "Select Hub Operations to score the locally configured RCM opportunity samples."
+    else:
+        route = "manager"
+        next_step = "The request was received by the local Manager Agent. Choose a specialist agent for a targeted workflow."
+    return {
+        "agent_name": "Manager Agent",
+        "status": "completed",
+        "summary": f"Local triage complete. Suggested route: {route}.\n\n{next_step}",
+        "logs": ["Request classified locally; no cloud model was called."],
+        "actions": [{"label": "Select agent", "value": route}],
+    }
+
 
 def main():
     print("=" * 65)
