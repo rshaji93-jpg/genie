@@ -23,7 +23,7 @@ export default function FeedbackModal({ isOpen, onClose, disputeContext }: Feedb
     setIsSubmitting(true);
 
     try {
-      const res = await fetch("http://localhost:8000/api/feedback", {
+      const res = await fetch("/api/py/feedback", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -47,7 +47,7 @@ export default function FeedbackModal({ isOpen, onClose, disputeContext }: Feedb
         onClose();
       }, 2500);
     } catch {
-      alert("Please ensure the backend is active on port 8000.");
+      alert("Unable to submit feedback. Check your connection and try again.");
     } finally {
       setIsSubmitting(false);
     }

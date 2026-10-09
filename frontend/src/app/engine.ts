@@ -28,10 +28,10 @@ export function getBackendBaseUrl(): string {
     (window.location.hostname === "localhost" ||
       window.location.hostname === "127.0.0.1")
   ) {
-    return "http://localhost:8000";
+    return "/api/py";
   }
 
-  return "https://personal-ai-genie.onrender.com";
+  return "/api/py";
 }
 
 export function checkWakeWordTrigger(text: string): boolean {

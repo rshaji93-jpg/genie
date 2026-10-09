@@ -1169,10 +1169,12 @@ function MainChatApp() {
       return;
     }
 
-    const socketBase = API_BASE.replace(/^http/, "ws");
-    const socket = new WebSocket(
-      `${socketBase}/ws/rooms/${encodeURIComponent(roomId)}`
+    const socketUrl = new URL(
+      `${API_BASE}/ws/rooms/${encodeURIComponent(roomId)}`,
+      window.location.origin
     );
+    socketUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(socketUrl);
     roomSocketRef.current = socket;
     readReceiptIdsRef.current.clear();
 
