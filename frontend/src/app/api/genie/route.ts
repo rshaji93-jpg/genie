@@ -143,7 +143,7 @@ export async function POST(request: Request) {
             "Content-Type": "application/json",
             "x-goog-api-key": sanitizedKey,
           },
-          signal: AbortSignal.timeout(30_000),
+          signal: request.signal,
           body: JSON.stringify({
             contents: [
               ...history.map((message) => ({
@@ -157,7 +157,8 @@ export async function POST(request: Request) {
           }),
         }
       );
-    } catch {
+    } catch (error) {
+      if (request.signal.aborted) throw error;
       throw new Error(`Gemini ${model} request failed due to a network error.`);
     }
     if (!response.ok) {
@@ -195,7 +196,7 @@ export async function POST(request: Request) {
           "HTTP-Referer": "https://personal-ai-genie.vercel.app",
           "X-Title": "Personal AI Genie",
         },
-        signal: AbortSignal.timeout(30_000),
+        signal: request.signal,
         body: JSON.stringify({
           model,
           messages: [
@@ -210,7 +211,8 @@ export async function POST(request: Request) {
           max_tokens: 1500,
         }),
       });
-    } catch {
+    } catch (error) {
+      if (request.signal.aborted) throw error;
       throw new Error(`OpenRouter ${model} request failed due to a network error.`);
     }
     if (!response.ok) throw new Error(`OpenRouter ${model} returned HTTP ${response.status}.`);

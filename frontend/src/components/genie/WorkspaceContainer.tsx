@@ -8,6 +8,8 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import Script from "next/script";
 import StudentBanner from "../../components/StudentBanner";
 import UnifiedStudyEngine from "../../components/UnifiedStudyEngine";
+import MessageBubble from "../../components/MessageBubble";
+import VoiceMic from "../../components/VoiceMic";
 import DynamicTeamModal, { type RoomCapacityMode } from "./DynamicTeamModal";
 import HeaderBar from "./HeaderBar";
 import SlideDockDrawer from "./SlideDockDrawer";
@@ -46,8 +48,6 @@ import {
   Key,
   ChevronLeft,
   ChevronRight,
-  Mic,
-  MicOff,
   Send,
   Globe,
   Users,
@@ -89,6 +89,7 @@ import {
   BookOpen,
   CheckSquare,
   Calculator,
+  Square,
 } from "lucide-react";
 
 interface IndianLanguage {
@@ -260,6 +261,7 @@ const THEME_STORAGE_KEY = "genie_workspace_theme";
 const ADMIN_EMAILS = ["rshaji93@gmail.com"];
 const VIP_ALLOWED_EMAILS = ["rshaji93@gmail.com", "manoharlumina@gmail.com", "ratnaraja007@gmail.com"];
 const DEVELOPER_EMAIL = "ratnaraja007@gmail.com";
+const SUPPORT_DISPATCH_EMAIL = process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "support@genie.ai";
 const DAILY_FREE_LIMIT = 20;
 
 interface RoomMember {
@@ -313,6 +315,26 @@ interface Message {
   sender_public_key?: JsonWebKey;
   senderName?: string;
   senderEmail?: string;
+  source?: "gemini-3.8-flash" | "openrouter-fallback" | "backend-manifest" | "cloud_ai" | "local_agent" | "platform_engine";
+  provider?: string;
+  providerModel?: string;
+  autoFallback?: boolean;
+  agentName?: string;
+  agentOutput?: {
+    agent_name: string;
+    status: string;
+    logs: string[];
+    actions: { label: string; value: string }[];
+    results?: {
+      title?: string;
+      company?: string;
+      location?: string;
+      score?: number;
+      verdict?: string;
+      matched_skills?: string[];
+      url?: string;
+    }[];
+  };
   replyTo?: { author: string; content: string };
   triggeredByRainbow?: boolean;
   isIntervention?: boolean;
@@ -329,6 +351,8 @@ interface ChatSession {
   title: string;
   isPinned: boolean;
   messages: Message[];
+  topicId?: string;
+  isSharedArchive?: boolean;
 }
 
 interface TopicChannel {
@@ -414,6 +438,8 @@ function normalizeRoomMessage(raw: Message): Message {
     display_name?: string;
     edited?: boolean;
     deleted?: boolean;
+    agent_name?: string;
+    agent_output?: Message["agentOutput"];
   };
   const senderName = String(wire.sender_name || wire.display_name || wire.senderName || "Room member");
   const role = wire.role === "assistant" || senderName.includes("Personal AI Genie") ? "assistant" : "user";
@@ -427,6 +453,8 @@ function normalizeRoomMessage(raw: Message): Message {
     sender_id: String(wire.sender_id || wire.user_id || ""),
     sender_name: senderName,
     senderName,
+    agentName: wire.agentName || wire.agent_name,
+    agentOutput: wire.agentOutput || wire.agent_output,
     is_edited: Boolean(wire.is_edited || wire.edited),
     is_deleted: Boolean(wire.is_deleted || wire.deleted),
     delivered_to: Array.isArray(wire.delivered_to) ? wire.delivered_to : [],
@@ -633,6 +661,7 @@ function MainChatApp() {
   const [sessions, setSessions] = useState<ChatSession[]>([
     { id: "1", title: "New Session", isPinned: false, messages: [] },
   ]);
+  const [sessionsHydrated, setSessionsHydrated] = useState(false);
   const [topics, setTopics] = useState<TopicChannel[]>([
     { id: "topic_1", title: "General", icon: "💬", messages: [] },
   ]);
@@ -649,6 +678,11 @@ function MainChatApp() {
   const [replyTarget, setReplyTarget] = useState<{ author: string; content: string } | null>(null);
   const [forwardMessage, setForwardMessage] = useState<Message | null>(null);
   const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [shareSessionId, setShareSessionId] = useState<string | null>(null);
+  const [shareInviteSessionId, setShareInviteSessionId] = useState<string | null>(null);
+  const shareTranscriptRef = useRef<Message[] | null>(null);
+  const shareTranscriptOwnerRef = useRef("");
+  const shareTranscriptSentRef = useRef(false);
   const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
 
@@ -661,6 +695,7 @@ function MainChatApp() {
   });
   const [selectedArchiveItems, setSelectedArchiveItems] = useState<Set<string>>(new Set());
   const [isArchiveLoading, setIsArchiveLoading] = useState(false);
+  const [isSavingArchive, setIsSavingArchive] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveStatus, setArchiveStatus] = useState<string | null>(null);
   const [settingsTab, setSettingsTab] = useState<"profile" | "developer" | "totp" | "theme" | "docs" | "blocked">("profile");
@@ -675,12 +710,15 @@ function MainChatApp() {
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingPreview, setStreamingPreview] = useState("");
+  const [streamingProvider, setStreamingProvider] = useState<{ provider: string; model: string } | null>(null);
+  const [streamingAutoFallback, setStreamingAutoFallback] = useState(false);
+  const activeChatAbortControllerRef = useRef<AbortController | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
 
-  const recognitionRef = useRef<any>(null);
   const vipSessionIdRef = useRef<string | null>(null);
   const roomSocketRef = useRef<WebSocket | null>(null);
   const archivePromptedRef = useRef(false);
@@ -691,7 +729,6 @@ function MainChatApp() {
   const API_BASE = getBackendBaseUrl();
 
   const GOOGLE_CLIENT_ID =
-    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ||
     "767453349146-honr4mjea5jgv23andq145fqtcjdor0t.apps.googleusercontent.com";
   const FACEBOOK_APP_ID = process.env.NEXT_PUBLIC_FACEBOOK_APP_ID?.trim() || "";
 
@@ -704,6 +741,7 @@ function MainChatApp() {
     userProfile.email.includes("@");
 
   const isDevUser = userProfile.email.toLowerCase() === DEVELOPER_EMAIL.toLowerCase();
+  const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
   const isPlatformHost = ADMIN_EMAILS.includes(userProfile.email.toLowerCase());
   const isKeyOwner = Boolean(userProfile.customApiKey) || isPlatformHost;
 
@@ -711,8 +749,8 @@ function MainChatApp() {
     Boolean(googleIdToken) && VIP_ALLOWED_EMAILS.includes(userProfile.email.toLowerCase());
   const isVipUser = isVipEligible && isVipSessionActive;
 
-  const isQuotaEnforced = !isVipUser && !userProfile.customApiKey;
-  const remainingDailyChats = Math.max(0, DAILY_FREE_LIMIT - dailyUsageCount);
+  const isQuotaEnforced = !isMasterAdmin && !isVipUser && !userProfile.customApiKey;
+  const remainingDailyChats = isMasterAdmin ? 999999 : Math.max(0, DAILY_FREE_LIMIT - dailyUsageCount);
   const activeRoomMemberCount = members.filter((member) => member.status === "active").length;
   const roomMemberCount = members.length;
   const roomCapacityLimit =
@@ -727,7 +765,11 @@ function MainChatApp() {
 
   const currentSession = sessions.find((s) => s.id === currentSessionId) || sessions[0];
   const activeTopic = topics.find((topic) => topic.id === activeTopicId) || topics[0];
-  const messages = isTeamMode ? roomMessages : activeTopic?.messages || personalMessages;
+  const messages = isTeamMode
+    ? roomMessages
+    : currentSession?.isSharedArchive
+    ? currentSession.messages
+    : activeTopic?.messages || personalMessages;
   const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
 
   function sendRoomEvent(event: Record<string, unknown>): boolean {
@@ -741,6 +783,13 @@ function MainChatApp() {
   }
 
   async function sendEncryptedRoomEvent(event: Record<string, unknown>): Promise<boolean> {
+    return encryptAndSendRoomEvent(event, members);
+  }
+
+  async function encryptAndSendRoomEvent(
+    event: Record<string, unknown>,
+    roomMembers: RoomMember[]
+  ): Promise<boolean> {
     const content = event.content;
     if (typeof content !== "string" || !roomCryptoIdentity) {
       setChatError("Encrypted room messaging is not ready. Please wait for the secure room to connect.");
@@ -751,7 +800,7 @@ function MainChatApp() {
         content,
         roomCryptoIdentity,
         roomIdentity,
-        members.map((member) => ({ id: member.id, publicKey: member.publicKey }))
+        roomMembers.map((member) => ({ id: member.id, publicKey: member.publicKey }))
       );
       const encryptedEvent: Record<string, unknown> = {
         ...event,
@@ -764,6 +813,37 @@ function MainChatApp() {
       setChatError(error instanceof Error ? error.message : "Could not encrypt the room message.");
       return false;
     }
+  }
+
+  async function publishPendingShareTranscript(roomMembers: RoomMember[]) {
+    const transcript = shareTranscriptRef.current;
+    if (
+      !transcript ||
+      shareTranscriptSentRef.current ||
+      !roomId.startsWith("share_") ||
+      roomIdentity !== shareTranscriptOwnerRef.current ||
+      roomMembers.filter((member) => member.status === "active").length < 2
+    ) {
+      return;
+    }
+    shareTranscriptSentRef.current = true;
+    for (const message of transcript) {
+      if (message.is_deleted) continue;
+      const sent = await encryptAndSendRoomEvent(
+        {
+          type: "message.send",
+          content: message.content,
+          sender_name: message.senderName || message.sender_name || userProfile.name,
+          sender_type: message.role === "assistant" ? "assistant" : "user",
+        },
+        roomMembers
+      );
+      if (!sent) {
+        setChatError("The shared transcript could not be transferred to the invite room.");
+        return;
+      }
+    }
+    shareTranscriptRef.current = null;
   }
 
   async function decodeRoomWireMessage(message: Message): Promise<Message> {
@@ -797,11 +877,38 @@ function MainChatApp() {
   useEffect(() => {
     try {
       if (typeof window !== "undefined") {
-        const initialRoomId = new URLSearchParams(window.location.search).get("room");
+        const pathShareRoom = window.location.pathname.match(/^\/room\/(share_[A-Za-z0-9_-]+)\/?$/)?.[1];
+        const initialRoomId =
+          pathShareRoom || new URLSearchParams(window.location.search).get("room");
         if (initialRoomId) {
           setRoomId(initialRoomId);
           setIsTeamMode(true);
+          if (initialRoomId.startsWith("share_")) setIsRoomUnlocked(true);
         }
+        const storedSessions =
+          localStorage.getItem("genie_chat_sessions_v2") ||
+          localStorage.getItem("genie_chat_sessions");
+        if (storedSessions) {
+          const parsedSessions: unknown = JSON.parse(storedSessions);
+          const restoredSessions = Array.isArray(parsedSessions)
+            ? parsedSessions
+            : (parsedSessions as { sessions?: unknown[] }).sessions;
+          if (Array.isArray(restoredSessions) && restoredSessions.length > 0) {
+            const validSessions = restoredSessions.filter(
+              (session): session is ChatSession =>
+                Boolean(session) &&
+                typeof session === "object" &&
+                typeof (session as ChatSession).id === "string" &&
+                typeof (session as ChatSession).title === "string" &&
+                Array.isArray((session as ChatSession).messages)
+            );
+            if (validSessions.length > 0) {
+              setSessions(validSessions);
+              setCurrentSessionId(validSessions[0].id);
+            }
+          }
+        }
+        setSessionsHydrated(true);
         const savedGuestId = localStorage.getItem("genie_guest_id");
         if (savedGuestId) setGuestId(savedGuestId);
         else {
@@ -947,6 +1054,13 @@ function MainChatApp() {
   useEffect(() => {
     if (!mounted) return;
     try {
+      if (roomId.startsWith("share_")) {
+        setRoomPasscode("842-109");
+        setEnteredRoomPasscode("842-109");
+        setIsRoomUnlocked(true);
+        setRoomPasscodeRoomId(roomId);
+        return;
+      }
       const savedPasscode = localStorage.getItem(`genie_room_passcode_${roomId}`);
       setRoomPasscode(savedPasscode || "842-109");
       setEnteredRoomPasscode(savedPasscode || "");
@@ -986,8 +1100,20 @@ function MainChatApp() {
   useEffect(() => {
     if (isTeamMode) return;
     const selectedSession = sessions.find((session) => session.id === currentSessionId);
-    if (selectedSession) setPersonalMessages(selectedSession.messages);
+    if (selectedSession) {
+      setPersonalMessages(selectedSession.messages);
+      if (selectedSession.topicId) setActiveTopicId(selectedSession.topicId);
+    }
   }, [currentSessionId]);
+
+  useEffect(() => {
+    if (!mounted || !sessionsHydrated) return;
+    try {
+      localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(sessions));
+    } catch (error) {
+      console.error("Chat session persistence failed:", error);
+    }
+  }, [mounted, sessionsHydrated, sessions]);
 
   useEffect(() => {
     if (themeReady) {
@@ -1114,7 +1240,7 @@ function MainChatApp() {
       }
 
       if (update.type === "presence" && update.users) {
-        setMembers(update.users.map((member) => ({
+        const nextMembers: RoomMember[] = update.users.map((member) => ({
           id: member.user_id,
           name: member.display_name,
           email: member.email || "",
@@ -1122,7 +1248,9 @@ function MainChatApp() {
           publicKey: member.public_key,
           role: member.user_id === roomIdentity ? "sovereign" : "member",
           status: member.status || "active",
-        })));
+        }));
+        setMembers(nextMembers);
+        void publishPendingShareTranscript(nextMembers);
         return;
       }
 
@@ -1625,6 +1753,70 @@ function MainChatApp() {
     }
   }
 
+  async function startSharedConversationInvite() {
+    if (!shareSessionId || !isAuthenticated || !googleIdToken || !roomIdentity) {
+      setChatError("Sign in with Google before inviting someone to a shared conversation.");
+      return;
+    }
+    if (!roomCryptoIdentity) {
+      setChatError("Secure room setup is still initializing. Please try again in a moment.");
+      return;
+    }
+    const session = sessions.find((item) => item.id === shareSessionId);
+    if (!session) {
+      setChatError("The selected conversation could not be found.");
+      return;
+    }
+    const transcript =
+      session.messages.length > 0
+        ? session.messages
+        : currentSessionId === session.id
+        ? activeTopic?.messages || personalMessages
+        : [];
+    const inviteSessionId = shareInviteSessionId || `${session.id}_${window.crypto.randomUUID()}`;
+    const sharedRoomId = `share_${inviteSessionId}`;
+    const inviteUrl = `${window.location.origin}/room/${sharedRoomId}`;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+    } catch (error) {
+      console.error("Shared room invite link could not be copied:", error);
+      setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
+      return;
+    }
+    shareTranscriptRef.current = transcript.map((message) => ({ ...message }));
+    shareTranscriptOwnerRef.current = roomIdentity;
+    shareTranscriptSentRef.current = false;
+    setRoomId(sharedRoomId);
+    setRoomTitle(session.title);
+    setRoomMessages([]);
+    setMembers([]);
+    setRoomPasscode("842-109");
+    setEnteredRoomPasscode("842-109");
+    setRoomPasscodeRoomId(sharedRoomId);
+    setIsRoomUnlocked(true);
+    setIsTeamMode(true);
+    setIsObserverActive(false);
+    setShareModalOpen(false);
+    setChatError(null);
+  }
+
+  function saveSharedConversationToArchive() {
+    if (!roomId.startsWith("share_")) return;
+    const savedId = `shared_${roomId}`;
+    const savedSession: ChatSession = {
+      id: savedId,
+      title: `Shared: ${roomTitle || roomId}`,
+      isPinned: false,
+      isSharedArchive: true,
+      messages: roomMessages.map((message) => ({ ...message })),
+    };
+    setSessions((previous) => [
+      savedSession,
+      ...previous.filter((session) => session.id !== savedId),
+    ]);
+    setChatError(null);
+  }
+
   async function loadBlockedUsers() {
     if (!googleIdToken || !userProfile.providerId) return;
     try {
@@ -1809,8 +2001,9 @@ function MainChatApp() {
   }, [friendsQueueOpen, isAuthenticated, googleIdToken, loadFriendsQueue]);
 
   async function loadArchiveManifest(openWhenAvailable: boolean) {
-    if (!googleIdToken || !userProfile.providerId) {
-      if (!openWhenAvailable) setArchiveError("Sign in with Google before accessing your archive.");
+    if (!isAuthenticated || !googleIdToken || !userProfile.providerId) {
+      setArchiveManifest({ personal: null, social: [], team_rooms: [] });
+      setArchiveError(null);
       return;
     }
     setArchiveError(null);
@@ -1820,7 +2013,17 @@ function MainChatApp() {
         `${API_BASE}/api/archive/manifest?user_id=${encodeURIComponent(userProfile.providerId)}`,
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
-      const manifest = (await response.json()) as ArchiveManifest & { detail?: string };
+      const manifest = (await response.json()) as ArchiveManifest & {
+        detail?: string;
+        status?: string;
+        error?: string;
+        manifest?: unknown[];
+      };
+      if (response.status === 401 || manifest.status === "unauthenticated") {
+        setArchiveManifest({ personal: null, social: [], team_rooms: [] });
+        setArchiveError(null);
+        return;
+      }
       if (!response.ok) {
         throw new Error(manifest.detail || `Archive manifest request failed (HTTP ${response.status}).`);
       }
@@ -1833,6 +2036,10 @@ function MainChatApp() {
       const hasArchives = Boolean(
         safeManifest.personal || safeManifest.social.length || safeManifest.team_rooms.length
       );
+      if (!hasArchives) {
+        setArchiveError(null);
+        return;
+      }
       if (openWhenAvailable && hasArchives) {
         setSelectedArchiveItems(new Set());
         setArchiveModalOpen(true);
@@ -1868,7 +2075,7 @@ function MainChatApp() {
       setArchiveError("Sign in with Google before saving an archive.");
       return;
     }
-    setIsArchiveLoading(true);
+    setIsSavingArchive(true);
     setArchiveError(null);
     setArchiveStatus(null);
 
@@ -1953,14 +2160,14 @@ function MainChatApp() {
       if (!response.ok || result.status !== "success") {
         throw new Error(result.detail || `Archive save failed (HTTP ${response.status}).`);
       }
-      setArchiveStatus("Archive snapshot saved.");
+      setArchiveStatus("Archive saved successfully");
       await loadArchiveManifest(false);
     } catch (error) {
       const diagnostic = error instanceof Error ? error.message : "Unknown archive save error.";
       console.error("Archive save failed:", error);
       setArchiveError(diagnostic);
     } finally {
-      setIsArchiveLoading(false);
+      setIsSavingArchive(false);
     }
   }
 
@@ -2371,44 +2578,6 @@ function MainChatApp() {
     URL.revokeObjectURL(url);
   };
 
-  const toggleListening = () => {
-    if (isListening) {
-      if (recognitionRef.current) recognitionRef.current.stop();
-      setIsListening(false);
-      return;
-    }
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      alert("Speech dictation works in Google Chrome, Microsoft Edge, and Safari.");
-      return;
-    }
-
-    try {
-      const recognition = new SpeechRecognition();
-      recognitionRef.current = recognition;
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.lang = selectedLang.code;
-
-      recognition.onstart = () => setIsListening(true);
-      recognition.onresult = (event: any) => {
-        let currentTranscript = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          currentTranscript += event.results[i][0].transcript;
-        }
-        setPrompt(currentTranscript);
-      };
-      recognition.onerror = () => setIsListening(false);
-      recognition.onend = () => setIsListening(false);
-      recognition.start();
-    } catch {
-      setIsListening(false);
-    }
-  };
-
   const handleCopyMessage = (content: string, index: number) => {
     navigator.clipboard.writeText(content);
     setCopiedIndex(index);
@@ -2426,17 +2595,17 @@ function MainChatApp() {
         body: JSON.stringify({
           user_email: userProfile.email,
           user_name: userProfile.name,
-          developer_destination: DEVELOPER_EMAIL,
+          developer_destination: SUPPORT_DISPATCH_EMAIL,
           track: reportType,
           description: ticketDescription,
           context: "Submitted via Genie Workspace Preferences",
         }),
       });
-      setTicketStatus(`Dispatched successfully to lead developer (${DEVELOPER_EMAIL})!`);
+      setTicketStatus(`Dispatched successfully to ${SUPPORT_DISPATCH_EMAIL}.`);
       setTicketDescription("");
       setTimeout(() => setTicketStatus(null), 3500);
     } catch {
-      setTicketStatus(`Queued for lead developer review (${DEVELOPER_EMAIL})!`);
+      setTicketStatus("Queued for Active Core Support Dispatch.");
       setTicketDescription("");
       setTimeout(() => setTicketStatus(null), 3500);
     }
@@ -2522,6 +2691,23 @@ function MainChatApp() {
               </p>
             )}
           </div>
+        </div>
+      )}
+      {isTeamMode && roomId.startsWith("share_") && (
+        <div className="mx-auto mb-4 flex max-w-3xl items-center justify-between gap-3 rounded-xl border border-cyan-200 bg-cyan-50/90 px-3 py-2 shadow-sm">
+          <span className="text-xs font-semibold text-cyan-950">
+            🔒 2-Member Shared Room
+          </span>
+          <button
+            type="button"
+            onClick={saveSharedConversationToArchive}
+            disabled={sessions.some((session) => session.id === `shared_${roomId}`)}
+            className="rounded-lg border border-cyan-300 bg-white px-3 py-1.5 text-[10px] font-semibold text-cyan-900 hover:bg-cyan-100 disabled:cursor-default disabled:opacity-70"
+          >
+            {sessions.some((session) => session.id === `shared_${roomId}`)
+              ? "✓ Saved to My Archived Chats"
+              : "💾 Save to My Archived Chats"}
+          </button>
         </div>
       )}
 
@@ -2801,6 +2987,8 @@ function MainChatApp() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
+                          setShareSessionId(session.id);
+                          setShareInviteSessionId(`${session.id}_${window.crypto.randomUUID()}`);
                           setShareModalOpen(true);
                           setActiveMenuId(null);
                         }}
@@ -2860,13 +3048,15 @@ function MainChatApp() {
           <div className={`space-y-2 border-t p-3 ${currentTheme.chromeBorderClass} ${currentTheme.chromeClass}`}>
             <SlideDockDrawer
               statusLabel={
-                isQuotaEnforced
-                  ? `⚡ ${remainingDailyChats} / ${DAILY_FREE_LIMIT} Chats Left`
-                  : isVipUser
-                  ? `★ VIP Unlimited · ${activeVipSessionCount}/20`
-                  : "★ BYOK Unlimited"
-              }
-              statusTone={isQuotaEnforced ? "quota" : isVipUser ? "vip" : "byok"}
+                  isMasterAdmin
+                    ? "⚡ Unlimited Admin Engine"
+                    : isQuotaEnforced
+                    ? `⚡ ${remainingDailyChats} / ${DAILY_FREE_LIMIT} Chats Left`
+                    : isVipUser
+                    ? `★ VIP Unlimited · ${activeVipSessionCount}/20`
+                    : "★ BYOK Unlimited"
+                }
+              statusTone={isMasterAdmin || isVipUser ? "vip" : isQuotaEnforced ? "quota" : "byok"}
               surfaceClass={currentTheme.chromeSurfaceClass}
               borderClass={currentTheme.borderClass}
               textClass={currentTheme.chromeTextClass}
@@ -2892,6 +3082,11 @@ function MainChatApp() {
                   <span className="text-[11px] font-bold text-slate-800 leading-tight truncate">
                     {userProfile.name}
                   </span>
+                  {isMasterAdmin && (
+                    <span className="truncate text-[8px] font-extrabold text-amber-700">
+                      🛡️ ★ MASTER ADMIN VIP (UNLIMITED ACCESS)
+                    </span>
+                  )}
                   <span className="text-[9px] text-slate-500 truncate">{userProfile.email || "Guest"}</span>
                 </div>
               </div>
@@ -3069,9 +3264,38 @@ function MainChatApp() {
                       key={msg.id || index}
                       className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
                     >
-                      {msg.senderName && (
-                        <span className="text-[10px] font-semibold text-slate-400 mb-1 px-1">
-                          {msg.senderName}
+                      {(msg.senderName || msg.source) && (
+                        <span
+                          title={
+                            msg.source === "cloud_ai"
+                              ? "Generated by a live cloud AI model."
+                              : msg.source === "platform_engine"
+                              ? "Answered instantly by the local Personal AI Genie platform engine."
+                              : msg.source === "local_agent"
+                              ? `Executed by the local ${msg.agentName || "Python"} agent.`
+                              : msg.source === "gemini-3.8-flash"
+                              ? "Generated by the Personal AI Genie cloud API."
+                              : msg.source === "backend-manifest"
+                              ? "Answered by the built-in Personal AI Genie platform guide."
+                              : msg.source === "openrouter-fallback"
+                              ? "Generated by an OpenRouter fallback model."
+                              : undefined
+                          }
+                          className={`mb-1 px-1 text-[10px] font-semibold ${
+                            msg.source ? "cursor-help text-slate-500" : "text-slate-400"
+                          }`}
+                        >
+                          {msg.source === "cloud_ai"
+                            ? "✨ Personal AI Genie (Live AI)"
+                            : msg.source === "platform_engine"
+                            ? "⚙️ Personal AI Genie (Local Engine)"
+                            : msg.source === "local_agent"
+                            ? `⚡ Local Agent Engine: ${msg.agentName || "Python Agent"}`
+                            : msg.source === "gemini-3.8-flash" || msg.source === "openrouter-fallback"
+                            ? "✨ Personal AI Genie (Live AI)"
+                            : msg.source === "backend-manifest"
+                            ? "⚙️ Personal AI Genie (Platform Engine)"
+                            : msg.senderName || "Personal AI Genie"}
                         </span>
                       )}
 
@@ -3198,15 +3422,66 @@ function MainChatApp() {
                           )}
                         </div>
                       ) : (
-                        <div className="space-y-1.5 max-w-[85%]">
-                          <div
-                            className={`group relative rounded-2xl rounded-bl-none px-4 py-3 text-sm leading-relaxed border shadow-sm ${
+                        <div className="w-full max-w-[85%] space-y-1.5">
+                          <MessageBubble
+                            provider={msg.provider || (msg.source === "openrouter-fallback" ? "OpenRouter" : msg.source === "cloud_ai" ? "Google Gemini" : "Personal AI Genie")}
+                            model={msg.providerModel || msg.modelUsed || (msg.source === "platform_engine" ? "platform engine" : "AI response")}
+                            autoFallback={msg.autoFallback}
+                            className={`group relative max-w-full rounded-2xl rounded-bl-none px-4 py-3 text-sm leading-relaxed border shadow-sm ${
                               msg.isIntervention
                                 ? `${selectedTheme.bgLightClass} ${selectedTheme.textClass} ${selectedTheme.borderClass}`
                                 : "bg-white text-slate-800 border-slate-200"
                             }`}
                           >
                             <p className="whitespace-pre-wrap">{msg.content}</p>
+                            {(msg.source === "local_agent" || msg.source === "platform_engine") && msg.agentOutput && (
+                              <div className="mt-3 space-y-2 border-t border-slate-200/80 pt-3 text-xs">
+                                <div className="flex items-center justify-between gap-2">
+                                  <span className="font-semibold">{msg.agentOutput.agent_name}</span>
+                                  <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                                    {msg.agentOutput.status.replaceAll("_", " ")}
+                                  </span>
+                                </div>
+                                {msg.agentOutput.logs.length > 0 && (
+                                  <ul className="space-y-1 text-[10px] text-slate-500">
+                                    {msg.agentOutput.logs.map((log, logIndex) => (
+                                      <li key={`${logIndex}-${log}`}>• {log}</li>
+                                    ))}
+                                  </ul>
+                                )}
+                                {msg.agentOutput.results && msg.agentOutput.results.length > 0 && (
+                                  <div className="space-y-1.5">
+                                    {msg.agentOutput.results.map((result, resultIndex) => (
+                                      <div
+                                        key={`${resultIndex}-${result.title || result.company || "result"}`}
+                                        className="rounded-lg border border-slate-200 bg-slate-50/80 p-2"
+                                      >
+                                        <div className="flex items-start justify-between gap-2">
+                                          <span className="font-semibold text-slate-700">
+                                            {[result.title, result.company].filter(Boolean).join(" · ") || "Agent result"}
+                                          </span>
+                                          {typeof result.score === "number" && (
+                                            <span className="shrink-0 font-bold text-emerald-700">{result.score}%</span>
+                                          )}
+                                        </div>
+                                        {result.location && <p className="mt-0.5 text-[10px] text-slate-500">{result.location}</p>}
+                                        {result.verdict && <p className="mt-0.5 text-[10px] text-slate-600">{result.verdict}</p>}
+                                        {result.matched_skills && result.matched_skills.length > 0 && (
+                                          <p className="mt-0.5 text-[10px] text-slate-500">
+                                            Matched: {result.matched_skills.join(", ")}
+                                          </p>
+                                        )}
+                                        {result.url && /^https?:\/\//i.test(result.url) && (
+                                          <a href={result.url} target="_blank" rel="noreferrer" className="mt-1 inline-block text-[10px] font-semibold text-cyan-700 hover:underline">
+                                            Open listing
+                                          </a>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                             {renderRoomReactions(msg)}
 
                             {/* Code Canvas Preview Banner */}
@@ -3226,7 +3501,7 @@ function MainChatApp() {
                                 </button>
                               </div>
                             )}
-                          </div>
+                          </MessageBubble>
 
                           <div className="flex items-center gap-1.5 text-slate-400 px-1">
                             <button
@@ -3273,10 +3548,32 @@ function MainChatApp() {
                   ))}
 
                   {isStreaming && (
-                    <div className="flex items-center gap-2 p-3 bg-white border border-slate-200 rounded-2xl w-fit shadow-xs">
-                      <Loader2 className={`w-4 h-4 ${selectedTheme.textClass} animate-spin`} />
-                      <span className="text-xs text-slate-500 font-medium">Genie is thinking...</span>
-                    </div>
+                    streamingPreview ? (
+                      <MessageBubble
+                        provider={streamingProvider?.provider || "Google Gemini"}
+                        model={streamingProvider?.model || "Connecting"}
+                        autoFallback={streamingAutoFallback}
+                        className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-none border border-cyan-200 bg-white px-4 py-3 text-sm leading-relaxed text-slate-800 shadow-sm"
+                      >
+                        {streamingPreview}
+                      </MessageBubble>
+                    ) : (
+                      <div className="flex items-center gap-3 rounded-2xl border border-cyan-200/70 bg-white/90 p-3 shadow-[0_0_24px_rgba(14,165,233,0.12)]">
+                        <span className="flex h-9 w-9 animate-pulse items-center justify-center rounded-full bg-gradient-to-br from-cyan-100 via-violet-100 to-pink-100 text-xl shadow-[0_0_16px_rgba(14,165,233,0.32)]" aria-hidden="true">
+                          🤖
+                        </span>
+                        <span className="flex flex-col gap-1">
+                          <span className="bg-gradient-to-r from-cyan-600 via-violet-600 to-pink-500 bg-clip-text text-xs font-semibold text-transparent animate-pulse">
+                            Genie is crafting your response...
+                          </span>
+                          <span className="flex items-center gap-1 text-[10px] text-cyan-600" aria-label="Generating response">
+                            <span className="animate-bounce">●</span>
+                            <span className="animate-bounce [animation-delay:150ms]">●</span>
+                            <span className="animate-bounce [animation-delay:300ms]">●</span>
+                          </span>
+                        </span>
+                      </div>
+                    )
                   )}
 
                   <div ref={messagesEndRef} />
@@ -3429,36 +3726,34 @@ function MainChatApp() {
 
               {/* Status Header */}
               <div className="max-w-3xl mx-auto mb-1.5 sm:mb-2 flex items-center justify-between px-2.5 sm:px-3 py-1 bg-slate-50/90 border border-slate-200 rounded-xl text-[10px] sm:text-[11px]">
-                {isTeamMode ? (
-                  <div className="flex items-center gap-1.5 sm:gap-2">
+                <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
+                  {isTeamMode && (
                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold bg-gradient-to-r from-violet-600 via-pink-500 to-amber-500 text-white shadow-xs">
                       <Users className="w-3 h-3" />
                       <span className="truncate max-w-[120px] sm:max-w-none">Team • {userProfile.name}</span>
                     </span>
-
-                    <button
-                      type="button"
-                      onClick={() => void handleObserverToggle()}
-                      className={`flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-lg text-[9px] sm:text-[10px] font-bold border transition-all ${
-                        isObserverActive
-                          ? "bg-emerald-100 text-emerald-800 border-emerald-300 shadow-xs"
-                          : "bg-white text-slate-500 border-slate-200 hover:bg-slate-100"
-                      }`}
-                    >
-                      <Sparkles className={`w-3 h-3 ${isObserverActive ? "text-emerald-600 animate-spin" : "text-slate-400"}`} />
-                      <span>Observer: {isObserverActive ? "ON" : "OFF"}</span>
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    {isQuotaEnforced && (
-                      <span className={`flex items-center gap-1 px-2 sm:px-2.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold ${remainingDailyChats > 5 ? "bg-purple-100 text-purple-800" : "bg-amber-100 text-amber-800"}`}>
-                        <Sparkles className="w-3 h-3" />
-                        <span>⚡ {remainingDailyChats} / {DAILY_FREE_LIMIT} Chats Left</span>
-                      </span>
-                    )}
-                  </div>
-                )}
+                  )}
+                  {!isTeamMode && isQuotaEnforced && isObserverActive && (
+                    <span className={`flex items-center gap-1 px-2 sm:px-2.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-bold ${remainingDailyChats > 5 ? "bg-purple-100 text-purple-800" : "bg-amber-100 text-amber-800"}`}>
+                      <Sparkles className="w-3 h-3" />
+                      <span>⚡ {remainingDailyChats} / {DAILY_FREE_LIMIT} Chats Left</span>
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void handleObserverToggle()}
+                    aria-pressed={isObserverActive}
+                    className={`shrink-0 rounded-lg border px-2 py-1 text-[9px] font-bold transition-all sm:text-[10px] ${
+                      isObserverActive
+                        ? "border-cyan-300 bg-emerald-50 text-emerald-800 shadow-xs"
+                        : "border-slate-200 bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    }`}
+                  >
+                    {isObserverActive
+                      ? "👁️ Observer ON"
+                      : "👁️‍🗨️ Observer OFF"}
+                  </button>
+                </div>
 
                 <span className={`hidden xs:inline text-[10px] ${selectedTheme.textClass} font-semibold truncate`}>
                   Type @Genie to query
@@ -3650,11 +3945,11 @@ function MainChatApp() {
                         ? `Listening in ${selectedLang.label}...`
                         : isTeamMode
                         ? `Message team or @Genie...`
-                        : isQuotaEnforced && remainingDailyChats === 0
+                        : isObserverActive && isQuotaEnforced && remainingDailyChats === 0
                         ? "Daily quota reached..."
                         : "Ask Genie anything..."
                     }
-                    disabled={isQuotaEnforced && remainingDailyChats === 0}
+                    disabled={isObserverActive && isQuotaEnforced && remainingDailyChats === 0}
                     className="flex-1 min-w-0 bg-transparent px-1 sm:px-3 text-slate-900 placeholder-slate-400 text-xs sm:text-sm focus:outline-none disabled:opacity-50"
                   />
 
@@ -3695,35 +3990,43 @@ function MainChatApp() {
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={toggleListening}
-                      className={`p-1.5 sm:p-2 rounded-full transition-all shrink-0 ${
-                        isListening
-                          ? "bg-rose-100 text-rose-600 ring-2 ring-rose-400 animate-pulse"
-                          : "text-slate-500 hover:text-slate-800"
-                      }`}
-                      title={isListening ? "Stop listening" : `Dictate in ${selectedLang.label}`}
-                    >
-                      {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                    </button>
+                    <VoiceMic
+                      backendUrl={API_BASE}
+                      disabled={isStreaming}
+                      onRecordingChange={setIsListening}
+                      onTranscription={(text) => {
+                        setIsListening(false);
+                        void handleSendMessage(undefined, false, text);
+                      }}
+                    />
 
-                    {/* Standard Send */}
-                    <button
-                      type="submit"
-                      disabled={!prompt.trim() || isStreaming || (isQuotaEnforced && remainingDailyChats === 0)}
-                      className={`p-1.5 sm:p-2 bg-gradient-to-r ${selectedTheme.gradientClass} text-white rounded-full disabled:opacity-40 transition-all shadow-xs shrink-0`}
-                      title="Send message"
-                    >
-                      <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-                    </button>
+                    {isStreaming ? (
+                      <button
+                        type="button"
+                        onClick={() => activeChatAbortControllerRef.current?.abort()}
+                        className="rounded-full bg-rose-600 p-1.5 text-white shadow-sm transition-colors hover:bg-rose-700 sm:p-2"
+                        title="Stop generating"
+                        aria-label="Stop generating"
+                      >
+                        <Square className="h-3.5 w-3.5 fill-current sm:h-4 sm:w-4" />
+                      </button>
+                    ) : (
+                      <button
+                        type="submit"
+                        disabled={!prompt.trim() || (isObserverActive && isQuotaEnforced && remainingDailyChats === 0)}
+                        className={`p-1.5 sm:p-2 bg-gradient-to-r ${selectedTheme.gradientClass} text-white rounded-full disabled:opacity-40 transition-all shadow-xs shrink-0`}
+                        title="Send message"
+                      >
+                        <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                      </button>
+                    )}
 
                     {/* Rainbow Send */}
                     {isTeamMode && (
                       <button
                         type="button"
                         onClick={(e) => handleSendMessage(e, true)}
-                        disabled={isStreaming || (isQuotaEnforced && remainingDailyChats === 0)}
+                        disabled={isStreaming || (isObserverActive && isQuotaEnforced && remainingDailyChats === 0)}
                         className="p-1.5 sm:p-2 bg-gradient-to-r from-violet-600 via-pink-500 via-amber-400 to-emerald-400 text-white rounded-full hover:scale-105 transition-all shadow-xs animate-pulse shrink-0"
                         title="Rainbow Send: Prompt Genie to observe and respond immediately"
                       >
@@ -4132,31 +4435,41 @@ function MainChatApp() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
           <div className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-slate-200 p-5 space-y-4">
             <div className="flex items-center justify-between border-b pb-3">
-              <span className="font-bold text-slate-800 text-sm">Share Conversation / Hop-in Group Chat</span>
-              <button onClick={() => setShareModalOpen(false)}>
+              <span className="font-bold text-slate-800 text-sm">Invite Friend to this Conversation</span>
+              <button type="button" onClick={() => setShareModalOpen(false)}>
                 <X className="w-4 h-4 text-slate-400" />
               </button>
             </div>
-            <p className="text-xs text-slate-600 font-medium truncate">{currentSession?.title}</p>
-            <p className="text-[11px] text-slate-500">
-              Anyone with this link can hop into this conversation like a group chat and talk with Genie.
+            <p className="text-xs text-slate-600 font-medium truncate">
+              {sessions.find((session) => session.id === shareSessionId)?.title || currentSession?.title}
             </p>
-            <div className={`p-3 ${selectedTheme.bgLightClass} rounded-xl border ${selectedTheme.borderClass} flex items-center justify-between`}>
-              <span className={`text-xs font-mono font-bold ${selectedTheme.textClass}`}>
-                GENIE-CHAT-{currentSessionId}
-              </span>
-              <button
-                onClick={() => {
-                  const hopInUrl = `${window.location.origin}/?room=GROUP-${currentSessionId}`;
-                  navigator.clipboard.writeText(hopInUrl);
-                  alert("Hop-in group chat link copied to clipboard!");
-                  setShareModalOpen(false);
-                }}
-                className={`text-xs font-semibold ${selectedTheme.textClass} bg-white border ${selectedTheme.borderClass} px-3 py-1.5 rounded-lg`}
-              >
-                Copy Link
-              </button>
+            <p className="text-[11px] text-slate-500">
+              This encrypted invite creates a room for you and one friend. The selected transcript is added
+              after your friend joins.
+            </p>
+            <div className={`rounded-xl border ${selectedTheme.borderClass} ${selectedTheme.bgLightClass} p-3`}>
+              <label htmlFor="shared-room-invite" className="mb-1 block text-[10px] font-semibold text-slate-500">
+                One-click invite link
+              </label>
+              <input
+                id="shared-room-invite"
+                readOnly
+                value={
+                  typeof window === "undefined" || !shareInviteSessionId
+                    ? ""
+                    : `${window.location.origin}/room/share_${shareInviteSessionId}`
+                }
+                className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[11px] text-slate-700"
+              />
             </div>
+            <button
+              type="button"
+              onClick={() => void startSharedConversationInvite()}
+              className={`flex w-full items-center justify-center gap-2 rounded-xl ${selectedTheme.primaryClass} px-3 py-2.5 text-xs font-bold text-white shadow-sm`}
+            >
+              <Copy className="h-3.5 w-3.5" />
+              Start Secure Room & Copy Invite
+            </button>
           </div>
         </div>
       )}
@@ -4529,10 +4842,10 @@ function MainChatApp() {
                 <button
                   type="button"
                   onClick={() => void handleSaveArchive()}
-                  disabled={isArchiveLoading}
+                  disabled={isSavingArchive}
                   className={`rounded-lg ${selectedTheme.primaryClass} px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-60`}
                 >
-                  {isArchiveLoading ? "Saving..." : "Save Archive"}
+                  {isSavingArchive ? "Saving..." : "Save Archive"}
                 </button>
                 <button onClick={() => setSettingsOpen(false)} className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg">
                   <X className="w-4 h-4" />
@@ -4687,36 +5000,42 @@ function MainChatApp() {
                   <p className="text-[11px] leading-relaxed text-slate-500">
                     Google remains your sign-in identity. Verified Meta linking opts you into the discoverable Friends Queue; your Meta access token is verified server-side and is never stored.
                   </p>
-                  <div className="flex items-center gap-3">
-                    {userProfile.socialAvatarUrl && (
-                      <GenieAvatar
-                        src={userProfile.socialAvatarUrl}
-                        alt={userProfile.socialHandle || "Linked social profile"}
-                        className="h-8 w-8 rounded-full"
+                  {FACEBOOK_APP_ID ? (
+                    <div className="flex items-center gap-3">
+                      {userProfile.socialAvatarUrl && (
+                        <GenieAvatar
+                          src={userProfile.socialAvatarUrl}
+                          alt={userProfile.socialHandle || "Linked social profile"}
+                          className="h-8 w-8 rounded-full"
+                        />
+                      )}
+                      <input
+                        type="text"
+                        value={userProfile.socialHandle}
+                        onChange={(event) =>
+                          setUserProfile((previous) => ({ ...previous, socialHandle: event.target.value }))
+                        }
+                        onBlur={(event) => {
+                          const handle = event.currentTarget.value.trim();
+                          setUserProfile((previous) => ({ ...previous, socialHandle: handle }));
+                          void saveSocialHandle(handle);
+                        }}
+                        placeholder="Instagram or Facebook handle"
+                        className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2 py-1.5 text-xs text-slate-700"
                       />
-                    )}
-                    <input
-                      type="text"
-                      value={userProfile.socialHandle}
-                      onChange={(event) =>
-                        setUserProfile((previous) => ({ ...previous, socialHandle: event.target.value }))
-                      }
-                      onBlur={(event) => {
-                        const handle = event.currentTarget.value.trim();
-                        setUserProfile((previous) => ({ ...previous, socialHandle: handle }));
-                        void saveSocialHandle(handle);
-                      }}
-                      placeholder="Instagram or Facebook handle"
-                      className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2 py-1.5 text-xs text-slate-700"
-                    />
-                    <button
-                      type="button"
-                      onClick={handleMetaLogin}
-                      className={`rounded-xl border ${selectedTheme.borderClass} px-3 py-2 text-[11px] font-semibold ${selectedTheme.textClass} hover:${selectedTheme.bgLightClass}`}
-                    >
-                      {userProfile.socialHandle ? "Update link" : "Link Meta"}
-                    </button>
-                  </div>
+                      <button
+                        type="button"
+                        onClick={handleMetaLogin}
+                        className={`rounded-xl border ${selectedTheme.borderClass} px-3 py-2 text-[11px] font-semibold ${selectedTheme.textClass} hover:${selectedTheme.bgLightClass}`}
+                      >
+                        {userProfile.socialHandle ? "Update link" : "Link Meta"}
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="inline-flex rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[10px] text-slate-500">
+                      Social linking is optional and inactive in local dev.
+                    </span>
+                  )}
                   {userProfile.isDiscoverable && (
                     <div className="flex items-center justify-between rounded-lg bg-emerald-50 px-3 py-2 text-[11px] text-emerald-800">
                       <span>Discoverable to Genie users</span>
@@ -4729,7 +5048,7 @@ function MainChatApp() {
                       </button>
                     </div>
                   )}
-                  {metaLoginError && (
+                  {FACEBOOK_APP_ID && metaLoginError && (
                     <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-[11px] text-rose-700">
                       {metaLoginError}
                     </p>
@@ -4822,7 +5141,7 @@ function MainChatApp() {
                         Direct Developer Pipeline
                       </span>
                       <span className="text-[10px] text-slate-500">
-                        Direct dispatches to lead dev: <span className="font-semibold text-violet-700">{DEVELOPER_EMAIL}</span>
+                        Direct dispatches to support: <span className="font-semibold text-violet-700">{SUPPORT_DISPATCH_EMAIL}</span>
                       </span>
                     </div>
                     <span className="text-[10px] font-semibold text-violet-700 bg-white px-2.5 py-0.5 rounded-full border border-violet-200">
@@ -5051,7 +5370,10 @@ function MainChatApp() {
       const interventionMsg: Message = {
         role: "assistant",
         content: `[★ Verified Synthesis • Host Intervention Audit]\n\n${sanitized}`,
-        senderName: `Personal AI Genie (${cascadeResult.model})`,
+        senderName: "Personal AI Genie",
+        source: cascadeResult.model.toLowerCase().includes("openrouter")
+          ? "openrouter-fallback"
+          : "gemini-3.8-flash",
         isIntervention: true,
         extractedCode: extracted || undefined,
       };
@@ -5061,6 +5383,7 @@ function MainChatApp() {
         content: interventionMsg.content,
         sender_type: "assistant",
         sender_name: interventionMsg.senderName,
+        source: interventionMsg.source,
       });
 
       if (extracted) setActiveCanvas(extracted);
@@ -5079,11 +5402,15 @@ function MainChatApp() {
       setIsObserverActive(false);
       return;
     }
-    if (!isTeamMode || !googleIdToken) {
-      setChatError("Observer review is available after Google sign-in and joining a shared room.");
+    setIsObserverActive(true);
+    if (!isTeamMode) {
       return;
     }
-    setIsObserverActive(true);
+    if (!googleIdToken) {
+      setIsObserverActive(false);
+      setChatError("Observer review is available after Google sign-in.");
+      return;
+    }
 
     try {
       const response = await fetch(`${API_BASE}/api/team/summarize-review`, {
@@ -5107,6 +5434,7 @@ function MainChatApp() {
         condensed_digest?: string;
         executive_review?: string;
         detail?: string;
+        source?: Message["source"];
       };
       if (!response.ok || !result.executive_review?.trim()) {
         throw new Error(result.detail || `Observer review failed (HTTP ${response.status}).`);
@@ -5115,6 +5443,7 @@ function MainChatApp() {
         type: "message.send",
         sender_type: "assistant",
         sender_name: "Personal AI Genie • Observer",
+        source: result.source || "gemini-3.8-flash",
         content: `Team digest:\n${result.condensed_digest || ""}\n\nExecutive review:\n${result.executive_review}`,
       });
     } catch (error) {
@@ -5231,14 +5560,19 @@ function MainChatApp() {
     if (!textToSend.trim() && !forceRainbowTrigger) return;
     if (isStreaming) return;
     const topicIdForRequest = activeTopic?.id || "topic_1";
-    const routedPersonalTopic = !isTeamMode && isAuthenticated && Boolean(googleIdToken && userProfile.providerId);
+    const sessionArchiveForRequest = !isTeamMode && Boolean(currentSession?.isSharedArchive);
+    const routedPersonalTopic =
+      !isTeamMode &&
+      !sessionArchiveForRequest &&
+      isAuthenticated &&
+      Boolean(googleIdToken && userProfile.providerId);
 
     const actualText = textToSend.trim() || (forceRainbowTrigger ? "Genie, please analyze the conversation and assist." : "");
     const shouldWakeGenie =
       !isTeamMode ||
       forceRainbowTrigger ||
       checkWakeWordTrigger(actualText);
-    if (shouldWakeGenie && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
+    if (shouldWakeGenie && isObserverActive && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
       setQuotaExceededModalOpen(true);
       return;
     }
@@ -5258,11 +5592,6 @@ function MainChatApp() {
     setEmojiPickerOpen(false);
     setAttachmentMenuOpen(false);
 
-    if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    }
-
     const userMsg: Message = {
       role: "user",
       content: actualText,
@@ -5279,15 +5608,21 @@ function MainChatApp() {
     const updatedMessages = [...messages, userMsg];
 
     if (!isTeamMode) {
-      setTopics((previous) => previous.map((topic) =>
-        topic.id === topicIdForRequest
-          ? { ...topic, messages: updatedMessages, message_count: updatedMessages.length }
-          : topic
-      ));
+      if (sessionArchiveForRequest && currentSession) {
+        setSessions((previous) => previous.map((session) =>
+          session.id === currentSession.id ? { ...session, messages: updatedMessages } : session
+        ));
+      } else {
+        setTopics((previous) => previous.map((topic) =>
+          topic.id === topicIdForRequest
+            ? { ...topic, messages: updatedMessages, message_count: updatedMessages.length }
+            : topic
+        ));
+      }
       setPersonalMessages(updatedMessages);
     }
 
-    if (shouldWakeGenie && isQuotaEnforced) {
+    if (shouldWakeGenie && isObserverActive && isQuotaEnforced) {
       const newCount = dailyUsageCount + 1;
       setDailyUsageCount(newCount);
       if (userProfile.email && typeof window !== "undefined") {
@@ -5303,10 +5638,18 @@ function MainChatApp() {
 
     let finalReply = "";
     let finalModel = "gemini-3.8-flash";
+    let finalSource: Message["source"] = "gemini-3.8-flash";
+    let finalAgentOutput: Message["agentOutput"];
+    let finalProvider: string | undefined;
+    let finalProviderModel: string | undefined;
+    let finalAutoFallback = false;
+    const useChatStream = isObserverActive && !routedPersonalTopic;
+    setStreamingPreview("");
+    setStreamingProvider(null);
+    setStreamingAutoFallback(false);
 
-    // Allow 45-second timeout to handle Render cold-start boots
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000);
+    activeChatAbortControllerRef.current = controller;
 
     try {
       let historyForRequest = isTeamMode
@@ -5356,6 +5699,7 @@ function MainChatApp() {
             message: actualText,
             message_id: userMsg.id,
             custom_api_key: userProfile.customApiKey || undefined,
+            observer_mode: isObserverActive,
           }
         : {
             user_email: userProfile.email,
@@ -5371,13 +5715,13 @@ function MainChatApp() {
             gender_context: userProfile.gender,
             language_code: selectedLang.code,
             is_team_chat: false,
-            is_observer_active: isObserverActive,
+            observer_mode: isObserverActive,
             quoted_message: sentReplyTarget
               ? { author: sentReplyTarget.author, content: sentReplyTarget.content }
               : undefined,
           };
       const res = await fetch(
-        `${API_BASE}${routedPersonalTopic ? "/api/personal/chat" : "/api/chat"}`,
+        `${API_BASE}${routedPersonalTopic ? "/api/personal/chat" : useChatStream ? "/api/chat/stream" : "/api/chat"}`,
         {
           method: "POST",
           signal: controller.signal,
@@ -5386,23 +5730,96 @@ function MainChatApp() {
         }
       );
 
-      clearTimeout(timeoutId);
-
-      const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.detail || data.error || `Chat backend returned HTTP ${res.status}.`);
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.detail || errorData.error || `Chat backend returned HTTP ${res.status}.`);
       }
-      if (typeof data.reply !== "string" || !data.reply.trim()) {
-        throw new Error("Chat backend returned an empty response.");
+      if (useChatStream) {
+        if (!res.body) throw new Error("Chat backend did not provide a readable event stream.");
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let pending = "";
+        const handleSseBlock = (block: string) => {
+          let eventName = "message";
+          const dataLines: string[] = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+          }
+          if (!dataLines.length) return;
+          const eventData = JSON.parse(dataLines.join("\n")) as {
+            provider?: string;
+            model?: string;
+            text?: string;
+            failed?: string;
+            message?: string;
+          };
+          if (eventName === "meta" && eventData.provider && eventData.model) {
+            finalProvider = eventData.provider;
+            finalProviderModel = eventData.model;
+            finalModel = eventData.model;
+            setStreamingProvider({ provider: eventData.provider, model: eventData.model });
+          } else if (eventName === "fallback") {
+            finalAutoFallback = true;
+            setStreamingAutoFallback(true);
+          } else if (eventName === "token" && eventData.text) {
+            finalReply += eventData.text;
+            setStreamingPreview(finalReply);
+          } else if (eventName === "error") {
+            throw new Error(eventData.message || "All configured chat providers are unavailable.");
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          pending += decoder.decode(value, { stream: !done });
+          pending = pending.replace(/\r\n/g, "\n");
+          let eventBoundary = pending.indexOf("\n\n");
+          while (eventBoundary !== -1) {
+            handleSseBlock(pending.slice(0, eventBoundary));
+            pending = pending.slice(eventBoundary + 2);
+            eventBoundary = pending.indexOf("\n\n");
+          }
+          if (done) break;
+        }
+        if (pending.trim()) handleSseBlock(pending);
+        if (!finalReply.trim()) throw new Error("Chat backend returned an empty response.");
+        finalSource = "cloud_ai";
+      } else {
+        const data = await res.json();
+        if (typeof data.reply !== "string" || !data.reply.trim()) {
+          throw new Error("Chat backend returned an empty response.");
+        }
+        finalReply = data.reply;
+        finalModel = data.model_used || "gemini-3.8-flash";
+        finalAgentOutput = data.agent_output;
+        finalProvider = data.provider_source === "openrouter-fallback"
+          ? "OpenRouter"
+          : data.provider_source === "gemini"
+            ? "Google Gemini"
+            : undefined;
+        finalProviderModel = finalModel;
+        finalSource =
+          data.source === "local_agent" ||
+          data.source === "platform_engine" ||
+          data.source === "cloud_ai" ||
+          data.source === "backend-manifest" ||
+          data.source === "openrouter-fallback"
+            ? data.source
+            : isObserverActive
+            ? "cloud_ai"
+            : "local_agent";
       }
-      finalReply = data.reply;
-      finalModel = data.model_used || "gemini-3.8-flash";
     } catch (primaryError) {
-      clearTimeout(timeoutId);
-      if (routedPersonalTopic) {
+      if (
+        controller.signal.aborted ||
+        (primaryError instanceof Error && primaryError.name === "AbortError")
+      ) {
+        setChatError(null);
+      } else if (routedPersonalTopic || !isObserverActive) {
         const diagnostic = primaryError instanceof Error ? primaryError.message : "Topic chat request failed.";
         console.error("Personal topic chat request failed:", primaryError);
-        setChatError(`Personal topic chat failed: ${diagnostic}`);
+        setChatError(`${isObserverActive ? "Personal topic chat" : "Platform engine"} failed: ${diagnostic}`);
       } else try {
         console.warn("Primary chat backend request failed; attempting server fallback.", primaryError);
         const raceResult = await callActiveGeminiCascade(
@@ -5412,12 +5829,23 @@ function MainChatApp() {
             : updatedMessages,
           selectedLang.label,
           userProfile.customApiKey || undefined,
-          googleIdToken
+          googleIdToken,
+          controller.signal
         );
         finalReply = raceResult.text;
         finalModel = raceResult.model;
+        finalSource = "cloud_ai";
+        finalProvider = "Google Gemini";
+        finalProviderModel = raceResult.model;
         setActiveModelName(raceResult.model);
       } catch (fallbackError) {
+        if (
+          controller.signal.aborted ||
+          (fallbackError instanceof Error && fallbackError.name === "AbortError")
+        ) {
+          setChatError(null);
+          return;
+        }
         console.error("Chat completion failed after backend and server fallback attempts.", fallbackError);
         const diagnostic =
           fallbackError instanceof Error
@@ -5427,7 +5855,9 @@ function MainChatApp() {
         const noProviderKey =
           /no (?:chat )?providers? are configured|no ai providers are configured/i.test(diagnostic);
         setChatError(
-          noProviderKey
+          isMasterAdmin
+            ? `Chat request failed: ${diagnostic}`
+            : noProviderKey
             ? "No AI provider key is configured. Add your Gemini API key in Settings > BYOK, or ask your administrator to configure the server key."
             : authorizationFailure
             ? "AI provider authorization failed. Update your API key in Settings > BYOK, or ask your administrator to check the server credentials."
@@ -5435,6 +5865,9 @@ function MainChatApp() {
         );
       }
     } finally {
+      if (activeChatAbortControllerRef.current === controller) {
+        activeChatAbortControllerRef.current = null;
+      }
       if (finalReply.trim()) {
         const extracted = extractCodeBlock(finalReply);
         const sanitized = sanitizeGenieOutput(finalReply);
@@ -5445,6 +5878,12 @@ function MainChatApp() {
           senderName: "Personal AI Genie",
           sender_name: "Personal AI Genie",
           modelUsed: finalModel,
+          source: finalSource,
+          provider: finalProvider,
+          providerModel: finalProviderModel,
+          autoFallback: finalAutoFallback,
+          agentName: finalAgentOutput?.agent_name,
+          agentOutput: finalAgentOutput,
           extractedCode: extracted || undefined,
         };
         if (isTeamMode) {
@@ -5453,13 +5892,23 @@ function MainChatApp() {
             content: sanitized,
             sender_type: "assistant",
             sender_name: responseMessage.sender_name,
+            source: responseMessage.source,
+            agent_name: responseMessage.agentName,
           });
         } else {
-          setTopics((previous) => previous.map((topic) => {
-            if (topic.id !== topicIdForRequest) return topic;
-            const nextMessages = [...topic.messages, responseMessage];
-            return { ...topic, messages: nextMessages, message_count: nextMessages.length };
-          }));
+          if (sessionArchiveForRequest && currentSession) {
+            setSessions((previous) => previous.map((session) =>
+              session.id === currentSession.id
+                ? { ...session, messages: [...session.messages, responseMessage] }
+                : session
+            ));
+          } else {
+            setTopics((previous) => previous.map((topic) => {
+              if (topic.id !== topicIdForRequest) return topic;
+              const nextMessages = [...topic.messages, responseMessage];
+              return { ...topic, messages: nextMessages, message_count: nextMessages.length };
+            }));
+          }
           if (activeTopicId === topicIdForRequest) {
             setPersonalMessages((previous) => [...previous, responseMessage]);
           }
@@ -5467,6 +5916,9 @@ function MainChatApp() {
 
         if (extracted) setActiveCanvas(extracted);
       }
+      setStreamingPreview("");
+      setStreamingProvider(null);
+      setStreamingAutoFallback(false);
       setIsStreaming(false);
     }
   }

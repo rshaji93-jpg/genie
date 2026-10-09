@@ -2,21 +2,28 @@ import asyncio
 from contextlib import closing
 import hashlib
 import hmac
+import importlib
 import json
+import logging
 import os
 import re
 import requests
 import sqlite3
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
-from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import id_token as google_id_token
 
 try:
     from .knowledge_registry import get_platform_system_manifest
@@ -26,11 +33,15 @@ except ImportError:
     from security import sanitize_ai_output
 
 BACKEND_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BACKEND_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(BACKEND_DIR / ".env", override=False)
 load_dotenv(BACKEND_DIR.parent / ".env.local", override=False)
 load_dotenv(BACKEND_DIR.parent / ".env", override=False)
 
 app = FastAPI(title="Personal AI Genie API", version="4.8.0")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,23 +51,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DEFAULT_GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+GOOGLE_CLIENT_ID = os.getenv(
+    "GOOGLE_CLIENT_ID",
+    "767453349146-honr4mjea5jgv23andq145fqtcjdor0t.apps.googleusercontent.com",
+).strip()
 
-# Cascade list of free models to try on OpenRouter in order of priority
+# Resilient models for upstream inference
 OPENROUTER_FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
     "openrouter/free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "mistralai/mistral-7b-instruct:free",
 ]
 OPENROUTER_KEY_RE = re.compile(r"^sk-or-[0-9A-Za-z_-]{40,}$")
-GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash"]
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+OPENROUTER_STREAM_MODELS = [
+    "deepseek/deepseek-r1:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemini-2.0-flash-exp:free",
+]
+
+LOCAL_CHITCHAT_PATTERNS = (
+    (
+        re.compile(r"^(hi|hello|hey|greetings|good\s+(morning|afternoon|evening|day))\b", re.IGNORECASE),
+        "Hello! I'm Personal AI Genie. How can I assist your workspace today?",
+    ),
+    (
+        re.compile(r"^(how\s+are\s+you|how\s+is\s+it\s+going|how're\s+you|how\s+do\s+you\s+do)\b", re.IGNORECASE),
+        "I'm running smoothly and fully operational! How can I help you today?",
+    ),
+    (
+        re.compile(r"^(who\s+am\s+i|what\s+about\s+me)\b", re.IGNORECASE),
+        "You are in your sovereign Personal AI Genie workspace. Check your profile settings to view your account details and active privileges!",
+    ),
+    (
+        re.compile(r"^who\s+are\s+you\b", re.IGNORECASE),
+        "I'm Personal AI Genie, your local workspace assistant. How can I help?",
+    ),
+    (
+        re.compile(r"^(thank\s+you|thanks|cool|awesome|great|ok|okay|bye|goodbye)\b", re.IGNORECASE),
+        "You're welcome! I'm here whenever you need me.",
+    ),
+)
 ALLOWED_ROOM_REACTIONS = frozenset(
     "❤️ 👍 👏 😂 🔥 🎉 😊 🙏 💡 📚 🎯 ✨ 🚀 😍 🥰 🤔 😮 😢 😡 🤝 ✅ ❌ ⭐ 💯 👀 🙌 🤩 😎 🥳 💪 🫡 👏🏻 💚 💙 💜 🧡 🤍 🤣 😴".split()
 )
 VIP_SESSION_LIMIT = 20
 VIP_SESSION_TTL_SECONDS = 90
 DAILY_MESSAGE_LIMIT = 20
-GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
+ADMIN_EMAILS = ["rshaji93@gmail.com"]
 VIP_ALLOWED_EMAILS = {
     email.strip().lower()
     for email in os.getenv(
@@ -227,6 +271,7 @@ def scrub_sensitive_tokens(text: str) -> str:
         scrubbed = re.sub(pattern, "[REDACTED]", scrubbed, flags=re.IGNORECASE)
     return sanitize_ai_output(scrubbed)
 
+
 class ChatMessage(BaseModel):
     role: str
     content: str = ""
@@ -244,6 +289,7 @@ class ChatMessage(BaseModel):
     deleted: bool = False
     isDeleted: bool = False
 
+
 class ChatRequest(BaseModel):
     user_email: Optional[str] = None
     google_id_token: Optional[str] = None
@@ -254,6 +300,9 @@ class ChatRequest(BaseModel):
     language_code: Optional[str] = "en-IN"
     is_team_chat: Optional[bool] = False
     is_observer_active: Optional[bool] = False
+    observer_mode: Optional[bool] = None
+    engine: str = "cloud_ai"
+    agent_target: str = "manager"
     models_cascade: Optional[List[str]] = None
 
 
@@ -276,6 +325,9 @@ class PersonalTopicChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20000)
     message_id: Optional[str] = Field(default=None, max_length=128)
     custom_api_key: Optional[str] = None
+    observer_mode: Optional[bool] = None
+    engine: str = "cloud_ai"
+    agent_target: str = "manager"
 
 
 class VipSessionRequest(BaseModel):
@@ -284,6 +336,7 @@ class VipSessionRequest(BaseModel):
     is_vip: bool = False
     google_id_token: Optional[str] = None
     action: str = "heartbeat"
+
 
 class TeamReviewRequest(BaseModel):
     room_id: str = Field(min_length=1, max_length=128)
@@ -337,13 +390,10 @@ def is_encrypted_message_envelope(value: Any) -> bool:
     )
 
 
-def get_verified_archive_identity(authorization: Optional[str]) -> Dict[str, str]:
+def get_verified_archive_identity(authorization: Optional[str]) -> Optional[Dict[str, str]]:
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Google sign-in is required for archive access.")
-    identity = verify_google_id_token_claims(authorization.removeprefix("Bearer ").strip())
-    if not identity:
-        raise HTTPException(status_code=401, detail="Google ID token verification failed.")
-    return identity
+        return None
+    return verify_google_id_token_claims(authorization.removeprefix("Bearer ").strip())
 
 
 def save_archive_snapshot(
@@ -478,6 +528,11 @@ class RoomManager:
                         replaced = True
                         break
                 if not replaced:
+                    if room_id.startswith("share_") and len(members) >= 2:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="This shared conversation already has two members.",
+                        )
                     members.append(member)
                 host_id = row[1] if row else (
                     requested_host_id
@@ -583,12 +638,19 @@ class RoomManager:
                 for (message_json,) in rows
                 if (message := json.loads(message_json))
             }
-            self._persist_room_member(
-                room_id,
-                connection,
-                getattr(connection, "room_title", room_id),
-                getattr(connection, "requested_host_id", ""),
-            )
+            try:
+                self._persist_room_member(
+                    room_id,
+                    connection,
+                    getattr(connection, "room_title", room_id),
+                    getattr(connection, "requested_host_id", ""),
+                )
+            except (HTTPException, sqlite3.Error, ValueError, TypeError):
+                self.connections[room_id].discard(connection.websocket)
+                self.identities.pop(connection.websocket, None)
+                if not self.connections[room_id]:
+                    self.connections.pop(room_id, None)
+                raise
             for message in self.messages[room_id].values():
                 if (
                     message["user_id"] != connection.client_id
@@ -701,6 +763,21 @@ class RoomManager:
                     "reactions": {},
                     "role": "assistant" if event.get("sender_type") == "assistant" else "user",
                 }
+                source = event.get("source")
+                if source in (
+                    "gemini-2.5-flash",
+                    "gemini-2.0-flash",
+                    "gemini-1.5-flash",
+                    "openrouter-fallback",
+                    "backend-manifest",
+                    "cloud_ai",
+                    "local_agent",
+                ):
+                    message["source"] = source
+                if isinstance(event.get("agent_name"), str):
+                    message["agent_name"] = event["agent_name"][:80]
+                if isinstance(event.get("agent_output"), dict):
+                    message["agent_output"] = event["agent_output"]
                 eligible_recipients = []
                 for peer in list(self.connections.get(room_id, set())):
                     recipient = self.identities.get(peer)
@@ -937,6 +1014,8 @@ def authorize_room_member(
 ):
     client_id = f"google:{identity['sub']}"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        if room_id.startswith("share_"):
+            connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             """
             SELECT title, host_id, members_json, passcode_salt, passcode_hash
@@ -986,6 +1065,8 @@ def authorize_room_member(
         members = json.loads(row[2])
         if any(member.get("id") == client_id for member in members):
             return
+        if room_id.startswith("share_") and len(members) >= 2:
+            raise HTTPException(status_code=403, detail="This shared conversation already has two members.")
         if not row[3] or not row[4] or len(normalized_passcode) < 6:
             raise HTTPException(status_code=403, detail="Room membership or a valid room passcode is required.")
         try:
@@ -1178,36 +1259,36 @@ async def unblock_friend(req: FriendRelationshipRequest):
 
 @app.get("/api/friends/blocked-list")
 async def get_blocked_friends(
-            user_id: str,
-            authorization: Optional[str] = Header(default=None),
+    user_id: str,
+    authorization: Optional[str] = Header(default=None),
 ):
-            if not authorization or not authorization.startswith("Bearer "):
-                raise HTTPException(status_code=401, detail="Google sign-in is required.")
-            identity = await asyncio.to_thread(verified_identity_from_token, authorization.removeprefix("Bearer ").strip())
-            if canonical_user_id(user_id) != identity["sub"]:
-                raise HTTPException(status_code=403, detail="You can only view your own blocked users.")
-            with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
-                rows = connection.execute(
-                    """
-                    SELECT b.blocked_id, d.display_name, d.handle, d.avatar_url
-                    FROM user_blocks b
-                    LEFT JOIN social_directory d ON d.user_id = b.blocked_id
-                    WHERE b.blocker_id = ?
-                    ORDER BY COALESCE(d.handle, d.display_name, b.blocked_id) COLLATE NOCASE
-                    """,
-                    (identity["sub"],),
-                ).fetchall()
-            return {
-                "blocked_users": [
-                    {
-                        "user_id": blocked_id,
-                        "display_name": display_name or handle or "Genie user",
-                        "handle": handle or display_name or "Genie user",
-                        "avatar_url": avatar_url or "",
-                    }
-                    for blocked_id, display_name, handle, avatar_url in rows
-                ]
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
+    identity = await asyncio.to_thread(verified_identity_from_token, authorization.removeprefix("Bearer ").strip())
+    if canonical_user_id(user_id) != identity["sub"]:
+        raise HTTPException(status_code=403, detail="You can only view your own blocked users.")
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        rows = connection.execute(
+            """
+            SELECT b.blocked_id, d.display_name, d.handle, d.avatar_url
+            FROM user_blocks b
+            LEFT JOIN social_directory d ON d.user_id = b.blocked_id
+            WHERE b.blocker_id = ?
+            ORDER BY COALESCE(d.handle, d.display_name, b.blocked_id) COLLATE NOCASE
+            """,
+            (identity["sub"],),
+        ).fetchall()
+    return {
+        "blocked_users": [
+            {
+                "user_id": blocked_id,
+                "display_name": display_name or handle or "Genie user",
+                "handle": handle or display_name or "Genie user",
+                "avatar_url": avatar_url or "",
             }
+            for blocked_id, display_name, handle, avatar_url in rows
+        ]
+    }
 
 
 @app.post("/api/crypto/public-key")
@@ -1378,30 +1459,19 @@ def read_root():
 
 def verify_google_id_token_claims(id_token: Optional[str]) -> Optional[Dict[str, str]]:
     """Verify a Google ID token and return its verified identity claims."""
-    client_id = (os.getenv("NEXT_PUBLIC_GOOGLE_CLIENT_ID") or "").strip()
-    client_id = client_id or (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
     token = (id_token or "").strip()
-    if not client_id or not token or len(token) > 8192:
+    if not token or len(token) > 8192:
         return None
     try:
-        response = requests.get(
-            GOOGLE_TOKENINFO_URL,
-            params={"id_token": token},
-            timeout=8.0,
+        claims = google_id_token.verify_oauth2_token(
+            token,
+            GoogleAuthRequest(),
+            audience=GOOGLE_CLIENT_ID,
         )
-        if response.status_code != 200:
-            return None
-        claims = response.json()
-        audience = claims.get("aud")
-        issuer = claims.get("iss")
-        expires_at = int(claims.get("exp", "0"))
         email = str(claims.get("email") or "").strip().lower()
         email_verified = claims.get("email_verified") is True or claims.get("email_verified") == "true"
         if (
-            audience != client_id
-            or issuer not in ("accounts.google.com", "https://accounts.google.com")
-            or expires_at <= int(time.time())
-            or not claims.get("sub")
+            not claims.get("sub")
             or not email
             or not email_verified
         ):
@@ -1411,7 +1481,7 @@ def verify_google_id_token_claims(id_token: Optional[str]) -> Optional[Dict[str,
             "sub": str(claims["sub"]),
             "name": str(claims.get("name") or ""),
         }
-    except (requests.RequestException, ValueError, TypeError):
+    except (GoogleAuthError, requests.RequestException, ValueError, TypeError):
         return None
 
 
@@ -1443,6 +1513,136 @@ def consume_daily_message(identity: str):
             )
         daily_message_counts[key] = used + 1
 
+
+def get_account_limits(identity: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    if identity and identity["email"].lower() in ADMIN_EMAILS:
+        return {
+            "tier": "vip_admin",
+            "chats_remaining": 999999,
+            "is_vip": True,
+            "unlimited": True,
+        }
+    email = identity["email"].lower() if identity else ""
+    with daily_message_counts_lock:
+        used = daily_message_counts.get(
+            (f"google:{email}", datetime.now(timezone.utc).date().isoformat()),
+            0,
+        )
+    return {
+        "tier": "standard",
+        "chats_remaining": max(0, DAILY_MESSAGE_LIMIT - used),
+        "is_vip": False,
+        "unlimited": False,
+    }
+
+
+@app.get("/api/auth/me")
+async def get_authenticated_profile(
+    authorization: Optional[str] = Header(default=None),
+):
+    token = authorization.removeprefix("Bearer ").strip() if authorization and authorization.startswith("Bearer ") else ""
+    identity = await asyncio.to_thread(verify_google_id_token_claims, token)
+    if not identity:
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
+    return {"user": identity, **get_account_limits(identity)}
+
+
+@app.get("/api/limits")
+async def get_authenticated_limits(
+    authorization: Optional[str] = Header(default=None),
+):
+    token = authorization.removeprefix("Bearer ").strip() if authorization and authorization.startswith("Bearer ") else ""
+    identity = await asyncio.to_thread(verify_google_id_token_claims, token)
+    if not identity:
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
+    return get_account_limits(identity)
+
+
+def is_safety_placeholder(response_text: str) -> bool:
+    lowered = response_text.lower().strip()
+    return "user safety: safe" in lowered or "response safety: safe" in lowered
+
+
+def evaluate_local_chitchat(message: str) -> Optional[str]:
+    cleaned_message = message.strip()
+    for pattern, reply in LOCAL_CHITCHAT_PATTERNS:
+        if pattern.search(cleaned_message):
+            return reply
+    return None
+
+
+def build_platform_recovery_response() -> str:
+    return (
+        "I’m temporarily unable to reach the AI providers, so I can’t answer general questions right now. "
+        "I can still help with Personal AI Genie platform questions:\n\n"
+        + get_platform_system_manifest()
+        + "\n\nPlease try your request again shortly."
+    )
+
+
+LOCAL_AGENT_MODULES = {
+    "manager": ("manager_agent", "Manager Agent"),
+    "job_hunter": ("job_hunter", "Job Hunter"),
+    "apply_runner": ("local_apply_runner", "Apply Runner"),
+    "hub": ("hub_app", "Hub Operations"),
+}
+
+
+def dispatch_local_agent(agent_target: str, task: str) -> Dict[str, Any]:
+    module_info = LOCAL_AGENT_MODULES.get(agent_target)
+    if module_info is None:
+        raise HTTPException(status_code=400, detail="Unknown local agent target.")
+    module_name, display_name = module_info
+    try:
+        agent_module = importlib.import_module(module_name)
+    except ImportError as error:
+        logger.exception("Unable to load local agent module %s.", module_name)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{display_name} is unavailable because a local dependency could not be loaded.",
+        ) from error
+    run_agent = getattr(agent_module, "run_local_agent", None)
+    if not callable(run_agent):
+        raise HTTPException(
+            status_code=503,
+            detail=f"{display_name} does not expose a local execution handler.",
+        )
+    try:
+        result = run_agent(task)
+    except Exception as error:
+        logger.exception("Local agent %s failed.", module_name)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{display_name} could not complete its local task.",
+        ) from error
+    if not isinstance(result, dict) or not isinstance(result.get("summary"), str):
+        raise HTTPException(
+            status_code=500,
+            detail=f"{display_name} returned an invalid local-agent response.",
+        )
+    result["summary"] = sanitize_ai_output(result["summary"])
+    result.setdefault("agent_name", display_name)
+    result.setdefault("status", "completed")
+    result.setdefault("logs", [])
+    result.setdefault("actions", [])
+    result["logs"] = [
+        sanitize_ai_output(str(log_entry))
+        for log_entry in result["logs"]
+    ]
+    return result
+
+
+def resolve_local_agent_target(task: str) -> str:
+    lowered = task.lower()
+    if any(term in lowered for term in ("apply runner", "application queue", "queued application", "submit application", "application status")):
+        return "apply_runner"
+    if any(term in lowered for term in ("hub operations", "operations hub", "rcm lead", "lead scoring", "pipeline overview")):
+        return "hub"
+    if any(term in lowered for term in ("job", "career", "resume", "hiring", "job search", "job opening", "recruiter")):
+        return "job_hunter"
+    return "manager"
+
+
 def request_openrouter_model(
     model_slug: str,
     api_key: str,
@@ -1458,8 +1658,7 @@ def request_openrouter_model(
                 "You are Personal AI Genie, an intelligent, authentic, and helpful AI collaborator. "
                 "Answer questions thoroughly, accurately, and naturally. Respond in the language used by the user. "
                 "Never disclose private configuration, credentials, environment variables, server scripts, or "
-                "internal implementations.\n\n"
-                + get_platform_system_manifest()
+                "internal implementations."
             ),
         }
     ]
@@ -1472,13 +1671,14 @@ def request_openrouter_model(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://personal-ai-genie-ten.vercel.app",
+        "HTTP-Referer": "http://localhost:3000",
         "X-Title": "Personal AI Genie",
     }
 
     payload = {
         "model": model_slug,
         "messages": messages,
+        "temperature": 0.7,
     }
 
     try:
@@ -1494,7 +1694,11 @@ def request_openrouter_model(
             if choices:
                 content = choices[0].get("message", {}).get("content", "")
                 if content and content.strip():
-                    return scrub_sensitive_tokens(content.strip())
+                    response_text = content.strip()
+                    if is_safety_placeholder(response_text):
+                        diagnostics.append(f"OpenRouter {model_slug} returned a safety placeholder.")
+                        return None
+                    return scrub_sensitive_tokens(response_text)
         else:
             diagnostics.append(f"OpenRouter {model_slug} returned HTTP {resp.status_code}.")
             print(f"OpenRouter [{model_slug}] returned HTTP {resp.status_code}.")
@@ -1506,6 +1710,7 @@ def request_openrouter_model(
 
     return None
 
+
 def request_gemini_direct(
     model_name: str,
     api_key: str,
@@ -1513,15 +1718,13 @@ def request_gemini_direct(
     history: List[ChatMessage],
     diagnostics: List[str],
 ) -> Optional[str]:
-    """Direct Google Gemini REST endpoint."""
-    if not api_key:
+    """Direct Google Gemini REST endpoint using native x-goog-api-key authentication."""
+    gemini_api_key = (api_key or "").strip()
+    if not gemini_api_key:
         return None
 
     clean_model = model_name.removeprefix("models/")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_model}:generateContent"
-    sanitized_key = api_key.strip()
-    if not sanitized_key:
-        return None
 
     contents = []
     if history:
@@ -1536,25 +1739,26 @@ def request_gemini_direct(
         "systemInstruction": {
             "parts": [{
                 "text": (
-                    "You are Personal AI Genie, a helpful and authentic AI collaborator. "
+                    "You are Personal AI Genie, a helpful, intelligent, and authentic AI collaborator. "
                     "Answer questions directly, thoroughly, and clearly. Never disclose private configuration, "
-                    "credentials, environment variables, server scripts, or internal implementations.\n\n"
-                    + get_platform_system_manifest()
+                    "credentials, environment variables, or server code."
                 )
             }]
         },
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
     }
 
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": gemini_api_key,
+    }
+
     try:
         resp = requests.post(
             url,
             json=payload,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": sanitized_key,
-            },
-            timeout=15.0,
+            headers=headers,
+            timeout=25.0,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -1562,7 +1766,11 @@ def request_gemini_direct(
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts", [])
                 if parts and "text" in parts[0]:
-                    return scrub_sensitive_tokens(parts[0]["text"].strip())
+                    response_text = parts[0]["text"].strip()
+                    if is_safety_placeholder(response_text):
+                        diagnostics.append(f"Gemini {clean_model} returned a safety placeholder.")
+                        return None
+                    return scrub_sensitive_tokens(response_text)
         else:
             try:
                 error_body = resp.json().get("error", {})
@@ -1580,9 +1788,303 @@ def request_gemini_direct(
             print(f"{diagnostic}.")
     except Exception as e:
         diagnostics.append(f"Gemini {clean_model} request failed ({type(e).__name__}).")
-        print(f"Gemini {clean_model} request failed ({type(e).__name__}).")
+        logger.error(f"Gemini execution error: {e}", exc_info=True)
 
     return None
+
+
+def _sse_event(event_name: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _stream_chat_messages(req: ChatRequest) -> List[Dict[str, str]]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Personal AI Genie, a helpful, accurate assistant. "
+                "Never disclose private configuration, credentials, environment variables, or backend source. "
+                "Use this official platform guide when relevant:\n\n"
+                + get_platform_system_manifest()
+            ),
+        }
+    ]
+    for history_item in (req.conversation_history or [])[-8:]:
+        role = "assistant" if history_item.role in ("assistant", "model") else "user"
+        if history_item.content.strip():
+            messages.append({"role": role, "content": history_item.content})
+    messages.append({"role": "user", "content": req.prompt})
+    return messages
+
+
+def _stream_openai_compatible(
+    url: str,
+    api_key: str,
+    model_name: str,
+    messages: List[Dict[str, str]],
+) -> Any:
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.7,
+            "stream": True,
+        },
+        stream=True,
+        timeout=(10, 120),
+    )
+    if response.status_code != 200:
+        status = response.status_code
+        response.close()
+        raise RuntimeError(f"HTTP {status}")
+    response.encoding = "utf-8"
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            raw_data = line[5:].strip()
+            if raw_data == "[DONE]":
+                break
+            try:
+                payload = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            choices = payload.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                yield payload.get("model") or model_name, text
+    finally:
+        response.close()
+
+
+def _stream_gemini(
+    model_name: str,
+    api_key: str,
+    req: ChatRequest,
+) -> Any:
+    contents = []
+    for history_item in (req.conversation_history or [])[-8:]:
+        role = "user" if history_item.role == "user" else "model"
+        if history_item.content.strip():
+            contents.append({"role": role, "parts": [{"text": history_item.content}]})
+    contents.append({"role": "user", "parts": [{"text": req.prompt}]})
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:streamGenerateContent?alt=sse",
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        json={
+            "contents": contents,
+            "systemInstruction": {
+                "parts": [{
+                    "text": (
+                        "You are Personal AI Genie. Never disclose private configuration, credentials, "
+                        "environment variables, or backend source. Official platform guide:\n\n"
+                        + get_platform_system_manifest()
+                    )
+                }]
+            },
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048},
+        },
+        stream=True,
+        timeout=(10, 120),
+    )
+    if response.status_code != 200:
+        status = response.status_code
+        response.close()
+        raise RuntimeError(f"HTTP {status}")
+    response.encoding = "utf-8"
+    try:
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            try:
+                payload = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+            candidates = payload.get("candidates") or []
+            if not candidates:
+                continue
+            parts = candidates[0].get("content", {}).get("parts", [])
+            for part in parts:
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    yield model_name, text
+    finally:
+        response.close()
+
+
+def _chat_stream_events(req: ChatRequest) -> Any:
+    messages = _stream_chat_messages(req)
+    providers: List[tuple[str, str, Any]] = []
+    gemini_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+    if gemini_key:
+        providers.append(("Google Gemini", "gemini-2.5-flash", lambda model: _stream_gemini(model, gemini_key, req)))
+        providers.append(("Google Gemini", "gemini-2.0-flash", lambda model: _stream_gemini(model, gemini_key, req)))
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key:
+        providers.append(("Groq Cloud", "llama-3.3-70b-versatile", lambda model: _stream_openai_compatible(
+            "https://api.groq.com/openai/v1/chat/completions", groq_key, model, messages
+        )))
+    mistral_key = os.getenv("MISTRAL_API_KEY", "").strip()
+    if mistral_key:
+        for mistral_model in ("mistral-small-latest", "codestral-latest"):
+            providers.append(("Mistral AI", mistral_model, lambda model, key=mistral_key: _stream_openai_compatible(
+                "https://api.mistral.ai/v1/chat/completions", key, model, messages
+            )))
+    github_key = (os.getenv("GITHUB_MODELS_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()
+    if github_key:
+        providers.append(("GitHub Models", "gpt-4o-mini", lambda model: _stream_openai_compatible(
+            "https://models.inference.ai.azure.com/chat/completions", github_key, model, messages
+        )))
+
+    completed = False
+    for provider_name, model_name, stream_factory in providers:
+        try:
+            token_stream = iter(stream_factory(model_name))
+            first_item = next(token_stream, None)
+            if first_item is None:
+                raise RuntimeError("Provider returned an empty stream")
+            active_model, first_text = first_item
+            yield _sse_event("meta", {"provider": provider_name, "model": active_model})
+            yield _sse_event("token", {"text": scrub_sensitive_tokens(first_text)})
+            for active_model, text in token_stream:
+                yield _sse_event("token", {"text": scrub_sensitive_tokens(text)})
+            completed = True
+            break
+        except Exception as error:
+            reason = str(error) if str(error).startswith("HTTP ") else type(error).__name__
+            yield _sse_event("fallback", {"failed": provider_name, "reason": reason})
+
+    if not completed:
+        openrouter_key = (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_KEY).strip()
+        if openrouter_key:
+            try:
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openrouter_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "http://localhost:3000",
+                        "X-Title": "Personal AI Genie",
+                    },
+                    json={
+                        "models": OPENROUTER_STREAM_MODELS,
+                        "messages": messages,
+                        "temperature": 0.7,
+                        "stream": True,
+                    },
+                    stream=True,
+                    timeout=(10, 120),
+                )
+                if response.status_code != 200:
+                    status = response.status_code
+                    response.close()
+                    raise RuntimeError(f"HTTP {status}")
+                response.encoding = "utf-8"
+                active_model = "OpenRouter free-model cascade"
+                emitted_meta = False
+                try:
+                    for line in response.iter_lines(decode_unicode=True):
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw_data = line[5:].strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            payload = json.loads(raw_data)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = payload.get("choices") or []
+                        if not choices:
+                            continue
+                        text = (choices[0].get("delta") or {}).get("content")
+                        if not isinstance(text, str) or not text:
+                            continue
+                        active_model = payload.get("model") or active_model
+                        if not emitted_meta:
+                            yield _sse_event("meta", {"provider": "OpenRouter", "model": active_model})
+                            emitted_meta = True
+                        yield _sse_event("token", {"text": scrub_sensitive_tokens(text)})
+                finally:
+                    response.close()
+                if not emitted_meta:
+                    raise RuntimeError("Provider returned an empty stream")
+                completed = True
+            except Exception as error:
+                reason = str(error) if str(error).startswith("HTTP ") else type(error).__name__
+                yield _sse_event("fallback", {"failed": "OpenRouter", "reason": reason})
+
+    if not completed:
+        yield _sse_event("error", {"message": "All configured chat providers are unavailable."})
+    yield _sse_event("done", {"status": "success" if completed else "error"})
+
+
+@app.post("/api/chat/stream")
+async def stream_chat(req: ChatRequest, request: Request):
+    if req.is_team_chat:
+        raise HTTPException(status_code=400, detail="Team messages cannot use the AI streaming endpoint.")
+    verified_email = verify_google_id_token(req.google_id_token) if req.google_id_token else None
+    if req.google_id_token and not verified_email:
+        raise HTTPException(status_code=401, detail="Google ID token verification failed.")
+    if not (req.observer_mode if req.observer_mode is not None else req.engine == "cloud_ai"):
+        raise HTTPException(status_code=400, detail="Streaming cascade is available only in Observer mode.")
+    is_master_admin = bool(verified_email and verified_email.lower() in ADMIN_EMAILS)
+    if not is_master_admin and not (req.custom_api_key or "").strip():
+        consume_daily_message(get_chat_identity(request, verified_email))
+    return StreamingResponse(
+        _chat_stream_events(req),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/voice/transcribe")
+async def transcribe_voice(file: UploadFile = File(...)):
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_key:
+        raise HTTPException(status_code=503, detail="Voice transcription is unavailable because Groq is not configured.")
+    max_audio_size = 25 * 1024 * 1024
+    audio_bytes = await file.read(max_audio_size + 1)
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="The audio recording is empty.")
+    if len(audio_bytes) > max_audio_size:
+        raise HTTPException(status_code=413, detail="Audio recordings must be 25 MB or smaller.")
+    filename = Path(file.filename or "recording.webm").name
+    content_type = file.content_type or "application/octet-stream"
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {groq_key}"},
+            data={"model": "whisper-large-v3", "temperature": "0.0", "response_format": "json"},
+            files={"file": (filename, audio_bytes, content_type)},
+            timeout=90.0,
+        )
+    except requests.RequestException as error:
+        logger.warning("Groq voice transcription request failed: %s", type(error).__name__)
+        raise HTTPException(status_code=502, detail="The voice transcription provider could not be reached.") from error
+    if response.status_code != 200:
+        logger.warning("Groq voice transcription returned HTTP %s.", response.status_code)
+        raise HTTPException(status_code=502, detail="The voice transcription provider rejected the recording.")
+    try:
+        text = response.json().get("text")
+    except (ValueError, AttributeError) as error:
+        raise HTTPException(status_code=502, detail="The voice transcription provider returned invalid data.") from error
+    if not isinstance(text, str):
+        raise HTTPException(status_code=502, detail="The voice transcription provider returned no transcript.")
+    return {"text": text.strip()}
+
 
 @app.post("/api/chat")
 @app.post("//api/chat")
@@ -1596,42 +2098,80 @@ async def handle_chat(req: ChatRequest, request: Request):
     verified_email = verify_google_id_token(req.google_id_token) if req.google_id_token else None
     if req.google_id_token and not verified_email:
         raise HTTPException(status_code=401, detail="Google ID token verification failed.")
-    if not (req.custom_api_key or "").strip():
+    is_master_admin = bool(verified_email and verified_email.lower() in ADMIN_EMAILS)
+    account_limits = get_account_limits({"email": verified_email}) if verified_email else {}
+    if req.engine not in ("cloud_ai", "local_agent"):
+        raise HTTPException(status_code=400, detail="Unknown chat engine.")
+    observer_mode = req.observer_mode if req.observer_mode is not None else req.engine == "cloud_ai"
+    if not observer_mode:
+        chitchat_reply = evaluate_local_chitchat(req.prompt)
+        if chitchat_reply:
+            return {
+                "reply": chitchat_reply,
+                "source": "platform_engine",
+                "intent": "chitchat",
+            }
+        agent_target = resolve_local_agent_target(req.prompt)
+        agent_output = await asyncio.to_thread(
+            dispatch_local_agent,
+            agent_target,
+            req.prompt,
+        )
+        return {
+            "reply": agent_output["summary"],
+            "model_used": "local-python-agent",
+            "source": "platform_engine",
+            "agent_name": agent_output["agent_name"],
+            "agent_output": agent_output,
+            **account_limits,
+        }
+    if not is_master_admin and not (req.custom_api_key or "").strip():
         consume_daily_message(get_chat_identity(request, verified_email))
     or_key = os.getenv("OPENROUTER_API_KEY", OPENROUTER_KEY).strip()
     user_gemini_key = (req.custom_api_key or "").strip()
-    server_gemini_key = (os.getenv("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY).strip()
+    server_gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_key = user_gemini_key or server_gemini_key
     diagnostics: List[str] = []
 
-    # 1. Primary: Direct Google Gemini (if key provided and valid)
+    # 1. Primary: Direct Google Gemini Native Rest API
     if gemini_key:
         for model in GEMINI_MODELS:
             reply = request_gemini_direct(model, gemini_key, req.prompt, history, diagnostics)
             if reply:
-                return {"reply": reply, "model_used": model}
+                return {
+                    "reply": reply,
+                    "model_used": model,
+                    "source": "cloud_ai",
+                    "provider_source": "gemini",
+                    **account_limits,
+                }
 
-    # 2. Resilient OpenRouter: Loops through free routes including Llama 3.3 70B Free
+    # 2. Resilient OpenRouter Dynamic Routing
     if or_key:
         for model_slug in OPENROUTER_FREE_MODELS:
-            print(f"Attempting OpenRouter free model: {model_slug}...")
             reply = request_openrouter_model(model_slug, or_key, req.prompt, history, diagnostics)
             if reply:
-                return {"reply": reply, "model_used": model_slug}
+                return {
+                    "reply": reply,
+                    "model_used": model_slug,
+                    "source": "cloud_ai",
+                    "provider_source": "openrouter-fallback",
+                    **account_limits,
+                }
             if diagnostics and any(
                 "OpenRouter" in diagnostic and ("HTTP 401." in diagnostic or "HTTP 403." in diagnostic)
                 for diagnostic in diagnostics
             ):
                 break
 
-    if not gemini_key and not or_key:
-        raise HTTPException(
-            status_code=503,
-            detail="No AI providers are configured. Set GEMINI_API_KEY or OPENROUTER_API_KEY on the backend, or provide a BYOK key.",
-        )
-
-    diagnostic = " ".join(diagnostics) or "All configured AI providers returned empty responses."
-    raise HTTPException(status_code=503, detail=f"AI provider requests failed: {diagnostic}")
+    return {
+        "reply": build_platform_recovery_response(),
+        "model_used": "backend-manifest",
+        "source": "backend-manifest",
+        "status": "degraded",
+        "error": "ai_providers_unavailable",
+        **account_limits,
+    }
 
 
 def verify_topic_owner(token: str, requested_user_id: str) -> Dict[str, str]:
@@ -1807,8 +2347,9 @@ async def clear_personal_topic(topic_id: str, req: TopicClearRequest):
 async def personal_topic_chat(req: PersonalTopicChatRequest):
     identity = verify_topic_owner(req.google_id_token, req.user_id)
     diagnostics: List[str] = []
-    api_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_KEY)).strip()
-    openrouter_key = (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_KEY).strip()
+    if req.engine not in ("cloud_ai", "local_agent"):
+        raise HTTPException(status_code=400, detail="Unknown chat engine.")
+    observer_mode = req.observer_mode if req.observer_mode is not None else req.engine == "cloud_ai"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
         row = connection.execute(
             """
@@ -1826,32 +2367,86 @@ async def personal_topic_chat(req: PersonalTopicChatRequest):
         for message in saved_messages[-40:]
         if message.get("role") in ("user", "assistant", "model")
     ]
-    if not (req.custom_api_key or "").strip():
-        consume_daily_message(f"google:{identity['email']}")
+    is_master_admin = identity["email"].lower() in ADMIN_EMAILS
 
     reply: Optional[str] = None
     model_used = ""
-    for model in GEMINI_MODELS:
-        reply = request_gemini_direct(model, api_key, req.message, history, diagnostics)
-        if reply:
-            model_used = model
-            break
-    if not reply and openrouter_key:
-        for model in OPENROUTER_FREE_MODELS:
-            reply = request_openrouter_model(model, openrouter_key, req.message, history, diagnostics)
-            if reply:
-                model_used = model
-                break
-            if any("HTTP 401." in item or "HTTP 403." in item for item in diagnostics):
-                break
-    if not reply:
-        if not api_key and not openrouter_key:
-            raise HTTPException(
-                status_code=503,
-                detail="No AI providers are configured. Add a BYOK key or ask your administrator to configure a server key.",
-            )
-        detail = " ".join(diagnostics) or "All configured AI providers returned empty responses."
-        raise HTTPException(status_code=503, detail=f"Personal topic chat failed: {detail}")
+    agent_output: Optional[Dict[str, Any]] = None
+
+    if not observer_mode:
+        chitchat_reply = evaluate_local_chitchat(req.message)
+        if chitchat_reply:
+            now = datetime.now(timezone.utc).isoformat()
+            user_message = {
+                "id": req.message_id or uuid.uuid4().hex,
+                "role": "user",
+                "content": req.message,
+                "created_at": now,
+            }
+            assistant_message = {
+                "id": uuid.uuid4().hex,
+                "role": "assistant",
+                "content": chitchat_reply,
+                "created_at": now,
+                "source": "platform_engine",
+                "intent": "chitchat",
+            }
+            saved_messages.extend((user_message, assistant_message))
+            with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+                with connection:
+                    connection.execute(
+                        """
+                        UPDATE personal_topic_channels
+                        SET messages_json = ?, updated_at = ?
+                        WHERE user_id = ? AND topic_id = ?
+                        """,
+                        (
+                            json.dumps(saved_messages, ensure_ascii=False),
+                            now,
+                            identity["sub"],
+                            req.topic_id,
+                        ),
+                    )
+            return {
+                "reply": chitchat_reply,
+                "source": "platform_engine",
+                "intent": "chitchat",
+            }
+        agent_target = resolve_local_agent_target(req.message)
+        agent_output = await asyncio.to_thread(
+            dispatch_local_agent,
+            agent_target,
+            req.message,
+        )
+        reply = agent_output["summary"]
+        model_used = "local-python-agent"
+    else:
+        if not is_master_admin and not (req.custom_api_key or "").strip():
+            consume_daily_message(f"google:{identity['email']}")
+        api_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        openrouter_key = (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_KEY).strip()
+
+        # Try Google Gemini Native REST
+        if api_key:
+            for model in GEMINI_MODELS:
+                reply = request_gemini_direct(model, api_key, req.message, history, diagnostics)
+                if reply:
+                    model_used = model
+                    break
+
+        # Fallback to OpenRouter Free
+        if not reply and openrouter_key:
+            for model in OPENROUTER_FREE_MODELS:
+                reply = request_openrouter_model(model, openrouter_key, req.message, history, diagnostics)
+                if reply:
+                    model_used = model
+                    break
+                if any("HTTP 401." in item or "HTTP 403." in item for item in diagnostics):
+                    break
+
+        if not reply:
+            reply = build_platform_recovery_response()
+            model_used = "backend-manifest"
 
     now = datetime.now(timezone.utc).isoformat()
     user_message = {
@@ -1860,12 +2455,22 @@ async def personal_topic_chat(req: PersonalTopicChatRequest):
         "content": req.message,
         "created_at": now,
     }
+    message_source = (
+        "platform_engine"
+        if agent_output
+        else "backend-manifest"
+        if model_used == "backend-manifest"
+        else "cloud_ai"
+    )
     assistant_message = {
         "id": uuid.uuid4().hex,
         "role": "assistant",
         "content": sanitize_ai_output(reply),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_used": model_used,
+        "source": message_source,
+        "agentName": agent_output["agent_name"] if agent_output else None,
+        "agentOutput": agent_output,
     }
     saved_messages.extend((user_message, assistant_message))
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
@@ -1883,9 +2488,29 @@ async def personal_topic_chat(req: PersonalTopicChatRequest):
     return {
         "reply": assistant_message["content"],
         "model_used": model_used,
+        "source": message_source,
+        "provider_source": (
+            None
+            if model_used in ("backend-manifest", "local-python-agent")
+            else "openrouter-fallback"
+            if model_used in OPENROUTER_FREE_MODELS
+            else "gemini"
+        ),
+        "status": (
+            agent_output["status"]
+            if agent_output
+            else "degraded"
+            if model_used == "backend-manifest"
+            else "success"
+        ),
+        "error": "ai_providers_unavailable" if model_used == "backend-manifest" else None,
+        "agent_name": agent_output["agent_name"] if agent_output else None,
+        "agent_output": agent_output,
+        **get_account_limits(identity),
         "user_message": user_message,
         "assistant_message": assistant_message,
     }
+
 
 @app.post("/api/vip/session")
 async def update_vip_session(req: VipSessionRequest):
@@ -2071,6 +2696,12 @@ async def get_archive_manifest(
     authorization: Optional[str] = Header(default=None),
 ):
     identity = await asyncio.to_thread(get_verified_archive_identity, authorization)
+    if not identity:
+        return {
+            "manifest": [],
+            "status": "unauthenticated",
+            "error": "Verification failed",
+        }
     if user_id != identity["sub"]:
         raise HTTPException(status_code=403, detail="Archive manifest is only available to its owner.")
 
@@ -2230,12 +2861,17 @@ async def summarize_team_review(req: TeamReviewRequest):
     if not condensed_digest:
         raise HTTPException(status_code=400, detail="No substantive room messages were available to review.")
 
-    api_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_KEY)).strip()
+    api_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
     if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="No Gemini API key is configured for Observer review summarization.",
-        )
+        recovery_response = build_platform_recovery_response()
+        return {
+            "status": "degraded",
+            "condensed_digest": condensed_digest,
+            "executive_review": recovery_response,
+            "model_used": "backend-manifest",
+            "source": "backend-manifest",
+            "error": "ai_providers_unavailable",
+        }
 
     diagnostics: List[str] = []
     review_prompt = (
@@ -2252,13 +2888,17 @@ async def summarize_team_review(req: TeamReviewRequest):
                 "condensed_digest": condensed_digest,
                 "executive_review": scrub_sensitive_tokens(summary),
                 "model_used": model,
+                "source": "cloud_ai",
             }
 
-    raise HTTPException(
-        status_code=503,
-        detail="Observer review summarization failed: "
-        + (" ".join(diagnostics) or "Gemini returned an empty response."),
-    )
+    return {
+        "status": "degraded",
+        "condensed_digest": condensed_digest,
+        "executive_review": build_platform_recovery_response(),
+        "model_used": "backend-manifest",
+        "source": "backend-manifest",
+        "error": "ai_providers_unavailable",
+    }
 
 
 def condense_chat_history(messages: List[ChatMessage], max_recent_window: int = 15) -> str:
@@ -2310,9 +2950,11 @@ def condense_chat_history(messages: List[ChatMessage], max_recent_window: int = 
     sections.extend(f"- {item}" for item in substantive[-max_recent_window:])
     return "\n".join(sections)
 
+
 @app.post("/api/tickets")
 async def create_ticket(ticket: Dict[str, Any]):
     return {"status": "received", "ticket_id": f"TKT-{os.urandom(3).hex().upper()}"}
+
 
 @app.post("/api/room/send-invites")
 async def send_invites(payload: Dict[str, Any]):
@@ -2420,6 +3062,9 @@ async def room_websocket(websocket: WebSocket, room_id: str):
         )
         try:
             await room_manager.connect(room_id, connection)
+        except HTTPException as error:
+            await websocket.close(code=1008, reason=str(error.detail))
+            return
         except (sqlite3.Error, ValueError, TypeError) as error:
             print(f"Room initialization failed: {type(error).__name__}")
             await websocket.close(code=1011, reason="Room could not be initialized.")
@@ -2432,4 +3077,3 @@ async def room_websocket(websocket: WebSocket, room_id: str):
                 await websocket.send_json({"type": "error", "detail": "Room events must be JSON objects."})
     except WebSocketDisconnect:
         await room_manager.disconnect(room_id, websocket)
-    

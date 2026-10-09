@@ -59,6 +59,38 @@ Evaluate the candidate for this position and provide:
     )
     return interaction.output_text
 
+
+def run_local_agent(task: str) -> dict:
+    from subagents.rcm_hunter.hunter import (
+        calculate_fit_score,
+        fetch_sample_rcm_leads,
+        load_candidate_profile,
+    )
+
+    profile = load_candidate_profile()
+    scored_jobs = []
+    for job in fetch_sample_rcm_leads():
+        score = calculate_fit_score(job["title"], job["description"], profile)
+        scored_jobs.append({
+            "title": job["title"],
+            "company": job["company"],
+            "location": job["location"],
+            "score": score["score"],
+            "verdict": score["verdict"],
+            "matched_skills": score["matched_skills"],
+            "url": job["url"],
+        })
+    scored_jobs.sort(key=lambda job: job["score"], reverse=True)
+    return {
+        "agent_name": "Job Hunter",
+        "status": "completed",
+        "summary": f"Ranked {len(scored_jobs)} locally configured opportunities for: {task.strip() or 'profile matching'}.",
+        "logs": ["Compared local sample listings with the candidate profile; no cloud model was called."],
+        "actions": [],
+        "results": scored_jobs,
+    }
+
+
 def main():
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:

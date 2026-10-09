@@ -71,7 +71,8 @@ export async function callActiveGeminiCascade(
   history: Message[],
   selectedLangLabel: string,
   providedKey?: string,
-  googleIdToken?: string
+  googleIdToken?: string,
+  signal?: AbortSignal
 ): Promise<{ text: string; model: string }> {
   const conversationHistory = (history || []).slice(-6).map((msg) => ({
     role: msg.role === "assistant" ? "assistant" : "user",
@@ -87,7 +88,7 @@ export async function callActiveGeminiCascade(
     const response = await fetch(backendUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(45_000),
+      signal,
       body: JSON.stringify({
         prompt: userPrompt,
         conversation_history: conversationHistory,
@@ -109,6 +110,7 @@ export async function callActiveGeminiCascade(
       backendFailure = "Backend returned an empty chat response.";
     }
   } catch (error) {
+    if (signal?.aborted) throw error;
     backendFailure =
       error instanceof Error ? error.message : "Unknown network error while contacting chat backend.";
   }
@@ -117,7 +119,7 @@ export async function callActiveGeminiCascade(
     const fallbackResponse = await fetch("/api/genie", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal: AbortSignal.timeout(45_000),
+      signal,
       body: JSON.stringify({
         prompt: userPrompt,
         history: conversationHistory,
@@ -140,6 +142,7 @@ export async function callActiveGeminiCascade(
     }
     throw new Error("Fallback API returned an empty chat response.");
   } catch (fallbackError) {
+    if (signal?.aborted) throw fallbackError;
     const fallbackFailure =
       fallbackError instanceof Error ? fallbackError.message : "Unknown fallback API error.";
     throw new Error(`Chat backend failed (${backendFailure}); ${fallbackFailure}`);

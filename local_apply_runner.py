@@ -3,7 +3,6 @@ import sys
 import time
 import requests
 from pathlib import Path
-from playwright.sync_api import sync_playwright
 
 # PASTE YOUR WEB APP URL HERE:
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycby5cRsS8P8R_TqNnoQgSlW7rB4bgLCQD3CVZWMMXupVFasWYoopAysAr-8yCHajVw3TfA/exec"
@@ -15,10 +14,13 @@ def fetch_queue():
     url = f"{WEB_APP_URL}?action=get_queue"
     try:
         response = requests.get(url, allow_redirects=True, timeout=15)
-        return response.json()
-    except Exception as e:
-        print(f"[Error fetching queue]: {e}")
-        return []
+        response.raise_for_status()
+        queue = response.json()
+    except (requests.RequestException, ValueError) as error:
+        raise RuntimeError("Could not retrieve the application queue.") from error
+    if not isinstance(queue, list):
+        raise RuntimeError("The application queue returned an invalid response.")
+    return queue
 
 def mark_status_in_sheet(row_index: int, new_status: str):
     payload = {"action": "update_status", "rowIndex": row_index, "status": new_status}
@@ -27,6 +29,34 @@ def mark_status_in_sheet(row_index: int, new_status: str):
         print(f"[Sheet Updated] Row {row_index} set to {new_status}")
     except Exception as e:
         print(f"[Error updating sheet]: {e}")
+
+
+def run_local_agent(task: str) -> dict:
+    queue = fetch_queue()
+    jobs = [
+        {
+            "title": str(job.get("title", "Untitled role")),
+            "company": str(job.get("company", "Unknown company")),
+            "location": str(job.get("location", "Not specified")),
+            "url": str(job.get("url", "")),
+        }
+        for job in queue
+        if isinstance(job, dict)
+    ]
+    summary = (
+        f"Found {len(jobs)} queued application(s)."
+        if jobs
+        else "There are no queued applications to review."
+    )
+    return {
+        "agent_name": "Apply Runner",
+        "status": "ready_for_review" if jobs else "completed",
+        "summary": f"{summary} {task.strip()}".strip(),
+        "logs": ["Queue preview only; no browser was opened and no application was submitted."],
+        "actions": [],
+        "results": jobs,
+    }
+
 
 def run_application(job: dict, p):
     print("\n" + "=" * 65)
@@ -74,6 +104,8 @@ def run_application(job: dict, p):
     return choice != 'q'
 
 def main():
+    from playwright.sync_api import sync_playwright
+
     if "YOUR_APPS_SCRIPT_WEB_APP" in WEB_APP_URL:
         print("Please edit local_apply_runner.py and replace YOUR_APPS_SCRIPT_WEB_APP_URL_HERE with your real Web App URL.")
         return
