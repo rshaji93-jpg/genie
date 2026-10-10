@@ -43,9 +43,11 @@ except ImportError:
 try:
     from .knowledge_registry import get_platform_system_manifest
     from .security import sanitize_ai_output
+    from .gemini_pool import gemini_pool
 except ImportError:
     from knowledge_registry import get_platform_system_manifest
     from security import sanitize_ai_output
+    from gemini_pool import gemini_pool
 
 BACKEND_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BACKEND_DIR.parent
@@ -4070,7 +4072,7 @@ def _stream_gemini(
 def _chat_stream_events(req: ChatRequest) -> Any:
     messages = _stream_chat_messages(req)
     providers: List[tuple[str, str, Any]] = []
-    gemini_key = (req.custom_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+    gemini_key = (req.custom_api_key or gemini_pool.get_key()).strip()
     if gemini_key:
         providers.append(("Google Gemini", "gemini-2.5-flash", lambda model: _stream_gemini(model, gemini_key, req)))
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
@@ -4105,6 +4107,10 @@ def _chat_stream_events(req: ChatRequest) -> Any:
             completed = True
             break
         except Exception as error:
+            if provider_name == "Google Gemini" and (
+                "429" in str(error) or "RESOURCE_EXHAUSTED" in str(error)
+            ):
+                gemini_pool.mark_rate_limited(gemini_key)
             reason = str(error) if str(error).startswith("HTTP ") else type(error).__name__
             yield _sse_event("fallback", {"failed": provider_name, "reason": reason})
 
