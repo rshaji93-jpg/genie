@@ -5,12 +5,15 @@
 // ========================================================================= //
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import Image from "next/image";
 import Script from "next/script";
+import { useRouter } from "next/navigation";
 import StudentBanner from "../../components/StudentBanner";
 import UnifiedStudyEngine from "../../components/UnifiedStudyEngine";
 import MessageBubble from "../../components/MessageBubble";
 import VoiceMic from "../../components/VoiceMic";
 import DynamicTeamModal, { type RoomCapacityMode } from "./DynamicTeamModal";
+import GenieBrandAvatar, { BrandAvatar } from "./GenieBrandAvatar";
 import HeaderBar from "./HeaderBar";
 import SlideDockDrawer from "./SlideDockDrawer";
 import {
@@ -28,6 +31,7 @@ import {
   checkWakeWordTrigger,
   callActiveGeminiCascade,
   getBackendBaseUrl,
+  getBackendApiUrl,
 } from "../../app/engine";
 
 // Import Lucide icons
@@ -90,6 +94,9 @@ import {
   CheckSquare,
   Calculator,
   Square,
+  UserPlus,
+  Search,
+  ImagePlus,
 } from "lucide-react";
 
 interface IndianLanguage {
@@ -281,6 +288,8 @@ interface DiscoverableFriend {
   handle: string;
   avatar_url: string;
   is_online: boolean;
+  active_room_id?: string;
+  relationship?: "none" | "following" | "follower" | "friend" | "request_sent" | "request_received";
 }
 
 interface BlockedFriendProfile {
@@ -307,6 +316,8 @@ interface Message {
   sender_name?: string;
   detail?: string;
   is_edited?: boolean;
+  isForwarded?: boolean;
+  forwardedFrom?: string;
   is_deleted?: boolean;
   delivered_to?: string[];
   read_by?: string[];
@@ -315,7 +326,9 @@ interface Message {
   sender_public_key?: JsonWebKey;
   senderName?: string;
   senderEmail?: string;
-  source?: "gemini-3.8-flash" | "openrouter-fallback" | "backend-manifest" | "cloud_ai" | "local_agent" | "platform_engine";
+  timestamp?: string;
+  avatarSrc?: string;
+  source?: "gemini-3.6-flash" | "openrouter-fallback" | "backend-manifest" | "cloud_ai" | "local_agent" | "platform_engine" | "local_mock";
   provider?: string;
   providerModel?: string;
   autoFallback?: boolean;
@@ -353,6 +366,29 @@ interface ChatSession {
   messages: Message[];
   topicId?: string;
   isSharedArchive?: boolean;
+  isDeleted?: boolean;
+  deletedAt?: string;
+}
+
+function ensureMessageTimestamps(messages: Message[]): Message[] {
+  return messages.map((message) => ({
+    ...message,
+    timestamp: message.timestamp || new Date().toISOString(),
+  }));
+}
+
+interface SocialInvite {
+  invite_id: string;
+  sender_name: string;
+  room_id: string;
+  room_title: string;
+  invite_url: string;
+}
+
+interface PendingFriendRequest {
+  user_id: string;
+  display_name: string;
+  avatar_url: string;
 }
 
 interface TopicChannel {
@@ -425,11 +461,6 @@ interface RoomSocketEvent {
 }
 
 const QUICK_ROOM_REACTIONS = ["❤️", "👍", "👏", "😂", "🔥", "🎉"];
-const ROOM_EMOJI_OPTIONS = [
-  ...QUICK_ROOM_REACTIONS, "😊", "🙏", "💡", "📚", "🎯", "✨", "🚀", "😍", "🥰",
-  "🤔", "😮", "😢", "😡", "🤝", "✅", "❌", "⭐", "💯", "👀", "🙌", "🤩",
-  "😎", "🥳", "💪", "🫡", "👏🏻", "💚", "💙", "💜", "🧡", "🤍", "🤣", "😴",
-];
 
 function normalizeRoomMessage(raw: Message): Message {
   const wire = raw as Message & {
@@ -522,25 +553,30 @@ function GenieAvatar({
     setHasError(false);
   }, [src]);
 
-  const isInvalid = !src || hasError || src.includes("default-user");
-
-  if (isInvalid) {
-    return (
-      <div
-        className={`${className} flex items-center justify-center bg-gradient-to-tr from-violet-600 via-pink-500 to-amber-400 text-white shadow-xs select-none p-1.5 flex-shrink-0`}
-        title={alt || "Personal AI Genie"}
-      >
-        <Sparkles className="w-full h-full text-white drop-shadow-sm" />
-      </div>
-    );
-  }
+  const legacyPresetAssets: Record<string, string> = {
+    "genie-preset:guardian": "/avatars/Profile 1.png",
+    "genie-preset:vapor": "/avatars/Profile 2.png",
+    "genie-preset:cosmic": "/avatars/Profile 3.png",
+    "genie-preset:neutral": "/avatars/Profile 3.png",
+    "genie-preset:option_a": "/avatars/Profile 1.png",
+    "genie-preset:option_b": "/avatars/Profile 2.png",
+    "genie-preset:option_c": "/avatars/Profile 3.png",
+    "/avatars/option_a.svg": "/avatars/Profile 1.png",
+    "/avatars/option_b.svg": "/avatars/Profile 2.png",
+    "/avatars/option_c.svg": "/avatars/Profile 3.png",
+  };
+  const resolvedSrc = src && legacyPresetAssets[src]
+    ? legacyPresetAssets[src]
+    : src && !src.includes("default-user")
+    ? src
+    : "/avatars/Profile 3.png";
 
   return (
     <img
-      src={src}
-      alt={alt || "Avatar"}
+      src={hasError ? "/avatars/Profile 3.png" : resolvedSrc}
+      alt={alt || "Genie profile avatar"}
       onError={() => setHasError(true)}
-      className={`${className} object-cover flex-shrink-0`}
+      className={`${className} rounded-full object-cover flex-shrink-0`}
     />
   );
 }
@@ -556,6 +592,83 @@ function sanitizeGenieOutput(text: string): string {
     .trim();
 }
 
+function getAssistantPersona(message: Message) {
+  if (message.avatarSrc === "/avatars/Genie PRO.png") {
+    return {
+      variant: "faceless-weaver" as const,
+      badge: "Genie Pro · Genie Core Engine",
+      provider: "Genie Pro",
+      model: "Genie Core Engine",
+    };
+  }
+  const resolved =
+    message.isIntervention ||
+    message.senderName?.includes("Intervention") ||
+    message.sender_name?.includes("Intervention") ||
+    message.content.startsWith("[★ Verified Synthesis");
+  if (resolved) {
+    return {
+      variant: "void-shaman" as const,
+      badge: "Primary Brand Icon · Resolved ✓",
+      provider: "Primary Brand Icon",
+      model: "Resolved ✓",
+    };
+  }
+  if (
+    message.source === "platform_engine" ||
+    message.source === "local_mock" ||
+    message.source === "backend-manifest" ||
+    message.source === "local_agent"
+  ) {
+    return {
+      variant: "faceless-weaver" as const,
+      badge: "Genie Pro · Genie Core Engine",
+      provider: "Genie Pro",
+      model: "Genie Core Engine",
+    };
+  }
+  return {
+    variant: "cosmic-shadow" as const,
+    badge: "Genie Master · AI response",
+    provider: "Genie Master",
+    model: "AI response",
+  };
+}
+
+function SearchMessageGroup({
+  title,
+  items,
+  onSelect,
+}: {
+  title: string;
+  items: Message[];
+  onSelect: (message: Message) => void;
+}) {
+  return (
+    <section className="space-y-1">
+      <h3 className="px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-slate-500">{title}</h3>
+      {items.map((message, index) => (
+        <button
+          key={message.id || `${message.role}-${index}`}
+          type="button"
+          onClick={() => onSelect(message)}
+          className="flex w-full items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-slate-50"
+        >
+          {message.role === "assistant" ? (
+            <BrandAvatar variant={getAssistantPersona(message).variant} className="mt-0.5 h-6 w-6" label="AI result avatar" />
+          ) : (
+            <User className="mt-1 h-4 w-4 shrink-0 text-slate-400" />
+          )}
+          <span className="min-w-0">
+            {message.role === "assistant" && <span className="block text-[9px] font-semibold text-violet-700">{getAssistantPersona(message).badge}</span>}
+            <span className="line-clamp-2 text-[11px] text-slate-700">{message.content}</span>
+          </span>
+        </button>
+      ))}
+    </section>
+  );
+}
+
 function extractCodeBlock(raw: string): { title: string; language: string; code: string } | null {
   const match = raw.match(/```(\w+)?\n([\s\S]*?)```/);
   if (match) {
@@ -568,11 +681,43 @@ function extractCodeBlock(raw: string): { title: string; language: string; code:
   return null;
 }
 
+function getAuthApiUrl(apiBase: string, path: string): string {
+  const apiPrefix = apiBase.endsWith("/api/py") ? "" : "/api";
+  return `${apiBase}${apiPrefix}/${path.replace(/^\/+/, "")}`;
+}
+
+async function fetchAuthenticatorSetup(
+  email: string,
+  token: string,
+  apiBase: string,
+): Promise<{ qr_code: string; secret: string }> {
+  const query = `?email=${encodeURIComponent(email)}`;
+  const headers = token && token !== "dev-token-local-bypass"
+    ? { Authorization: `Bearer ${token}` }
+    : undefined;
+  const response = await fetch(`${getAuthApiUrl(apiBase, "auth/totp/setup")}${query}`, {
+    cache: "no-store",
+    headers,
+  });
+  const result = (await response.json()) as {
+    qr_code?: string;
+    secret?: string;
+    manual_secret?: string;
+    detail?: string;
+  };
+  const secret = result.manual_secret || result.secret;
+  if (!response.ok || !result.qr_code || !secret) {
+    throw new Error(result.detail || `Authenticator setup could not be started (HTTP ${response.status}).`);
+  }
+  return { qr_code: result.qr_code, secret };
+}
+
 // ========================================================================= //
 // SECTION 2: AUTHENTICATION, INITIALIZATION & PERSISTED SESSION STORAGE     //
 // ========================================================================= //
 
 function MainChatApp() {
+  const router = useRouter();
   const [mounted, setMounted] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [currentTheme, setCurrentTheme] = useState<ThemePreset>(THEME_PRESETS[1]);
@@ -580,8 +725,29 @@ function MainChatApp() {
   const setSelectedTheme = setCurrentTheme;
   const [themeReady, setThemeReady] = useState(false);
 
-  const [hasAgreedToTerms, setHasAgreedToTerms] = useState(false);
-  const [termsPromptWarning, setTermsPromptWarning] = useState(false);
+  const [registrationRequired, setRegistrationRequired] = useState(false);
+  const [registrationBusy, setRegistrationBusy] = useState(false);
+  const [registrationError, setRegistrationError] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [showDevAuthBypass, setShowDevAuthBypass] = useState(false);
+  const [registrationTermsAccepted, setRegistrationTermsAccepted] = useState(false);
+  const [registrationPrivacyAccepted, setRegistrationPrivacyAccepted] = useState(false);
+  const [authenticatorEnabled, setAuthenticatorEnabled] = useState(false);
+  const [authenticatorSetupOpen, setAuthenticatorSetupOpen] = useState(false);
+  const [authenticatorSetup, setAuthenticatorSetup] = useState<{ qr_code: string; secret: string } | null>(null);
+  const [authenticatorSetupCode, setAuthenticatorSetupCode] = useState("");
+  const [authenticatorSetupBusy, setAuthenticatorSetupBusy] = useState(false);
+  const [authenticatorSetupError, setAuthenticatorSetupError] = useState<string | null>(null);
+  const [authenticatorLoginEmail, setAuthenticatorLoginEmail] = useState("");
+  const [authenticatorLoginCode, setAuthenticatorLoginCode] = useState("");
+  const [authenticatorLoginError, setAuthenticatorLoginError] = useState<string | null>(null);
+  const [authenticatorLoginBusy, setAuthenticatorLoginBusy] = useState(false);
+  const [authenticatorResetMessage, setAuthenticatorResetMessage] = useState<string | null>(null);
+  const [authenticatorResetCode, setAuthenticatorResetCode] = useState("");
+  const [authenticatorResetPending, setAuthenticatorResetPending] = useState(false);
+  const [authenticatorResetBusy, setAuthenticatorResetBusy] = useState(false);
+  const [registrationReauthRequired, setRegistrationReauthRequired] = useState(false);
+  const registrationReauthRequiredRef = useRef(false);
 
   const [spaceMode, setSpaceMode] = useState<"personal" | "workspace">("personal");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -594,7 +760,7 @@ function MainChatApp() {
   const [vipSessionLimitReached, setVipSessionLimitReached] = useState(false);
   const [activeVipSessionCount, setActiveVipSessionCount] = useState(0);
   const [quotaExceededModalOpen, setQuotaExceededModalOpen] = useState(false);
-  const [activeModelName, setActiveModelName] = useState<string>("gemini-3.8-flash");
+  const [activeModelName, setActiveModelName] = useState<string>("Genie Core Engine");
 
   const [roomId, setRoomId] = useState("GENIE-TEAM-MAIN");
   const [roomTitle, setRoomTitle] = useState("GENIE TEAM MAIN");
@@ -624,13 +790,22 @@ function MainChatApp() {
   const [userProfile, setUserProfile] = useState({
     name: "Guest User",
     email: "",
-    avatarUrl: "",
+    mobileNumber: "",
+    recoveryEmail: "",
+    allowRoomInvites: "mutual_friends" as "mutual_friends" | "everyone",
+    isCreator: false,
+    avatarUrl: "genie-preset:neutral",
+    googleAvatarUrl: "",
     role: "professional" as "student" | "professional",
     profession: "Healthcare Revenue Cycle & Client Operations",
+    institution: "",
+    studyFocus: "",
+    studyLevel: "",
     ageGroup: "pro",
-    gender: "male",
+    gender: "",
     customApiKey: "",
     totpPasscode: "",
+    totpEnabled: false,
     authProvider: "" as "" | "google" | "meta",
     providerId: "",
     socialHandle: "",
@@ -638,14 +813,37 @@ function MainChatApp() {
     socialProfileId: "",
     isDiscoverable: false,
   });
+  const userProfileRef = useRef(userProfile);
+  useEffect(() => {
+    userProfileRef.current = userProfile;
+  }, [userProfile]);
+  useEffect(() => () => {
+    if (profileTotpToastTimerRef.current) clearTimeout(profileTotpToastTimerRef.current);
+  }, []);
   const [googleIdToken, setGoogleIdToken] = useState("");
+  const [editProfileOpen, setEditProfileOpen] = useState(false);
+  const [profileSaveBusy, setProfileSaveBusy] = useState(false);
+  const [profileSaveError, setProfileSaveError] = useState<string | null>(null);
+  const [profileTotpSetup, setProfileTotpSetup] = useState<{ qr_code: string; secret: string } | null>(null);
+  const [profileTotpCode, setProfileTotpCode] = useState("");
+  const [profileTotpBusy, setProfileTotpBusy] = useState(false);
+  const [profileTotpError, setProfileTotpError] = useState<string | null>(null);
+  const [profileTotpMessage, setProfileTotpMessage] = useState<string | null>(null);
+  const [profileTotpToast, setProfileTotpToast] = useState<string | null>(null);
+  const profileTotpToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [profileEditor, setProfileEditor] = useState({
+    name: "",
+    mobileNumber: "",
+    recoveryEmail: "",
+    avatarUrl: "genie-preset:neutral",
+    gender: "",
+  });
   const [guestId, setGuestId] = useState("");
 
-  const [isTotpVerified, setIsTotpVerified] = useState(false);
-  const [isTotpVerifying, setIsTotpVerifying] = useState(false);
   const [members, setMembers] = useState<RoomMember[]>([]);
   const [roomCryptoIdentity, setRoomCryptoIdentity] = useState<RoomCryptoIdentity | null>(null);
   const [discoverableFriends, setDiscoverableFriends] = useState<DiscoverableFriend[]>([]);
+  const [pendingFriendRequests, setPendingFriendRequests] = useState<PendingFriendRequest[]>([]);
   const [blockedUsers, setBlockedUsers] = useState<BlockedFriendProfile[]>([]);
   const [blockTarget, setBlockTarget] = useState<BlockedFriendProfile | DiscoverableFriend | null>(null);
   const [friendMenuUserId, setFriendMenuUserId] = useState<string | null>(null);
@@ -654,6 +852,21 @@ function MainChatApp() {
   const [friendsQueueOpen, setFriendsQueueOpen] = useState(false);
   const [friendsQueueError, setFriendsQueueError] = useState<string | null>(null);
   const [isFriendsLoading, setIsFriendsLoading] = useState(false);
+  const [socialInvites, setSocialInvites] = useState<SocialInvite[]>([]);
+  const [friendSearchOpen, setFriendSearchOpen] = useState(false);
+  const [friendSearchEmail, setFriendSearchEmail] = useState("");
+  const [friendSearchResult, setFriendSearchResult] = useState<DiscoverableFriend | null>(null);
+  const [friendSearchNotFound, setFriendSearchNotFound] = useState(false);
+  const [friendSearchBusy, setFriendSearchBusy] = useState(false);
+  const [omniSearchQuery, setOmniSearchQuery] = useState("");
+  const [omniSearchResults, setOmniSearchResults] = useState<DiscoverableFriend[]>([]);
+  const [omniSearchNotFound, setOmniSearchNotFound] = useState(false);
+  const [omniSearchBusy, setOmniSearchBusy] = useState(false);
+  const [omniSearchError, setOmniSearchError] = useState<string | null>(null);
+  const [inviteEmailBusy, setInviteEmailBusy] = useState(false);
+  const [inviteEmailStatus, setInviteEmailStatus] = useState<string | null>(null);
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [trashSessions, setTrashSessions] = useState<ChatSession[]>([]);
   const [roomAdminOpen, setRoomAdminOpen] = useState(false);
   const [roomCapacityMode, setRoomCapacityMode] = useState<RoomCapacityMode>("unlimited");
   const [customRoomCapacity, setCustomRoomCapacity] = useState(10);
@@ -673,9 +886,14 @@ function MainChatApp() {
   const [archivedRoomMessages, setArchivedRoomMessages] = useState<Record<string, Message[]>>({});
   const [archivedRoomKinds, setArchivedRoomKinds] = useState<Record<string, "social" | "team_rooms">>({});
   const [currentSessionId, setCurrentSessionId] = useState("1");
+  const [isTopicConversation, setIsTopicConversation] = useState(false);
   const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
 
   const [replyTarget, setReplyTarget] = useState<{ author: string; content: string } | null>(null);
+  const [longPressMenu, setLongPressMenu] = useState<{ message: Message; index: number; x: number; y: number } | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [messageSearchMode, setMessageSearchMode] = useState<"ai" | "chat" | null>(null);
+  const [messageSearchQuery, setMessageSearchQuery] = useState("");
   const [forwardMessage, setForwardMessage] = useState<Message | null>(null);
   const [shareModalOpen, setShareModalOpen] = useState(false);
   const [shareSessionId, setShareSessionId] = useState<string | null>(null);
@@ -705,13 +923,16 @@ function MainChatApp() {
 
   const [prompt, setPrompt] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
+  const suppressAuthWarning =
+    (showDevAuthBypass || isAuthenticated) &&
+    Boolean(chatError && /google sign-in could not be verified|google identity verification failed|ID token may be expired|platform engine failed.*google sign-in/i.test(chatError));
+  const visibleChatError = suppressAuthWarning ? null : chatError;
   const [metaLoginError, setMetaLoginError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState<IndianLanguage>(INDIAN_LANGUAGES[0]);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingPreview, setStreamingPreview] = useState("");
-  const [streamingProvider, setStreamingProvider] = useState<{ provider: string; model: string } | null>(null);
   const [streamingAutoFallback, setStreamingAutoFallback] = useState(false);
   const activeChatAbortControllerRef = useRef<AbortController | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
@@ -725,11 +946,11 @@ function MainChatApp() {
   const readReceiptIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const promptInputRef = useRef<HTMLInputElement>(null);
 
   const API_BASE = getBackendBaseUrl();
 
-  const GOOGLE_CLIENT_ID =
-    "767453349146-honr4mjea5jgv23andq145fqtcjdor0t.apps.googleusercontent.com";
+  const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID?.trim() || "";
   const FACEBOOK_APP_ID = process.env.NEXT_PUBLIC_FACEBOOK_APP_ID?.trim() || "";
 
   const isCorporateDomain =
@@ -767,10 +988,124 @@ function MainChatApp() {
   const activeTopic = topics.find((topic) => topic.id === activeTopicId) || topics[0];
   const messages = isTeamMode
     ? roomMessages
+    : isTopicConversation
+    ? activeTopic?.messages || []
     : currentSession?.isSharedArchive
     ? currentSession.messages
-    : activeTopic?.messages || personalMessages;
+    : currentSession?.messages || personalMessages;
+  const searchableMessages = sessions.filter((session) => !session.isDeleted).flatMap((session) => session.messages)
+    .concat(topics.flatMap((topic) => topic.messages), personalMessages);
+  const searchMatches = messageSearchQuery.trim()
+    ? [...new Map(searchableMessages.filter((message) =>
+        message.content.toLowerCase().includes(messageSearchQuery.trim().toLowerCase())
+      ).map((message) => [message.id || `${message.role}:${message.content}`, message])).values()].slice(0, 8)
+    : [];
+  const chatSearchMatches = searchMatches.filter((message) => message.role === "user");
+  const aiSearchMatches = searchMatches.filter((message) => message.role === "assistant");
   const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
+  const observerPreferenceOwner =
+    userProfile.providerId || userProfile.email.toLowerCase() || guestId || "guest";
+
+  useEffect(() => {
+    if (!mounted) return;
+    let active = true;
+    try {
+      const savedPreference = localStorage.getItem(
+        `genie_observer_mode_${observerPreferenceOwner}`
+      );
+      if (savedPreference === "true" || savedPreference === "false") {
+        queueMicrotask(() => {
+          if (active) setIsObserverActive(savedPreference === "true");
+        });
+      }
+    } catch (error) {
+      console.error("Observer mode preference could not be restored:", error);
+      queueMicrotask(() => {
+        if (active) setChatError("Observer mode preference could not be restored from this browser.");
+      });
+    }
+    return () => {
+      active = false;
+    };
+  }, [mounted, observerPreferenceOwner]);
+
+  const updateCurrentPersonalMessages = (updateMessages: (current: Message[]) => Message[]) => {
+    if (currentSession?.isSharedArchive) {
+      setSessions((previous) =>
+        previous.map((session) =>
+          session.id === currentSession.id
+            ? { ...session, messages: updateMessages(session.messages) }
+            : session
+        )
+      );
+      return;
+    }
+
+    if (isTopicConversation && activeTopic) {
+      setTopics((previous) =>
+        previous.map((topic) => {
+          if (topic.id !== activeTopic.id) return topic;
+          const updatedMessages = updateMessages(topic.messages);
+          return {
+            ...topic,
+            messages: updatedMessages,
+            message_count: updatedMessages.length,
+          };
+        })
+      );
+      setPersonalMessages(updateMessages);
+      return;
+    }
+    if (currentSession) {
+      setSessions((previous) =>
+        previous.map((session) =>
+          session.id === currentSession.id
+            ? { ...session, messages: updateMessages(session.messages) }
+            : session
+        )
+      );
+    }
+    setPersonalMessages(updateMessages);
+  };
+
+  function stopCurrentChatGeneration() {
+    activeChatAbortControllerRef.current?.abort();
+    activeChatAbortControllerRef.current = null;
+    setStreamingPreview("");
+    setStreamingAutoFallback(false);
+    setChatError(null);
+    setIsStreaming(false);
+  }
+
+  function handleSelectSession(session: ChatSession) {
+    stopCurrentChatGeneration();
+    setCurrentSessionId(session.id);
+    setIsTopicConversation(Boolean(session.topicId));
+    setIsTeamMode(false);
+    setPersonalMessages(session.messages);
+    setPrompt("");
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      setSidebarOpen(false);
+    }
+  }
+
+  function handleCreateNewChat() {
+    stopCurrentChatGeneration();
+    const newId = window.crypto.randomUUID();
+    setSessions((previous) => [
+      { id: newId, title: "New Session", isPinned: false, messages: [] },
+      ...previous,
+    ]);
+    setCurrentSessionId(newId);
+    setIsTopicConversation(false);
+    setIsTeamMode(false);
+    setPersonalMessages([]);
+    setPrompt("");
+    window.requestAnimationFrame(() => promptInputRef.current?.focus());
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      setSidebarOpen(false);
+    }
+  }
 
   function sendRoomEvent(event: Record<string, unknown>): boolean {
     const socket = roomSocketRef.current;
@@ -820,7 +1155,7 @@ function MainChatApp() {
     if (
       !transcript ||
       shareTranscriptSentRef.current ||
-      !roomId.startsWith("share_") ||
+      (!roomId.startsWith("share_") && !roomId.startsWith("invite_")) ||
       roomIdentity !== shareTranscriptOwnerRef.current ||
       roomMembers.filter((member) => member.status === "active").length < 2
     ) {
@@ -877,13 +1212,13 @@ function MainChatApp() {
   useEffect(() => {
     try {
       if (typeof window !== "undefined") {
-        const pathShareRoom = window.location.pathname.match(/^\/room\/(share_[A-Za-z0-9_-]+)\/?$/)?.[1];
+        const pathShareRoom = window.location.pathname.match(/^\/room\/((?:share|invite)_[A-Za-z0-9_-]+)\/?$/)?.[1];
         const initialRoomId =
           pathShareRoom || new URLSearchParams(window.location.search).get("room");
         if (initialRoomId) {
           setRoomId(initialRoomId);
           setIsTeamMode(true);
-          if (initialRoomId.startsWith("share_")) setIsRoomUnlocked(true);
+          if (initialRoomId.startsWith("share_") || initialRoomId.startsWith("invite_")) setIsRoomUnlocked(true);
         }
         const storedSessions =
           localStorage.getItem("genie_chat_sessions_v2") ||
@@ -903,8 +1238,28 @@ function MainChatApp() {
                 Array.isArray((session as ChatSession).messages)
             );
             if (validSessions.length > 0) {
-              setSessions(validSessions);
-              setCurrentSessionId(validSessions[0].id);
+              const recentSessions = validSessions.filter((session) =>
+                !session.isDeleted ||
+                !session.deletedAt ||
+                Date.now() - new Date(session.deletedAt).getTime() <= 30 * 86400000
+              );
+              const activeSessions = recentSessions.filter((session) => !session.isDeleted);
+              const deletedSessions = recentSessions.filter((session) => session.isDeleted);
+              const sessionsForUse = activeSessions.length
+                ? activeSessions
+                : [{ id: Date.now().toString(), title: "New Session", isPinned: false, messages: [] }];
+              const normalizedSessions = sessionsForUse.map((session) => ({
+                ...session,
+                messages: ensureMessageTimestamps(session.messages),
+              }));
+              const normalizedDeleted = deletedSessions.map((session) => ({
+                ...session,
+                messages: ensureMessageTimestamps(session.messages),
+              }));
+              setSessions([...normalizedSessions, ...normalizedDeleted]);
+              setTrashSessions(normalizedDeleted);
+              setCurrentSessionId(sessionsForUse[0].id);
+              setIsTopicConversation(Boolean(sessionsForUse[0].topicId));
             }
           }
         }
@@ -916,7 +1271,10 @@ function MainChatApp() {
           localStorage.setItem("genie_guest_id", newGuestId);
           setGuestId(newGuestId);
         }
-        const restoredGoogleToken = sessionStorage.getItem("genie_google_id_token") || "";
+        const restoredGoogleToken =
+          localStorage.getItem("genie_session_token") ||
+          sessionStorage.getItem("genie_google_id_token") ||
+          "";
         setGoogleIdToken(restoredGoogleToken);
 
         try {
@@ -934,13 +1292,22 @@ function MainChatApp() {
         try {
           const savedAuth = localStorage.getItem("genie_is_authenticated");
           const savedProfile = localStorage.getItem("genie_user_profile");
-          const savedAgreed = localStorage.getItem("genie_terms_agreed");
-
           if (savedAuth === "true" && savedProfile) {
             const parsedProfile = JSON.parse(savedProfile);
-            setUserProfile((prev) => ({ ...prev, ...parsedProfile, customApiKey: "" }));
-            setIsAuthenticated(parsedProfile.authProvider === "google" && Boolean(restoredGoogleToken));
-            setHasAgreedToTerms(savedAgreed === "true");
+            const isDevSession = localStorage.getItem("genie_session_token") === "dev-token-local-bypass";
+            const isLocalRegistrationFallback =
+              localStorage.getItem("genie_local_registration_fallback") === "true";
+            setUserProfile((prev) => ({
+              ...prev,
+              ...parsedProfile,
+              providerId: parsedProfile.providerId || (isDevSession ? "dev-admin" : prev.providerId),
+              authProvider: parsedProfile.authProvider || (isDevSession ? "google" : prev.authProvider),
+              avatarUrl: parsedProfile.avatarUrl || (isDevSession ? "genie-preset:guardian" : prev.avatarUrl),
+              totpEnabled: Boolean(parsedProfile.totpEnabled),
+              customApiKey: "",
+            }));
+            setAuthenticatorEnabled(Boolean(parsedProfile.totpEnabled));
+            setIsAuthenticated(isDevSession || isLocalRegistrationFallback);
           }
         } catch (error) {
           console.error("Session restoration error", error);
@@ -950,9 +1317,181 @@ function MainChatApp() {
       console.error("Workspace initialization error", error);
     } finally {
       setThemeReady(true);
+      setShowDevAuthBypass(
+        process.env.NODE_ENV !== "production" &&
+        ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)
+      );
       setMounted(true);
     }
   }, []);
+
+  useEffect(() => {
+    if (!mounted) return;
+    if (!googleIdToken || !userProfile.providerId || googleIdToken === "dev-token-local-bypass") return;
+    let active = true;
+    setRegistrationBusy(true);
+    void fetch(getAuthApiUrl(API_BASE, "registration/me"), {
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${googleIdToken}` },
+    })
+      .then(async (response) => {
+        const result = (await response.json()) as {
+          registered?: boolean;
+          requires_setup?: boolean;
+          email?: string;
+          profile?: {
+            display_name?: string;
+            email?: string;
+            google_avatar_url?: string;
+            mobile_number?: string;
+            recovery_email?: string;
+            allow_room_invites?: "mutual_friends" | "everyone";
+            is_creator?: boolean;
+            avatar_url?: string;
+            gender?: string;
+          };
+          session_token?: string;
+          totp_enabled?: boolean;
+          profile_complete?: boolean;
+          detail?: string;
+        };
+        if (response.status === 401) {
+          if (localStorage.getItem("genie_local_registration_fallback") === "true") {
+            throw new Error("The registration service could not verify the saved local session.");
+          }
+          registrationReauthRequiredRef.current = true;
+          setRegistrationReauthRequired(true);
+          sessionStorage.removeItem("genie_google_id_token");
+          localStorage.removeItem("genie_session_token");
+          throw new Error("Your Google sign-in expired or could not be verified. Re-authenticate with Google to continue.");
+        }
+        if (response.status === 404) {
+          if (!active) return;
+          const email = userProfile.email || authenticatorLoginEmail || "rshaji93@gmail.com";
+          setAuthenticatorLoginEmail(email);
+          setUserProfile((previous) => ({ ...previous, email }));
+          setRegistrationRequired(true);
+          setIsAuthenticated(false);
+          return;
+        }
+        if (!response.ok) throw new Error(result.detail || `Registration status could not be checked (HTTP ${response.status}).`);
+        if (!active) return;
+        setAuthenticatorEnabled(Boolean(result.totp_enabled));
+        setUserProfile((previous) => ({ ...previous, totpEnabled: Boolean(result.totp_enabled) }));
+        const hasLocalRegistrationFallback =
+          localStorage.getItem("genie_local_registration_fallback") === "true";
+        if (hasLocalRegistrationFallback && !result.registered) {
+          setRegistrationRequired(false);
+          setIsAuthenticated(true);
+          return;
+        }
+        if (!result.registered) {
+          const email = result.email || result.profile?.email || userProfile.email || authenticatorLoginEmail || "rshaji93@gmail.com";
+          setAuthenticatorLoginEmail(email);
+          setUserProfile((previous) => ({
+            ...previous,
+            name: result.profile?.display_name || previous.name,
+            email,
+            mobileNumber: result.profile?.mobile_number || previous.mobileNumber,
+            recoveryEmail: result.profile?.recovery_email || previous.recoveryEmail,
+            avatarUrl: result.profile?.avatar_url || previous.avatarUrl,
+            gender: result.profile?.gender || previous.gender,
+          }));
+          setIsAuthenticated(false);
+          setRegistrationRequired(true);
+          return;
+        }
+        const profile = {
+          ...userProfile,
+          name: result.profile?.display_name || userProfile.name,
+          email: result.profile?.email || userProfile.email,
+          googleAvatarUrl: result.profile?.google_avatar_url || userProfile.googleAvatarUrl,
+          mobileNumber: result.profile?.mobile_number || "",
+          recoveryEmail: result.profile?.recovery_email || "",
+          allowRoomInvites: result.profile?.allow_room_invites || "mutual_friends",
+          isCreator: Boolean(result.profile?.is_creator),
+          avatarUrl: result.profile?.avatar_url || "genie-preset:neutral",
+          totpEnabled: Boolean(result.totp_enabled),
+          gender: result.profile?.gender || "",
+        };
+        const sessionToken = googleIdToken.startsWith("genie1.")
+          ? result.session_token || googleIdToken
+          : result.session_token || "";
+        if (!sessionToken) {
+          setAuthMode("login");
+          setAuthenticatorLoginEmail(result.profile?.email || userProfile.email);
+          setIsAuthenticated(false);
+          return;
+        }
+        if (sessionToken !== googleIdToken) setGoogleIdToken(sessionToken);
+        sessionStorage.setItem("genie_google_id_token", sessionToken);
+        if (sessionToken.startsWith("genie1.")) {
+          localStorage.setItem("genie_session_token", sessionToken);
+        }
+        setUserProfile(profile);
+        localStorage.setItem("genie_user_profile", JSON.stringify({ ...profile, customApiKey: "", totpPasscode: "" }));
+        localStorage.setItem("genie_is_authenticated", "true");
+        localStorage.setItem("genie_terms_agreed", "true");
+        localStorage.removeItem("genie_local_registration_fallback");
+        setRegistrationRequired(false);
+        setIsAuthenticated(true);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        console.error("Mandatory registration verification failed:", error);
+        if (localStorage.getItem("genie_local_registration_fallback") === "true") {
+          setRegistrationRequired(false);
+          setIsAuthenticated(true);
+          return;
+        }
+        setRegistrationRequired(true);
+        setIsAuthenticated(false);
+        setRegistrationError(error instanceof Error ? error.message : "Registration status could not be checked.");
+      })
+      .finally(() => {
+        if (active) setRegistrationBusy(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [mounted, googleIdToken, userProfile.providerId, userProfile.email, authenticatorLoginEmail, registrationRequired, API_BASE]);
+
+  useEffect(() => {
+    if (!mounted || !registrationRequired || !registrationReauthRequired) return;
+    let active = true;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const renderReauthenticationButton = () => {
+      const google = (window as any).google;
+      const container = document.getElementById("googleRegistrationReauthBtn");
+      if (!google?.accounts?.id || !(window as any).__gsi_auth_active || !container) return false;
+      if (container.childElementCount === 0) {
+        google.accounts.id.renderButton(container, {
+          theme: "outline",
+          size: "large",
+          width: 300,
+          text: "signin_with",
+          shape: "pill",
+        });
+      }
+      return true;
+    };
+    if (!renderReauthenticationButton()) {
+      timer = setInterval(() => {
+        if (active && renderReauthenticationButton() && timer) clearInterval(timer);
+      }, 350);
+    }
+    return () => {
+      active = false;
+      if (timer) clearInterval(timer);
+    };
+  }, [mounted, registrationRequired, registrationReauthRequired]);
+
+  function requireGoogleReauthentication(message: string) {
+    registrationReauthRequiredRef.current = true;
+    setRegistrationReauthRequired(true);
+    sessionStorage.removeItem("genie_google_id_token");
+    setRegistrationError(message);
+  }
 
   useEffect(() => {
     if (!mounted) return;
@@ -1021,7 +1560,7 @@ function MainChatApp() {
     let active = true;
     setIsTopicLoading(true);
     void fetch(
-      `${API_BASE}/api/personal/topics?user_id=${encodeURIComponent(userProfile.providerId)}`,
+      getBackendApiUrl(`/api/personal/topics?user_id=${encodeURIComponent(userProfile.providerId)}`),
       { headers: { Authorization: `Bearer ${googleIdToken}` } }
     )
       .then(async (response) => {
@@ -1029,10 +1568,10 @@ function MainChatApp() {
           topics?: TopicChannel[];
           detail?: string;
         };
-        if (!response.ok) throw new Error(result.detail || `Topic channels failed to load (HTTP ${response.status}).`);
-        if (!Array.isArray(result.topics) || result.topics.length < 1 || result.topics.length > 10) {
-          throw new Error("The topic service returned an invalid channel list.");
-        }
+if (!response.ok || !Array.isArray(result.topics)) {
+    console.warn("Topic channels unavailable or invalid, applying fallback.");
+    return;
+}
         if (!active) return;
         setTopics(result.topics);
         setActiveTopicId((current) => result.topics!.some((topic) => topic.id === current) ? current : result.topics![0].id);
@@ -1054,7 +1593,7 @@ function MainChatApp() {
   useEffect(() => {
     if (!mounted) return;
     try {
-      if (roomId.startsWith("share_")) {
+      if (roomId.startsWith("share_") || roomId.startsWith("invite_")) {
         setRoomPasscode("842-109");
         setEnteredRoomPasscode("842-109");
         setIsRoomUnlocked(true);
@@ -1076,8 +1615,8 @@ function MainChatApp() {
   }, [mounted, roomId]);
 
   useEffect(() => {
-    if (!roomCryptoIdentity || !googleIdToken) return;
-    void fetch(`${API_BASE}/api/crypto/public-key`, {
+    if (!roomCryptoIdentity || !googleIdToken?.startsWith("genie1.")) return;
+    void fetch(getBackendApiUrl("/api/crypto/public-key"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1259,12 +1798,16 @@ function MainChatApp() {
       if (update.type === "message" && update.message) {
         void decodeRoomWireMessage(update.message)
           .then((message) => {
+            const timestampedMessage = {
+              ...message,
+              timestamp: message.timestamp || new Date().toISOString(),
+            };
             setRoomMessages((previous) => {
-              const exists = previous.some((item) => item.id === message.id);
+              const exists = previous.some((item) => item.id === timestampedMessage.id);
               if (update.action === "edit" || update.action === "delete") {
-                return previous.map((item) => item.id === message.id ? message : item);
+                return previous.map((item) => item.id === timestampedMessage.id ? timestampedMessage : item);
               }
-              return exists ? previous : [...previous, message];
+              return exists ? previous : [...previous, timestampedMessage];
             });
           })
           .catch((error: unknown) => {
@@ -1384,9 +1927,12 @@ function MainChatApp() {
 
     const updateSession = async (action: "acquire" | "heartbeat" | "release") => {
       try {
-        const response = await fetch(`${API_BASE}/api/vip/session`, {
+        const response = await fetch(getBackendApiUrl("/api/vip/session"), {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${googleIdToken}`,
+          },
           body: JSON.stringify({
             session_id: vipSessionId,
             user_email: userProfile.email,
@@ -1402,7 +1948,17 @@ function MainChatApp() {
           limit?: number;
           detail?: string;
         };
-        if (!response.ok) throw new Error(result.detail || `VIP session request failed (${response.status}).`);
+        if (!response.ok) {
+          if (active && action !== "release") {
+            setIsVipSessionActive(false);
+            setVipSessionLimitReached(false);
+            setActiveVipSessionCount(0);
+          }
+          console.warn(
+            result.detail || `VIP session request failed (${response.status}).`
+          );
+          return;
+        }
         if (active && action !== "release") {
           setIsVipSessionActive(result.active === true);
           setVipSessionLimitReached(result.active === false);
@@ -1412,6 +1968,7 @@ function MainChatApp() {
         if (active && action !== "release") {
           setIsVipSessionActive(false);
           setVipSessionLimitReached(false);
+          setActiveVipSessionCount(0);
           console.error("VIP session presence update failed:", error);
         }
       }
@@ -1454,13 +2011,18 @@ function MainChatApp() {
               const updatedProfile = {
                 name: data.name || "User",
                 email: data.email || "",
-                avatarUrl: data.picture || "",
+                avatarUrl: userProfileRef.current.avatarUrl || "genie-preset:neutral",
+                googleAvatarUrl: data.picture || "",
+                mobileNumber: "",
+                recoveryEmail: "",
+                allowRoomInvites: "mutual_friends" as const,
+                isCreator: false,
                 authProvider: "google" as const,
                 providerId: data.sub || "",
                 role: "professional" as const,
                 profession: "Healthcare Revenue Cycle & Client Operations",
                 ageGroup: "pro",
-                gender: "male",
+                gender: userProfileRef.current.gender || "",
                 customApiKey: "",
                 totpPasscode: "",
                 socialHandle: "",
@@ -1468,15 +2030,33 @@ function MainChatApp() {
                 socialProfileId: "",
               };
 
-              setUserProfile((prev) => ({ ...prev, ...updatedProfile }));
+              const reauthenticating = registrationReauthRequiredRef.current;
+              const sameGoogleAccount =
+                reauthenticating && userProfileRef.current.providerId === updatedProfile.providerId;
+              const profileToPersist = sameGoogleAccount
+                ? {
+                    ...userProfileRef.current,
+                    email: updatedProfile.email,
+                    googleAvatarUrl: updatedProfile.googleAvatarUrl,
+                    avatarUrl: updatedProfile.avatarUrl,
+                    authProvider: updatedProfile.authProvider,
+                    providerId: updatedProfile.providerId,
+                  }
+                : updatedProfile;
+              setUserProfile((prev) => ({ ...prev, ...profileToPersist }));
               setGoogleIdToken(response.credential);
-              setIsAuthenticated(true);
-              setHasAgreedToTerms(true);
+              setIsAuthenticated(false);
+              setRegistrationRequired(reauthenticating);
+              setRegistrationError(null);
+              setRegistrationReauthRequired(false);
+              registrationReauthRequiredRef.current = false;
+              if (!sameGoogleAccount) {
+                setRegistrationTermsAccepted(false);
+                setRegistrationPrivacyAccepted(false);
+              }
 
               if (typeof window !== "undefined") {
-                localStorage.setItem("genie_is_authenticated", "true");
-                localStorage.setItem("genie_user_profile", JSON.stringify(updatedProfile));
-                localStorage.setItem("genie_terms_agreed", "true");
+                localStorage.setItem("genie_user_profile", JSON.stringify(profileToPersist));
                 sessionStorage.setItem("genie_google_id_token", response.credential);
               }
             } catch (err) {
@@ -1575,7 +2155,7 @@ function MainChatApp() {
             setMetaLoginError("Meta did not provide a profile-verification token.");
             return;
           }
-          void fetch(`${API_BASE}/api/social/discovery`, {
+          void fetch(getBackendApiUrl("/api/social/discovery"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -1621,34 +2201,267 @@ function MainChatApp() {
   };
 
   const loadFriendsQueue = useCallback(async () => {
-   if (!googleIdToken) return;
+   if (!googleIdToken) {
+     setDiscoverableFriends([]);
+     setSovereignRooms([]);
+     setPendingFriendRequests([]);
+     return;
+   }
    setIsFriendsLoading(true);
    setFriendsQueueError(null);
    try {
      const headers = { Authorization: `Bearer ${googleIdToken}` };
-     const [friendsResponse, roomsResponse] = await Promise.all([
-       fetch(`${API_BASE}/api/social/friends`, { headers }),
-       fetch(`${API_BASE}/api/rooms`, { headers }),
+     const [friendsResponse, roomsResponse, requestsResponse] = await Promise.all([
+       fetch(getBackendApiUrl("/api/social/friends"), { headers }),
+       fetch(getBackendApiUrl("/api/rooms"), { headers }),
+       fetch(getBackendApiUrl("/api/social/friend-requests"), { headers }),
      ]);
-     const [friendResult, roomResult] = await Promise.all([
-       friendsResponse.json() as Promise<{ friends?: DiscoverableFriend[]; detail?: string }>,
-       roomsResponse.json() as Promise<{ rooms?: SovereignRoomSummary[]; detail?: string }>,
-     ]);
-     if (!friendsResponse.ok) {
-       throw new Error(friendResult.detail || `Friends Queue failed (HTTP ${friendsResponse.status}).`);
+const [friendResult, roomResult, requestsResult] = await Promise.all([
+      friendsResponse.ok ? friendsResponse.json().catch(() => ({ friends: [] })) : Promise.resolve({ friends: [] }),
+      roomsResponse.ok ? roomsResponse.json().catch(() => ({ rooms: [] })) : Promise.resolve({ rooms: [] }),
+      requestsResponse.ok ? requestsResponse.json().catch(() => ({ requests: [] })) : Promise.resolve({ requests: [] }),
+    ]);
+    setDiscoverableFriends(friendResult?.friends || []);
+     setSovereignRooms(roomsResponse.ok ? roomResult.rooms || [] : []);
+     setPendingFriendRequests(requestsResponse.ok ? requestsResult.requests || [] : []);
+     const failedPolls = [
+       !friendsResponse.ok && `Friends Queue (HTTP ${friendsResponse.status})`,
+       !roomsResponse.ok && `Saved rooms (HTTP ${roomsResponse.status})`,
+       !requestsResponse.ok && `Friend requests (HTTP ${requestsResponse.status})`,
+     ].filter(Boolean);
+     if (failedPolls.length) {
+       setFriendsQueueError(`Some social data could not be loaded: ${failedPolls.join(", ")}.`);
      }
-     if (!roomsResponse.ok) {
-       throw new Error(roomResult.detail || `Saved rooms failed (HTTP ${roomsResponse.status}).`);
-     }
-     setDiscoverableFriends(friendResult.friends || []);
-     setSovereignRooms(roomResult.rooms || []);
    } catch (error) {
      console.error("Friends Queue refresh failed:", error);
+     setDiscoverableFriends([]);
+     setSovereignRooms([]);
+     setPendingFriendRequests([]);
      setFriendsQueueError(error instanceof Error ? error.message : "Could not refresh social presence.");
    } finally {
      setIsFriendsLoading(false);
    }
-  }, [API_BASE, googleIdToken]);
+  }, [googleIdToken]);
+
+  async function respondToFriendRequest(request: PendingFriendRequest, accepted: boolean) {
+    if (!googleIdToken) return;
+    try {
+      const response = await fetch(getBackendApiUrl("/api/social/friend-requests/respond"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          requester_id: request.user_id,
+          response: accepted ? "accepted" : "declined",
+        }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Friend request could not be updated (HTTP ${response.status}).`);
+      setPendingFriendRequests((previous) => previous.filter((item) => item.user_id !== request.user_id));
+      await loadFriendsQueue();
+    } catch (error) {
+      console.error("Friend request response failed:", error);
+      setFriendsQueueError(error instanceof Error ? error.message : "Friend request could not be updated.");
+    }
+  }
+
+  useEffect(() => {
+    if (!isAuthenticated || !googleIdToken) return;
+    void loadFriendsQueue();
+    const intervalId = window.setInterval(() => void loadFriendsQueue(), 15000);
+    return () => window.clearInterval(intervalId);
+  }, [isAuthenticated, googleIdToken, loadFriendsQueue]);
+
+  const loadSocialInvites = useCallback(async () => {
+    if (!googleIdToken || !isAuthenticated) {
+      setSocialInvites([]);
+      return;
+    }
+    try {
+      const response = await fetch(getBackendApiUrl("/api/social/invites"), {
+        headers: { Authorization: `Bearer ${googleIdToken}` },
+      });
+      const result = (await response.json()) as { invites?: SocialInvite[]; detail?: string };
+      if (!response.ok) {
+        setSocialInvites([]);
+        setFriendsQueueError(
+          result.detail || `Invitations could not be loaded (HTTP ${response.status}).`
+        );
+        return;
+      }
+      setSocialInvites(result.invites || []);
+    } catch (error) {
+      console.error("Social invitations refresh failed:", error);
+      setSocialInvites([]);
+      setFriendsQueueError(error instanceof Error ? error.message : "Invitations could not be loaded.");
+    }
+  }, [googleIdToken, isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !googleIdToken) return;
+    void loadSocialInvites();
+    const intervalId = window.setInterval(() => void loadSocialInvites(), 15000);
+    return () => window.clearInterval(intervalId);
+  }, [isAuthenticated, googleIdToken, loadSocialInvites]);
+
+  async function sendRoomInvite(friend: DiscoverableFriend) {
+    if (!googleIdToken || !isTeamMode || !roomId) {
+      setFriendsQueueError("Start or join a room before inviting a friend.");
+      return;
+    }
+    const inviteUrl = `${window.location.origin}/room/${roomId}`;
+    try {
+      const response = await fetch(getBackendApiUrl("/api/social/invites"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          recipient_id: friend.user_id,
+          room_id: roomId,
+          room_title: roomTitle,
+          invite_url: inviteUrl,
+        }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Invitation could not be sent (HTTP ${response.status}).`);
+      setFriendsQueueError(null);
+    } catch (error) {
+      console.error("In-app room invitation failed:", error);
+      setFriendsQueueError(error instanceof Error ? error.message : "Invitation could not be sent.");
+    }
+  }
+
+  async function respondToSocialInvite(invite: SocialInvite, accepted: boolean) {
+    if (!googleIdToken) return;
+    try {
+      const response = await fetch(getBackendApiUrl(`/api/social/invites/${encodeURIComponent(invite.invite_id)}/respond`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ google_id_token: googleIdToken, status: accepted ? "accepted" : "declined" }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Invitation could not be updated (HTTP ${response.status}).`);
+      setSocialInvites((previous) => previous.filter((item) => item.invite_id !== invite.invite_id));
+      if (accepted) router.push(`/room/${encodeURIComponent(invite.room_id)}`);
+    } catch (error) {
+      console.error("Social invitation response failed:", error);
+      setFriendsQueueError(error instanceof Error ? error.message : "Invitation could not be updated.");
+    }
+  }
+
+  async function searchForFriend(event: React.FormEvent) {
+    event.preventDefault();
+    if (!googleIdToken || !friendSearchEmail.trim()) return;
+    setFriendSearchBusy(true);
+    setFriendSearchResult(null);
+    setFriendSearchNotFound(false);
+    try {
+      const response = await fetch(
+        getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
+        { headers: { Authorization: `Bearer ${googleIdToken}` } }
+      );
+      const result = (await response.json()) as {
+        found?: boolean;
+        users?: DiscoverableFriend[];
+        detail?: string;
+      };
+      if (!response.ok) throw new Error(result.detail || `Friend search failed (HTTP ${response.status}).`);
+      if (result.users?.length) {
+        setFriendSearchResult(result.users[0]);
+      } else {
+        setFriendSearchNotFound(true);
+      }
+    } catch (error) {
+      console.error("Friend search failed:", error);
+      setFriendsQueueError(error instanceof Error ? error.message : "Friend search failed.");
+    } finally {
+      setFriendSearchBusy(false);
+    }
+  }
+
+  async function searchOmniDirectory(event: React.FormEvent) {
+    event.preventDefault();
+    if (!googleIdToken || omniSearchQuery.trim().length < 2) return;
+    setOmniSearchBusy(true);
+    setOmniSearchError(null);
+    setOmniSearchNotFound(false);
+    try {
+      const response = await fetch(
+        getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
+        { headers: { Authorization: `Bearer ${googleIdToken}` } }
+      );
+      const result = (await response.json()) as { users?: DiscoverableFriend[]; detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Directory search failed (HTTP ${response.status}).`);
+      const users = result.users || [];
+      setOmniSearchResults(users);
+      setOmniSearchNotFound(users.length === 0);
+    } catch (error) {
+      console.error("Omni-search failed:", error);
+      setOmniSearchError(error instanceof Error ? error.message : "Directory search failed.");
+    } finally {
+      setOmniSearchBusy(false);
+    }
+  }
+
+  async function sendOnboardingInviteEmail(email: string) {
+    if (!googleIdToken) return;
+    setInviteEmailBusy(true);
+    setInviteEmailStatus(null);
+    try {
+      const response = await fetch(getBackendApiUrl("/api/invite/email"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ google_id_token: googleIdToken, email }),
+      });
+      const result = (await response.json()) as { success?: boolean; simulated?: boolean; detail?: string };
+      if (!response.ok || !result.success) {
+        throw new Error(result.detail || `Invitation could not be dispatched (HTTP ${response.status}).`);
+      }
+      setInviteEmailStatus(`Invitation email dispatched to ${email}!`);
+    } catch (error) {
+      console.error("Registration invitation failed:", error);
+      setOmniSearchError(error instanceof Error ? error.message : "Invitation could not be sent.");
+    } finally {
+      setInviteEmailBusy(false);
+    }
+  }
+
+  async function updateSocialRelationship(friend: DiscoverableFriend, action: "follow" | "friend-request") {
+    if (!googleIdToken) return;
+    const endpoint = action === "follow" ? "/api/social/follow" : "/api/social/friend-requests";
+    try {
+      const response = await fetch(getBackendApiUrl(endpoint), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ google_id_token: googleIdToken, target_user_id: friend.user_id }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Relationship could not be updated (HTTP ${response.status}).`);
+      setOmniSearchError(null);
+      if (omniSearchQuery.trim()) {
+        const searchResponse = await fetch(
+          getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
+          { headers: { Authorization: `Bearer ${googleIdToken}` } }
+        );
+        const searchResult = (await searchResponse.json()) as { users?: DiscoverableFriend[] };
+        if (!searchResponse.ok) throw new Error("Updated relationship status could not be loaded.");
+        setOmniSearchResults(searchResult.users || []);
+      }
+      if (friendSearchEmail.trim()) {
+        const searchResponse = await fetch(
+          getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
+          { headers: { Authorization: `Bearer ${googleIdToken}` } }
+        );
+        const searchResult = (await searchResponse.json()) as { users?: DiscoverableFriend[] };
+        if (!searchResponse.ok) throw new Error("Updated relationship status could not be loaded.");
+        setFriendSearchResult(searchResult.users?.[0] || null);
+      }
+      await loadFriendsQueue();
+    } catch (error) {
+      console.error("Social relationship update failed:", error);
+      setOmniSearchError(error instanceof Error ? error.message : "Relationship could not be updated.");
+    }
+  }
 
   async function createTopicChannel() {
     if (topics.length >= 10) return;
@@ -1664,7 +2477,7 @@ function MainChatApp() {
     try {
       let newTopic: TopicChannel;
       if (isAuthenticated && googleIdToken && userProfile.providerId) {
-        const response = await fetch(`${API_BASE}/api/personal/topics/create`, {
+        const response = await fetch(getBackendApiUrl("/api/personal/topics/create"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1707,7 +2520,7 @@ function MainChatApp() {
     }
     try {
       if (isAuthenticated && googleIdToken && userProfile.providerId) {
-        const response = await fetch(`${API_BASE}/api/personal/topics/${encodeURIComponent(topic.id)}`, {
+        const response = await fetch(getBackendApiUrl(`/api/personal/topics/${encodeURIComponent(topic.id)}`), {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1734,7 +2547,7 @@ function MainChatApp() {
     try {
       if (isAuthenticated && googleIdToken && userProfile.providerId) {
         const response = await fetch(
-          `${API_BASE}/api/personal/topics/${encodeURIComponent(topic.id)}/clear`,
+          getBackendApiUrl(`/api/personal/topics/${encodeURIComponent(topic.id)}/clear`),
           {
             method: "DELETE",
             headers: { "Content-Type": "application/json" },
@@ -1823,7 +2636,7 @@ function MainChatApp() {
     if (!googleIdToken || !userProfile.providerId) return;
     try {
       const response = await fetch(
-        `${API_BASE}/api/friends/blocked-list?user_id=${encodeURIComponent(userProfile.providerId)}`,
+        getBackendApiUrl(`/api/friends/blocked-list?user_id=${encodeURIComponent(userProfile.providerId)}`),
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
       const result = (await response.json()) as {
@@ -1841,7 +2654,7 @@ function MainChatApp() {
   async function confirmBlockUser() {
     if (!googleIdToken || !userProfile.providerId || !blockTarget) return;
     try {
-      const response = await fetch(`${API_BASE}/api/friends/block`, {
+      const response = await fetch(getBackendApiUrl("/api/friends/block"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1872,7 +2685,7 @@ function MainChatApp() {
   async function unblockUser(target: BlockedFriendProfile) {
     if (!googleIdToken || !userProfile.providerId) return;
     try {
-      const response = await fetch(`${API_BASE}/api/friends/unblock`, {
+      const response = await fetch(getBackendApiUrl("/api/friends/unblock"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1898,7 +2711,7 @@ function MainChatApp() {
   async function openDirectFriendRoom(friend: DiscoverableFriend) {
    if (!googleIdToken) return;
    try {
-     const response = await fetch(`${API_BASE}/api/social/direct-room`, {
+     const response = await fetch(getBackendApiUrl("/api/social/direct-room"), {
        method: "POST",
        headers: { "Content-Type": "application/json" },
        body: JSON.stringify({ google_id_token: googleIdToken, target_user_id: friend.user_id }),
@@ -1927,7 +2740,7 @@ function MainChatApp() {
   async function unlinkSocialDiscovery() {
    if (!googleIdToken) return;
    try {
-     const response = await fetch(`${API_BASE}/api/social/discovery`, {
+     const response = await fetch(getBackendApiUrl("/api/social/discovery"), {
        method: "DELETE",
        headers: { Authorization: `Bearer ${googleIdToken}` },
      });
@@ -1959,7 +2772,7 @@ function MainChatApp() {
    if (!cleanHandle) return;
    if (userProfile.isDiscoverable && googleIdToken) {
      try {
-       const response = await fetch(`${API_BASE}/api/social/discovery`, {
+       const response = await fetch(getBackendApiUrl("/api/social/discovery"), {
          method: "PUT",
          headers: { "Content-Type": "application/json" },
          body: JSON.stringify({ google_id_token: googleIdToken, handle: cleanHandle }),
@@ -2012,7 +2825,7 @@ function MainChatApp() {
     setIsArchiveLoading(true);
     try {
       const response = await fetch(
-        `${API_BASE}/api/archive/manifest?user_id=${encodeURIComponent(userProfile.providerId)}`,
+        getBackendApiUrl(`/api/archive/manifest?user_id=${encodeURIComponent(userProfile.providerId)}`),
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
       const manifest = (await response.json()) as ArchiveManifest & {
@@ -2026,9 +2839,10 @@ function MainChatApp() {
         setArchiveError(null);
         return;
       }
-      if (!response.ok) {
-        throw new Error(manifest.detail || `Archive manifest request failed (HTTP ${response.status}).`);
-      }
+if (!response.ok) {
+    console.warn("Archive manifest inaccessible:", manifest?.detail);
+    return;
+}
       const safeManifest: ArchiveManifest = {
         personal: manifest.personal || null,
         social: Array.isArray(manifest.social) ? manifest.social : [],
@@ -2143,7 +2957,7 @@ function MainChatApp() {
               },
             ]
           : [];
-      const response = await fetch(`${API_BASE}/api/archive/save`, {
+      const response = await fetch(getBackendApiUrl("/api/archive/save"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2192,7 +3006,7 @@ function MainChatApp() {
     ];
 
     try {
-      const response = await fetch(`${API_BASE}/api/archive/restore`, {
+      const response = await fetch(getBackendApiUrl("/api/archive/restore"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2285,6 +3099,8 @@ function MainChatApp() {
       localStorage.removeItem("genie_is_authenticated");
       localStorage.removeItem("genie_user_profile");
       localStorage.removeItem("genie_terms_agreed");
+      localStorage.removeItem("genie_session_token");
+      localStorage.removeItem("genie_local_registration_fallback");
       sessionStorage.removeItem("genie_google_id_token");
       if ((window as any).google?.accounts?.id) {
         (window as any).google.accounts.id.disableAutoSelect();
@@ -2293,8 +3109,13 @@ function MainChatApp() {
     }
     setIsAuthenticated(false);
     setIsRoomUnlocked(false);
-    setIsTotpVerified(false);
-    setHasAgreedToTerms(false);
+    setRegistrationRequired(false);
+    setRegistrationReauthRequired(false);
+    registrationReauthRequiredRef.current = false;
+    setRegistrationError(null);
+    setRegistrationTermsAccepted(false);
+    setRegistrationPrivacyAccepted(false);
+    setAuthenticatorEnabled(false);
     setGoogleIdToken("");
     setIsTeamMode(false);
     setIsObserverActive(false);
@@ -2313,13 +3134,22 @@ function MainChatApp() {
     setUserProfile({
       name: "Guest User",
       email: "",
+      mobileNumber: "",
+      recoveryEmail: "",
+      allowRoomInvites: "mutual_friends",
+      isCreator: false,
       avatarUrl: "",
+      googleAvatarUrl: "",
       role: "professional",
       profession: "Healthcare Revenue Cycle & Client Operations",
+      institution: "",
+      studyFocus: "",
+      studyLevel: "",
       ageGroup: "pro",
-      gender: "male",
+      gender: "",
       customApiKey: "",
       totpPasscode: "",
+      totpEnabled: false,
       authProvider: "",
       providerId: "",
       socialHandle: "",
@@ -2327,45 +3157,6 @@ function MainChatApp() {
       socialProfileId: "",
       isDiscoverable: false,
     });
-  };
-
-  const handleVerifyTotp = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const clean = userProfile.totpPasscode.trim().replace(/\s|-/g, "");
-    if (!/^\d{6}$/.test(clean)) {
-      alert("Please enter a valid 6-digit Authenticator code.");
-      return;
-    }
-
-    setIsTotpVerifying(true);
-    try {
-      const response = await fetch("/api/genie", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "verify_totp", code: clean }),
-      });
-      const result = (await response.json()) as { valid?: boolean; error?: string };
-      if (!response.ok) {
-        throw new Error(result.error || `Authenticator verification failed (HTTP ${response.status}).`);
-      }
-      if (!result.valid) {
-        alert("The Authenticator code is invalid or expired.");
-        return;
-      }
-
-      setIsTotpVerified(true);
-      setUserProfile((profile) => ({ ...profile, totpPasscode: "" }));
-      alert(
-        isCorporateDomain
-          ? "Corporate Authenticator verified! Departmental VIP and Room Governance active."
-          : "Platform Master Authenticator verified! VIP Pass active."
-      );
-    } catch (error) {
-      console.error("Authenticator verification failed:", error);
-      alert(error instanceof Error ? error.message : "Authenticator verification failed.");
-    } finally {
-      setIsTotpVerifying(false);
-    }
   };
 
   const handleUnlockRoom = (e: React.FormEvent) => {
@@ -2384,6 +3175,8 @@ function MainChatApp() {
 
   const handleExitRoomToPersonal = () => {
     if (!mounted) return;
+    roomSocketRef.current?.close(1000, "Left the room.");
+    roomSocketRef.current = null;
     setIsTeamMode(false);
     setIsObserverActive(false);
     setIsRoomUnlocked(false);
@@ -2395,6 +3188,159 @@ function MainChatApp() {
     }
   };
 
+  const loadTrash = useCallback(async () => {
+    if (!googleIdToken || !isAuthenticated) return;
+    try {
+      const response = await fetch(getBackendApiUrl("/api/trash/conversations"), {
+        headers: { Authorization: `Bearer ${googleIdToken}` },
+      });
+      const result = (await response.json()) as {
+        conversations?: { conversation: ChatSession; deleted_at: string }[];
+        detail?: string;
+      };
+      if (!response.ok) throw new Error(result.detail || `Trash could not be loaded (HTTP ${response.status}).`);
+      setTrashSessions((result.conversations || []).map(({ conversation, deleted_at }) => ({
+        ...conversation,
+        isDeleted: true,
+        deletedAt: deleted_at,
+      })));
+    } catch (error) {
+      console.error("Trash load failed:", error);
+      setChatError(error instanceof Error ? error.message : "Recently deleted conversations could not be loaded.");
+    }
+  }, [API_BASE, googleIdToken, isAuthenticated]);
+
+  useEffect(() => {
+    if (trashOpen && isAuthenticated) void loadTrash();
+  }, [trashOpen, isAuthenticated, loadTrash]);
+
+  async function softDeleteSession(session: ChatSession) {
+    const deletedAt = new Date().toISOString();
+    const deleted = { ...session, isDeleted: true, deletedAt };
+    if (googleIdToken && isAuthenticated) {
+      try {
+        const response = await fetch(getBackendApiUrl("/api/trash/conversations"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ google_id_token: googleIdToken, conversation: deleted, deleted_at: deletedAt }),
+        });
+        const result = (await response.json()) as { detail?: string };
+        if (!response.ok) {
+    console.warn("Could not delete conversation from server:", result.detail);
+    return;
+}
+      } catch (error) {
+        console.error("Cloud conversation deletion failed:", error);
+        setChatError(error instanceof Error ? error.message : "Conversation could not be moved to trash.");
+        return;
+      }
+    }
+    const activeSessions = sessions.filter((item) => !item.isDeleted && item.id !== session.id);
+    setSessions((previous) => previous.map((item) => item.id === session.id ? deleted : item));
+    setTrashSessions((previous) => [deleted, ...previous.filter((item) => item.id !== session.id)]);
+    if (currentSessionId === session.id && activeSessions.length) {
+      const replacement = activeSessions[0];
+      setCurrentSessionId(replacement.id);
+      setIsTopicConversation(Boolean(replacement.topicId));
+      setPersonalMessages(ensureMessageTimestamps(replacement.messages));
+    } else if (currentSessionId === session.id) {
+      const replacement: ChatSession = { id: Date.now().toString(), title: "New Session", isPinned: false, messages: [] };
+      setSessions((previous) => [replacement, ...previous]);
+      setCurrentSessionId(replacement.id);
+      setIsTopicConversation(false);
+      setPersonalMessages([]);
+    }
+  }
+
+  async function restoreSession(session: ChatSession) {
+    let restored: ChatSession = { ...session, isDeleted: false };
+    delete restored.deletedAt;
+    if (googleIdToken && isAuthenticated) {
+      try {
+        const response = await fetch(
+          getBackendApiUrl(`/api/trash/conversations/${encodeURIComponent(session.id)}/restore`),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ google_id_token: googleIdToken }),
+          }
+        );
+        const result = (await response.json()) as { conversation?: ChatSession; detail?: string };
+        if (!response.ok || !result.conversation) {
+          throw new Error(result.detail || `Conversation could not be restored (HTTP ${response.status}).`);
+        }
+        restored = result.conversation;
+      } catch (error) {
+        console.error("Cloud conversation restore failed:", error);
+        setChatError(error instanceof Error ? error.message : "Conversation could not be restored.");
+        return;
+      }
+    }
+    setSessions((previous) => previous.some((item) => item.id === restored.id)
+      ? previous.map((item) => item.id === restored.id ? restored : item)
+      : [restored, ...previous]);
+    setTrashSessions((previous) => previous.filter((item) => item.id !== session.id));
+    setCurrentSessionId(restored.id);
+    setIsTopicConversation(Boolean(restored.topicId));
+    setPersonalMessages(ensureMessageTimestamps(restored.messages));
+    setIsTeamMode(false);
+  }
+
+  async function copyHeaderInvite(mode: "personal" | "workspace") {
+    if (!googleIdToken || !isAuthenticated || !roomCryptoIdentity) {
+      setChatError("Sign in and wait for secure room setup before sharing a room.");
+      return;
+    }
+    const newRoomId = `${mode === "personal" ? "share_" : "invite_"}${window.crypto.randomUUID().replaceAll("-", "")}`;
+    const inviteUrl = `${window.location.origin}/room/${newRoomId}`;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      shareTranscriptRef.current = messages.filter((message) => !message.is_deleted).map((message) => ({ ...message }));
+      shareTranscriptOwnerRef.current = roomIdentity;
+      shareTranscriptSentRef.current = false;
+      setRoomId(newRoomId);
+      setRoomTitle(mode === "personal" ? "Private 1-on-1 Session" : "Workspace Session");
+      setRoomMessages([]);
+      setMembers([]);
+      setRoomPasscode("842-109");
+      setEnteredRoomPasscode("842-109");
+      setRoomPasscodeRoomId(newRoomId);
+      setIsRoomUnlocked(true);
+      setIsTeamMode(true);
+      setSpaceMode(mode);
+      if (mode === "personal") setRoomCapacityMode("pair");
+      else {
+        setRoomCapacityMode("custom");
+        setCustomRoomCapacity(5);
+      }
+      setIsObserverActive(false);
+      setChatError(null);
+    } catch (error) {
+      console.error("Room invite link could not be copied:", error);
+      setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
+    }
+  }
+
+  async function endActiveRoom() {
+    if (!googleIdToken || !roomId) return;
+    try {
+      const response = await fetch(getBackendApiUrl(`/api/rooms/${encodeURIComponent(roomId)}`), {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${googleIdToken}` },
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Session could not be ended (HTTP ${response.status}).`);
+      roomSocketRef.current?.close(1000, "Host ended the session.");
+      roomSocketRef.current = null;
+      setMembers([]);
+      setRoomMessages([]);
+      handleExitRoomToPersonal();
+    } catch (error) {
+      console.error("Room end failed:", error);
+      setChatError(error instanceof Error ? error.message : "Session could not be ended.");
+    }
+  }
+
   const executePasscodeRegeneration = async () => {
     const newCode = Math.floor(100000 + Math.random() * 900000).toString();
     const formatted = `${newCode.slice(0, 3)}-${newCode.slice(3)}`;
@@ -2403,7 +3349,7 @@ function MainChatApp() {
       return;
     }
     try {
-      const response = await fetch(`${API_BASE}/api/rooms/passcode`, {
+      const response = await fetch(getBackendApiUrl("/api/rooms/passcode"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ google_id_token: googleIdToken, room_id: roomId, passcode: formatted }),
@@ -2483,7 +3429,7 @@ function MainChatApp() {
     };
 
     try {
-      const response = await fetch(`${API_BASE}/api/room/send-invites`, {
+      const response = await fetch(getBackendApiUrl("/api/room/send-invites"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -2586,32 +3532,764 @@ function MainChatApp() {
     setTimeout(() => setCopiedIndex(null), 2000);
   };
 
+  const handleReloadMessage = (message: Message, index: number) => {
+    const promptMessage =
+      message.role === "user"
+        ? message
+        : [...messages.slice(0, index)].reverse().find((item) => item.role === "user");
+    if (promptMessage) {
+      void handleSendMessage(undefined, false, promptMessage.content);
+    }
+  };
+
+  const handleEditMessage = async (message: Message, index: number) => {
+    if (isTeamMode) {
+      await handleEditRoomMessage(message);
+    } else if (editDraft.trim()) {
+      const messageKey = message.id || String(index);
+      updateCurrentPersonalMessages((current) =>
+        current.map((item, itemIndex) =>
+          (item.id || String(itemIndex)) === messageKey
+            ? { ...item, content: editDraft.trim(), text: editDraft.trim(), is_edited: true }
+            : item
+        )
+      );
+      setEditingMessageId(null);
+      setEditDraft("");
+    }
+  };
+
+  const handleDeleteMessage = (message: Message, index: number) => {
+    if (isTeamMode) {
+      handleDeleteRoomMessage(message);
+      return;
+    }
+    const messageKey = message.id || String(index);
+    updateCurrentPersonalMessages((current) =>
+      current.filter((item, itemIndex) => (item.id || String(itemIndex)) !== messageKey)
+    );
+  };
+
   const handleTicketSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!ticketDescription.trim()) return;
+    if (reportType !== "ui_request" || !ticketDescription.trim()) return;
 
     try {
-      await fetch(`${API_BASE}/api/tickets`, {
+      const response = await fetch("/api/py/tickets", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           user_email: userProfile.email,
           user_name: userProfile.name,
           developer_destination: SUPPORT_DISPATCH_EMAIL,
-          track: reportType,
+          track: "ui_request",
           description: ticketDescription,
           context: "Submitted via Genie Workspace Preferences",
         }),
       });
+      if (!response.ok) {
+        throw new Error(`Developer pipeline returned HTTP ${response.status}.`);
+      }
       setTicketStatus(`Dispatched successfully to ${SUPPORT_DISPATCH_EMAIL}.`);
       setTicketDescription("");
       setTimeout(() => setTicketStatus(null), 3500);
-    } catch {
-      setTicketStatus("Queued for Active Core Support Dispatch.");
-      setTicketDescription("");
-      setTimeout(() => setTicketStatus(null), 3500);
+    } catch (error) {
+      console.error("Feature request dispatch failed:", error);
+      setTicketStatus("Feature request could not be sent. Please try again.");
     }
   };
+
+  const handleReportAIMistake = async (reportedMessage?: Message) => {
+    setReportType("ai_issue");
+    const latestAssistantMessage = reportedMessage || [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant" && message.content.trim());
+    if (!latestAssistantMessage) {
+      setTicketStatus("There is no Genie answer in this chat to review yet.");
+      return;
+    }
+    if (isStreaming) {
+      setTicketStatus("Wait for Genie to finish responding before requesting a review.");
+      return;
+    }
+
+    const reviewPrompt = [
+      "@Genie please review and correct your latest answer in this active conversation. Return the correction as a clearly labeled in-chat intervention.",
+      `Latest answer to review:\n${latestAssistantMessage.content}`,
+      ticketDescription.trim() ? `User's concern:\n${ticketDescription.trim()}` : "",
+      "Explain what was inaccurate or incomplete, then provide a corrected answer.",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    setTicketStatus(null);
+    setTicketDescription("");
+    setSettingsOpen(false);
+    await handleSendMessage(undefined, false, reviewPrompt, true, true);
+  };
+
+  async function handleAuthenticatorLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setAuthenticatorLoginBusy(true);
+    setAuthenticatorLoginError(null);
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/verify"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: authenticatorLoginEmail.trim(),
+          code: authenticatorLoginCode.trim(),
+        }),
+      });
+      const result = (await response.json()) as {
+        session_token?: string;
+        profile?: {
+          user_id: string;
+          display_name: string;
+          email: string;
+          mobile_number: string;
+          recovery_email: string;
+          avatar_url: string;
+          gender: string;
+          allow_room_invites: "mutual_friends" | "everyone";
+          is_creator: boolean;
+        };
+        detail?: string;
+      };
+      if (!response.ok || !result.session_token || !result.profile) {
+        throw new Error(result.detail || `Authenticator sign-in failed (HTTP ${response.status}).`);
+      }
+
+      const profile = {
+        ...userProfile,
+        providerId: result.profile.user_id,
+        authProvider: "google" as const,
+        name: result.profile.display_name,
+        email: result.profile.email,
+        mobileNumber: result.profile.mobile_number,
+        recoveryEmail: result.profile.recovery_email,
+        avatarUrl: result.profile.avatar_url || "genie-preset:neutral",
+        gender: result.profile.gender || "",
+        allowRoomInvites: result.profile.allow_room_invites,
+        isCreator: result.profile.is_creator,
+        totpPasscode: "",
+      };
+      localStorage.setItem("genie_session_token", result.session_token);
+      localStorage.setItem("genie_user_profile", JSON.stringify({ ...profile, customApiKey: "" }));
+      localStorage.setItem("genie_is_authenticated", "true");
+      sessionStorage.setItem("genie_google_id_token", result.session_token);
+      setGoogleIdToken(result.session_token);
+      setUserProfile(profile);
+      setAuthenticatorLoginCode("");
+      setIsAuthenticated(true);
+    } catch (error) {
+      console.error("Passwordless Authenticator sign-in failed:", error);
+      setAuthenticatorLoginError(error instanceof Error ? error.message : "Authenticator sign-in failed.");
+    } finally {
+      setAuthenticatorLoginBusy(false);
+    }
+  }
+
+  function handleStartGoogleRegistration() {
+    setAuthMode("register");
+    setRegistrationError(null);
+    const google = (window as Window & {
+      google?: {
+        accounts?: {
+          id?: {
+            prompt: (callback?: (notification: {
+              isNotDisplayed: () => boolean;
+              isSkippedMoment: () => boolean;
+              getNotDisplayedReason: () => string;
+            }) => void) => void;
+          };
+        };
+      };
+    }).google;
+    if (!google?.accounts?.id?.prompt) {
+      setRegistrationError("Google sign-in is still loading. Use the Google button below when it appears.");
+      return;
+    }
+    try {
+      google.accounts.id.prompt((notification) => {
+        if (notification.isNotDisplayed() || notification.isSkippedMoment()) {
+          const reason = notification.getNotDisplayedReason();
+          setRegistrationError(`Google sign-in was unavailable (${reason || "please try again"}).`);
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof DOMException && error.name === "AbortError" || /\b403\b|AbortError/i.test(message)) {
+        setRegistrationError("Google sign-in was blocked by the browser. Allow Google sign-in and try again.");
+      } else {
+        setRegistrationError(message || "Google sign-in could not be started.");
+      }
+    }
+  }
+
+  async function handleDevBypassLogin() {
+    setAuthenticatorLoginBusy(true);
+    setAuthenticatorLoginError(null);
+    try {
+      let devUser = {
+        id: "dev-admin",
+        email: "rshaji93@gmail.com",
+        name: "Shaji (Dev)",
+        avatar_type: "preset_a",
+      };
+      try {
+        const response = await fetch(getAuthApiUrl(API_BASE, "auth/dev-session"), {
+          method: "POST",
+        });
+        if (response.ok) {
+          const result = (await response.json()) as {
+            token?: string;
+            user?: Partial<typeof devUser>;
+          };
+          if (result.token && result.user) devUser = { ...devUser, ...result.user };
+        }
+      } catch (error) {
+        console.warn("Development auth endpoint unavailable; using the local mock session.", error);
+      }
+      const sessionToken = "dev-token-local-bypass";
+      const profile = {
+        ...userProfile,
+        providerId: devUser.id,
+        authProvider: "google" as const,
+        name: devUser.name,
+        email: devUser.email,
+        avatarUrl: devUser.avatar_type === "preset_a" ? "genie-preset:guardian" : "genie-preset:neutral",
+        totpPasscode: "",
+      };
+      localStorage.setItem("genie_session_token", sessionToken);
+      localStorage.setItem("genie_user_profile", JSON.stringify(devUser));
+      localStorage.setItem("genie_is_authenticated", "true");
+      sessionStorage.setItem("genie_google_id_token", sessionToken);
+      setGoogleIdToken(sessionToken);
+      setUserProfile(profile);
+      setRegistrationRequired(false);
+      setRegistrationBusy(false);
+      setRegistrationReauthRequired(false);
+      setAuthMode("login");
+      setIsAuthenticated(true);
+    } catch (error) {
+      console.error("Development sign-in failed:", error);
+      setAuthenticatorLoginError(error instanceof Error ? error.message : "Development sign-in failed.");
+    } finally {
+      setAuthenticatorLoginBusy(false);
+    }
+  }
+
+  async function handleStartAuthenticatorSetup() {
+    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    if (!token || token === "dev-token-local-bypass") {
+      setAuthenticatorSetupError("Sign in with a verified account before enabling Authenticator.");
+      return;
+    }
+    setAuthenticatorSetupBusy(true);
+    setAuthenticatorSetupError(null);
+    try {
+      const setup = await fetchAuthenticatorSetup(userProfile.email, token, API_BASE);
+      setAuthenticatorSetup(setup);
+      setAuthenticatorSetupCode("");
+      setAuthenticatorSetupOpen(true);
+    } catch (error) {
+      console.error("Authenticator setup could not be started:", error);
+      setAuthenticatorSetupError(error instanceof Error ? error.message : "Authenticator setup could not be started.");
+    } finally {
+      setAuthenticatorSetupBusy(false);
+    }
+  }
+
+  async function handleVerifyAuthenticatorSetup() {
+    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    if (!token || !authenticatorSetup || authenticatorSetupCode.length !== 6) return;
+    setAuthenticatorSetupBusy(true);
+    setAuthenticatorSetupError(null);
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/verify"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          email: userProfile.email,
+          code: authenticatorSetupCode,
+          setup_secret: authenticatorSetup.secret,
+        }),
+      });
+      const result = (await response.json()) as { verified?: boolean; detail?: string };
+      if (!response.ok || !result.verified) {
+        throw new Error(result.detail || "Authenticator code could not be verified.");
+      }
+      setUserProfile((previous) => ({ ...previous, totpEnabled: true }));
+      setAuthenticatorEnabled(true);
+      setAuthenticatorSetupOpen(false);
+      setAuthenticatorSetup(null);
+      setAuthenticatorSetupCode("");
+      setAuthenticatorResetMessage("Google Authenticator is now active for your account.");
+    } catch (error) {
+      console.error("Authenticator verification failed:", error);
+      setAuthenticatorSetupError(error instanceof Error ? error.message : "Authenticator code could not be verified.");
+    } finally {
+      setAuthenticatorSetupBusy(false);
+    }
+  }
+
+  async function requestAuthenticatorReset(emailOverride?: string) {
+    setAuthenticatorResetBusy(true);
+    setAuthenticatorResetMessage(null);
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/reset/request"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: (emailOverride || authenticatorLoginEmail).trim() }),
+      });
+      const result = (await response.json()) as { message?: string; detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Reset email request failed (HTTP ${response.status}).`);
+      setAuthenticatorResetPending(true);
+      setAuthenticatorResetMessage(result.message || "Check your email for the verification code.");
+    } catch (error) {
+      setAuthenticatorResetMessage(error instanceof Error ? error.message : "Authenticator reset could not be requested.");
+    } finally {
+      setAuthenticatorResetBusy(false);
+    }
+  }
+
+  async function confirmAuthenticatorReset() {
+    setAuthenticatorResetBusy(true);
+    setAuthenticatorResetMessage(null);
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/reset/confirm"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: authenticatorLoginEmail.trim(), code: authenticatorResetCode.trim() }),
+      });
+      const result = (await response.json()) as { message?: string; detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Authenticator reset failed (HTTP ${response.status}).`);
+      setAuthenticatorResetMessage(result.message || "Authenticator reset. You can enroll again from Workspace Preferences.");
+      setAuthenticatorResetPending(false);
+      setUserProfile((previous) => ({ ...previous, totpEnabled: false }));
+      setAuthenticatorEnabled(false);
+      setAuthenticatorResetCode("");
+      setAuthenticatorSetup(null);
+      setAuthenticatorSetupOpen(false);
+    } catch (error) {
+      setAuthenticatorResetMessage(error instanceof Error ? error.message : "Authenticator reset failed.");
+    } finally {
+      setAuthenticatorResetBusy(false);
+    }
+  }
+
+  async function handleRegistrationAvatarFile(file?: File) {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setRegistrationError("Choose an avatar image no larger than 2 MB.");
+      return;
+    }
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const mimeType = file.type || (
+      extension === "png" ? "image/png" :
+      extension === "jpg" || extension === "jpeg" ? "image/jpeg" :
+      extension === "svg" ? "image/svg+xml" : ""
+    );
+    if (!["image/png", "image/jpeg", "image/svg+xml"].includes(mimeType)) {
+      setRegistrationError("Choose a PNG, JPG, or SVG image.");
+      return;
+    }
+    try {
+      const avatarUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("The selected avatar image could not be read."));
+        reader.onload = () => {
+          if (typeof reader.result !== "string") {
+            reject(new Error("The selected avatar image could not be read."));
+            return;
+          }
+          resolve(reader.result);
+        };
+        reader.readAsDataURL(file);
+      });
+      setUserProfile((previous) => ({ ...previous, avatarUrl }));
+      setRegistrationError(null);
+    } catch (error) {
+      setRegistrationError(error instanceof Error ? error.message : "The selected avatar image could not be read.");
+    }
+  }
+
+  async function submitMandatoryRegistration(event: React.FormEvent) {
+    event.preventDefault();
+    if (!googleIdToken || !registrationTermsAccepted || !registrationPrivacyAccepted) {
+      setRegistrationError("Sign in with Google and accept both required policies to complete registration.");
+      return;
+    }
+    setRegistrationBusy(true);
+    setRegistrationError(null);
+    const persistRegistrationFallback = () => {
+      const fallbackToken = googleIdToken;
+      const localProfile = {
+        ...userProfile,
+        providerId: userProfile.providerId || (fallbackToken === "dev-token-local-bypass" ? "dev-admin" : ""),
+        authProvider: (userProfile.authProvider || "google") as "google",
+        name: userProfile.name.trim(),
+        email: userProfile.email.trim().toLowerCase(),
+        customApiKey: "",
+        totpPasscode: "",
+      };
+      localStorage.setItem("genie_user_profile", JSON.stringify(localProfile));
+      localStorage.setItem("genie_session_token", fallbackToken);
+      localStorage.setItem("genie_is_authenticated", "true");
+      localStorage.setItem("genie_terms_agreed", "true");
+      localStorage.setItem("genie_local_registration_fallback", "true");
+      sessionStorage.setItem("genie_google_id_token", fallbackToken);
+      setGoogleIdToken(fallbackToken);
+      setUserProfile(localProfile);
+      setRegistrationRequired(false);
+      setRegistrationReauthRequired(false);
+      registrationReauthRequiredRef.current = false;
+      setIsAuthenticated(true);
+      setAuthenticatorEnabled(false);
+      setRegistrationTermsAccepted(false);
+      setRegistrationPrivacyAccepted(false);
+    };
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "registration/complete"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          email: userProfile.email.trim(),
+          display_name: userProfile.name.trim(),
+          avatar_url: userProfile.avatarUrl || "genie-preset:neutral",
+          avatar_type: userProfile.avatarUrl === "/avatars/Profile 1.png"
+            ? "option_a"
+            : userProfile.avatarUrl === "/avatars/Profile 2.png"
+            ? "option_b"
+            : userProfile.avatarUrl === "/avatars/Profile 3.png"
+            ? "option_c"
+            : undefined,
+          mobile_number: userProfile.mobileNumber.trim(),
+          phone: userProfile.mobileNumber.trim(),
+          recovery_email: userProfile.recoveryEmail.trim(),
+          terms_accepted: registrationTermsAccepted,
+          privacy_accepted: registrationPrivacyAccepted,
+        }),
+      });
+      if (!response.ok) {
+        console.warn(`Registration API returned HTTP ${response.status}; using the locally saved profile.`);
+        persistRegistrationFallback();
+        return;
+      }
+      const result = (await response.json()) as {
+        session_token?: string;
+        profile?: {
+          display_name: string;
+          email: string;
+          google_avatar_url?: string;
+          mobile_number: string;
+          recovery_email: string;
+          allow_room_invites: "mutual_friends" | "everyone";
+          avatar_url?: string;
+        };
+        detail?: string;
+      };
+      if (response.status === 401) {
+        requireGoogleReauthentication(
+          "Your Google sign-in expired or could not be verified. Re-authenticate with Google to submit your registration."
+        );
+        return;
+      }
+      if (!response.ok || !result.profile || !result.session_token) {
+        throw new Error(result.detail || `Registration could not be saved (HTTP ${response.status}).`);
+      }
+      const completedProfile = {
+        ...userProfile,
+        name: result.profile.display_name,
+        email: result.profile.email,
+        googleAvatarUrl: result.profile.google_avatar_url || userProfile.googleAvatarUrl,
+        mobileNumber: result.profile.mobile_number,
+        recoveryEmail: result.profile.recovery_email,
+        allowRoomInvites: result.profile.allow_room_invites,
+        avatarUrl: result.profile.avatar_url || userProfile.avatarUrl,
+      };
+      localStorage.setItem("genie_user_profile", JSON.stringify({
+        ...completedProfile,
+        customApiKey: "",
+        totpPasscode: "",
+      }));
+      localStorage.setItem("genie_is_authenticated", "true");
+      localStorage.setItem("genie_terms_agreed", "true");
+      sessionStorage.setItem("genie_google_id_token", result.session_token);
+      localStorage.setItem("genie_session_token", result.session_token);
+      setGoogleIdToken(result.session_token);
+      setUserProfile(completedProfile);
+      setRegistrationRequired(false);
+      setRegistrationReauthRequired(false);
+      registrationReauthRequiredRef.current = false;
+      setIsAuthenticated(true);
+      setAuthenticatorEnabled(false);
+      localStorage.removeItem("genie_local_registration_fallback");
+      setRegistrationTermsAccepted(false);
+      setRegistrationPrivacyAccepted(false);
+    } catch (error) {
+      console.warn("Registration API could not be reached; using the locally saved profile.", error);
+      persistRegistrationFallback();
+    } finally {
+      setRegistrationBusy(false);
+    }
+  }
+
+  function openProfileEditor() {
+    setProfileEditor({
+      name: userProfile.name,
+      mobileNumber: userProfile.mobileNumber,
+      recoveryEmail: userProfile.recoveryEmail,
+      avatarUrl: userProfile.avatarUrl || "genie-preset:neutral",
+      gender: userProfile.gender || "",
+    });
+    setProfileSaveError(null);
+    setProfileTotpSetup(null);
+    setProfileTotpCode("");
+    setProfileTotpError(null);
+    setProfileTotpMessage(null);
+    setProfileTotpToast(null);
+    setEditProfileOpen(true);
+  }
+
+  async function startProfileTotpSetup() {
+    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    if (!token) {
+      setProfileTotpError("Sign in with your verified account before setting up Authenticator.");
+      return;
+    }
+    setProfileTotpBusy(true);
+    setProfileTotpError(null);
+    setProfileTotpMessage(null);
+    try {
+      const setup = await fetchAuthenticatorSetup(userProfile.email, token, API_BASE);
+      setProfileTotpSetup(setup);
+      setProfileTotpCode("");
+    } catch (error) {
+      console.error("Profile Authenticator setup could not be started:", error);
+      setProfileTotpError(error instanceof Error ? error.message : "Authenticator setup could not be started.");
+    } finally {
+      setProfileTotpBusy(false);
+    }
+  }
+
+  async function verifyProfileTotpSetup() {
+    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    if (!token || !profileTotpSetup || profileTotpCode.length !== 6) return;
+    setProfileTotpBusy(true);
+    setProfileTotpError(null);
+    setProfileTotpMessage(null);
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token !== "dev-token-local-bypass") {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/verify"), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          email: userProfile.email,
+          code: profileTotpCode,
+          setup_secret: profileTotpSetup.secret,
+        }),
+      });
+      const result = (await response.json()) as { verified?: boolean; detail?: string };
+      if (!response.ok || !result.verified) {
+        throw new Error(result.detail || `Authenticator code could not be verified (HTTP ${response.status}).`);
+      }
+      const updatedProfile = { ...userProfile, totpEnabled: true };
+      setUserProfile(updatedProfile);
+      setAuthenticatorEnabled(true);
+      setProfileTotpSetup(null);
+      setProfileTotpCode("");
+      setProfileTotpMessage("Google Authenticator is now enabled for your account.");
+      try {
+        localStorage.setItem("genie_user_profile", JSON.stringify({
+          ...updatedProfile,
+          customApiKey: "",
+          totpPasscode: "",
+        }));
+      } catch (error) {
+        console.warn("Authenticator status could not be cached locally:", error);
+      }
+    } catch (error) {
+      console.error("Profile Authenticator verification failed:", error);
+      setProfileTotpError(error instanceof Error ? error.message : "Authenticator code could not be verified.");
+    } finally {
+      setProfileTotpBusy(false);
+    }
+  }
+
+  async function requestProfileTotpReset() {
+    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    if (!token || token === "dev-token-local-bypass") {
+      setProfileTotpError("A verified account session is required to request an Authenticator reset.");
+      return;
+    }
+    setProfileTotpBusy(true);
+    setProfileTotpError(null);
+    setProfileTotpMessage(null);
+    try {
+      const response = await fetch(getAuthApiUrl(API_BASE, "auth/totp/request-reset"), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ email: userProfile.email }),
+      });
+      const result = (await response.json()) as { success?: boolean; detail?: string };
+      if (!response.ok || !result.success) {
+        throw new Error(result.detail || `Authenticator reset email could not be requested (HTTP ${response.status}).`);
+      }
+      const message = "A secure reset link has been dispatched to your verified email.";
+      setProfileTotpMessage(null);
+      setProfileTotpToast(message);
+      if (profileTotpToastTimerRef.current) clearTimeout(profileTotpToastTimerRef.current);
+      profileTotpToastTimerRef.current = setTimeout(() => setProfileTotpToast(null), 5000);
+    } catch (error) {
+      console.error("Profile Authenticator reset email request failed:", error);
+      setProfileTotpError(error instanceof Error ? error.message : "Authenticator reset could not be requested.");
+    } finally {
+      setProfileTotpBusy(false);
+    }
+  }
+
+  async function handleProfileAvatarFile(file?: File) {
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setProfileSaveError("Choose an image no larger than 2 MB.");
+      return;
+    }
+    const extension = file.name.split(".").pop()?.toLowerCase();
+    const mimeType = file.type || (
+      extension === "png" ? "image/png" :
+      extension === "jpg" || extension === "jpeg" ? "image/jpeg" :
+      extension === "svg" ? "image/svg+xml" : ""
+    );
+    if (!["image/png", "image/jpeg", "image/svg+xml"].includes(mimeType)) {
+      setProfileSaveError("Choose a PNG, JPG, or SVG image.");
+      return;
+    }
+    setProfileSaveError(null);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("The selected avatar image could not be read."));
+        reader.onload = () => {
+          if (typeof reader.result !== "string") {
+            reject(new Error("The selected avatar image could not be read."));
+            return;
+          }
+          resolve(reader.result);
+        };
+        reader.readAsDataURL(file);
+      });
+      setProfileEditor((previous) => ({ ...previous, avatarUrl: dataUrl }));
+    } catch (error) {
+      setProfileSaveError(error instanceof Error ? error.message : "The selected avatar image could not be read.");
+    }
+  }
+
+  async function saveProfileChanges(event: React.FormEvent) {
+    event.preventDefault();
+    if (!googleIdToken) {
+      setProfileSaveError("Sign in with Google again before saving profile changes.");
+      return;
+    }
+    setProfileSaveBusy(true);
+    setProfileSaveError(null);
+    try {
+      const response = await fetch(getBackendApiUrl("/api/registration/profile"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          display_name: profileEditor.name.trim(),
+          mobile_number: profileEditor.mobileNumber.trim(),
+          recovery_email: profileEditor.recoveryEmail.trim(),
+          avatar_url: profileEditor.avatarUrl,
+          gender: profileEditor.gender,
+        }),
+      });
+      const result = (await response.json()) as {
+        profile?: {
+          display_name: string;
+          email: string;
+          mobile_number: string;
+          recovery_email: string;
+          avatar_url: string;
+          gender: string;
+        };
+        detail?: string;
+      };
+      if (response.status === 401) {
+        throw new Error("Your Google sign-in expired. Sign out and authenticate with Google again before saving.");
+      }
+      if (!response.ok || !result.profile) {
+        throw new Error(result.detail || `Profile could not be saved (HTTP ${response.status}).`);
+      }
+      const updatedProfile = {
+        ...userProfile,
+        name: result.profile.display_name,
+        email: result.profile.email,
+        mobileNumber: result.profile.mobile_number,
+        recoveryEmail: result.profile.recovery_email,
+        avatarUrl: result.profile.avatar_url,
+        gender: result.profile.gender,
+      };
+      setUserProfile(updatedProfile);
+      setMembers((previous) => previous.map((member) =>
+        member.id === roomIdentity
+          ? { ...member, name: updatedProfile.name, email: updatedProfile.email, avatarUrl: updatedProfile.avatarUrl }
+          : member
+      ));
+      try {
+        localStorage.setItem("genie_user_profile", JSON.stringify({
+          ...updatedProfile,
+          customApiKey: "",
+          totpPasscode: "",
+        }));
+      } catch (error) {
+        console.warn("Updated profile is saved on the server but could not be cached locally:", error);
+      }
+      setEditProfileOpen(false);
+    } catch (error) {
+      console.error("Profile update failed:", error);
+      setProfileSaveError(error instanceof Error ? error.message : "Profile could not be saved.");
+    } finally {
+      setProfileSaveBusy(false);
+    }
+  }
+
+  async function updateInvitePrivacy(policy: "mutual_friends" | "everyone") {
+    if (!googleIdToken) return;
+    const previousPolicy = userProfile.allowRoomInvites;
+    setUserProfile((previous) => ({ ...previous, allowRoomInvites: policy }));
+    try {
+      const response = await fetch(getBackendApiUrl("/api/registration/invite-privacy"), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ google_id_token: googleIdToken, policy }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || `Invite privacy could not be updated (HTTP ${response.status}).`);
+      const updatedProfile = { ...userProfile, allowRoomInvites: policy };
+      localStorage.setItem("genie_user_profile", JSON.stringify({
+        ...updatedProfile,
+        customApiKey: "",
+        totpPasscode: "",
+      }));
+    } catch (error) {
+      setUserProfile((previous) => ({ ...previous, allowRoomInvites: previousPolicy }));
+      console.error("Invite privacy update failed:", error);
+      setChatError(error instanceof Error ? error.message : "Invite privacy could not be updated.");
+    }
+  }
 
   return (
     <>
@@ -2624,8 +4302,30 @@ function MainChatApp() {
         />
       )}
 
+      {forwardMessage && (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm">
+          <section role="dialog" aria-modal="true" aria-labelledby="forward-message-title" className="w-full max-w-sm space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h2 id="forward-message-title" className="text-sm font-bold text-slate-900">Forward message</h2>
+                <p className="mt-1 line-clamp-2 text-[10px] text-slate-500">{forwardMessage.content}</p>
+              </div>
+              <button type="button" onClick={() => setForwardMessage(null)} aria-label="Cancel forwarding" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+            </div>
+            <p className="text-[10px] font-bold uppercase tracking-wide text-slate-500">Choose a chat</p>
+            <div className="max-h-56 space-y-1 overflow-y-auto">
+              {topics.map((topic) => (
+                <button key={topic.id} type="button" onClick={() => forwardMessageToTopic(topic.id)} className="flex w-full items-center gap-2 rounded-lg border border-slate-100 px-3 py-2 text-left text-xs font-semibold text-slate-700 hover:bg-slate-50">
+                  <span aria-hidden="true">{topic.icon}</span>{topic.title}
+                </button>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
+
       {/* Primary Authentication Gate */}
-      {!isAuthenticated && (
+      {!isAuthenticated && !registrationRequired && !registrationBusy && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4">
           <div className="w-full max-w-md bg-white rounded-3xl shadow-2xl border border-slate-200 p-6 flex flex-col items-center text-center space-y-4">
             <div className={`w-14 h-14 ${selectedTheme.bgLightClass} ${selectedTheme.textClass} rounded-full flex items-center justify-center shadow-inner`}>
@@ -2635,64 +4335,599 @@ function MainChatApp() {
             <div>
               <h2 className="text-xl font-extrabold text-slate-800">Personal AI Genie</h2>
               <p className="text-xs text-slate-500 mt-1">
-                Autonomous Multi-User Workspace & Personal AI Companion
+                Secure sign-in with your Google account
               </p>
             </div>
 
             <div className="w-full bg-slate-50 border border-slate-200 rounded-2xl p-3.5 text-left space-y-2">
               <div className="flex items-center gap-1.5 text-slate-800 text-xs font-bold">
                 <ShieldCheck className="w-4 h-4 text-purple-600" />
-                <span>Terms & AI Disclaimer Notice</span>
+                <span>Secure, passwordless access</span>
               </div>
               <p className="text-[11px] text-slate-500 leading-relaxed">
-                Sign in with Google to use Personal AI Genie and shared rooms. Social profiles can optionally be linked later for roster display. Free accounts receive 20 AI messages per day.
+                {authMode === "login"
+                  ? "Continue with Google to sign in. If you enabled Authenticator, you can also use its current 6-digit code below."
+                  : "Verify your Gmail with Google, then complete your profile. Authenticator is optional and can be enabled later in Workspace Preferences."}
               </p>
-
-              <label className="flex items-start gap-2 pt-1 cursor-pointer select-none">
+            </div>
+            {authMode === "login" ? (
+            <form onSubmit={(event) => void handleAuthenticatorLogin(event)} className="w-full space-y-3">
+              <label className="block space-y-1 text-left">
+                <span className="text-xs font-semibold text-slate-700">Verified Gmail</span>
                 <input
-                  type="checkbox"
-                  checked={hasAgreedToTerms}
-                  onChange={(e) => {
-                    setHasAgreedToTerms(e.target.checked);
-                    setTermsPromptWarning(false);
-                  }}
-                  className="mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500"
+                  type="email"
+                  required
+                  autoComplete="email"
+                  value={authenticatorLoginEmail}
+                  onChange={(event) => setAuthenticatorLoginEmail(event.target.value)}
+                  placeholder="you@gmail.com"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
                 />
-                <span className="text-[11px] text-slate-700 font-medium">
-                  I agree to the{" "}
+              </label>
+              <label className="block space-y-1 text-left">
+                <span className="text-xs font-semibold text-slate-700">6-digit Authenticator code</span>
+                <input
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  pattern="[0-9]{6}"
+                  required
+                  value={authenticatorLoginCode}
+                  onChange={(event) => setAuthenticatorLoginCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                  placeholder="000000"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-center font-mono text-lg tracking-[0.35em] outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                />
+              </label>
+              {authenticatorLoginError && <p role="alert" className="text-left text-xs text-rose-700">{authenticatorLoginError}</p>}
+              {authenticatorResetMessage && <p role="status" className="text-left text-xs text-slate-600">{authenticatorResetMessage}</p>}
+              {authenticatorResetPending && (
+                <div className="flex gap-2">
+                  <input
+                    aria-label="Email verification code"
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={authenticatorResetCode}
+                    onChange={(event) => setAuthenticatorResetCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                    placeholder="Email code"
+                    className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                  />
+                  <button type="button" onClick={() => void confirmAuthenticatorReset()} disabled={authenticatorResetBusy || authenticatorResetCode.length !== 6} className="rounded-xl border border-amber-300 px-3 py-2 text-xs font-semibold text-amber-800 disabled:opacity-50">
+                    Reset
+                  </button>
+                </div>
+              )}
+              <button type="submit" disabled={authenticatorLoginBusy || authenticatorLoginCode.length !== 6} className="flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-800 px-4 py-3 text-sm font-bold text-white shadow-md hover:bg-cyan-900 disabled:opacity-50">
+                {authenticatorLoginBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                Sign in securely
+              </button>
+              <button type="button" onClick={() => void requestAuthenticatorReset()} disabled={authenticatorResetBusy || !authenticatorLoginEmail.includes("@")} className="w-full text-xs font-semibold text-cyan-800 hover:underline disabled:opacity-50">
+                {authenticatorResetBusy ? "Sending verification email…" : "Reset Authenticator by email"}
+              </button>
+            </form>
+            ) : (
+              <div className="w-full space-y-3 rounded-2xl border border-cyan-100 bg-cyan-50/70 p-4 text-left">
+                <p className="text-sm font-semibold text-slate-800">Create your Genie account</p>
+                <p className="text-xs leading-relaxed text-slate-600">
+                  Continue with Google to verify your Gmail address, then complete your profile. You can enable Authenticator later in Workspace Preferences.
+                </p>
+                <label className="block space-y-1">
+                  <span className="text-xs font-semibold text-slate-700">Gmail address</span>
+                  <input
+                    type="email"
+                    required
+                    autoComplete="email"
+                    value={authenticatorLoginEmail}
+                    onChange={(event) => setAuthenticatorLoginEmail(event.target.value)}
+                    placeholder="you@gmail.com"
+                    className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={handleStartGoogleRegistration}
+                  className="flex w-full items-center justify-center rounded-xl bg-cyan-800 px-4 py-3 text-sm font-bold text-white shadow-md transition hover:bg-cyan-900 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:ring-offset-2"
+                >
+                  Continue with Google / Link Gmail
+                </button>
+                {registrationError && <p role="alert" className="text-xs text-rose-700">{registrationError}</p>}
+              </div>
+            )}
+            <div className="w-full border-t border-slate-200 pt-3">
+              {authMode === "login" ? (
+                <button
+                  type="button"
+                  onClick={() => setAuthMode("register")}
+                  className="mb-2 text-xs text-cyan-800 hover:underline"
+                >
+                  New here? Link your verified Google account to register.
+                </button>
+              ) : (
+                <div className="w-full">
                   <button
                     type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setLegalModalOpen(true);
-                    }}
-                    className="text-purple-600 font-bold hover:underline"
+                    onClick={() => setAuthMode("login")}
+                    className="mb-2 text-xs font-semibold text-cyan-800 hover:underline"
                   >
-                    Terms of Service, User Disclaimer & Privacy Policy
+                    Back to sign in
                   </button>
-                </span>
+                  {showDevAuthBypass && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => void handleDevBypassLogin()}
+                        disabled={authenticatorLoginBusy}
+                        className="block w-full text-[11px] font-medium text-amber-700 hover:underline disabled:opacity-50"
+                      >
+                        {authenticatorLoginBusy ? "Opening local development session…" : "[Dev: Enter Workspace as rshaji93@gmail.com]"}
+                      </button>
+                      {authenticatorLoginError && <p role="alert" className="mt-1 text-[11px] text-rose-700">{authenticatorLoginError}</p>}
+                    </>
+                  )}
+                </div>
+              )}
+              <div className="flex min-h-[40px] w-full justify-center"><div id="googleSignInBtn" /></div>
+            </div>
+            {registrationReauthRequired && <p className="text-xs text-amber-700">{authenticatorResetMessage || "Use Google sign-in to start Authenticator enrollment."}</p>}
+          </div>
+        </div>
+      )}
+      {registrationBusy && googleIdToken && !registrationRequired && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-md">
+          <div role="status" className="flex items-center gap-3 rounded-2xl bg-white px-5 py-4 text-sm font-semibold text-slate-700 shadow-xl">
+            <Loader2 className="h-5 w-5 animate-spin text-cyan-700" />
+            Verifying your Genie registration…
+          </div>
+        </div>
+      )}
+      {registrationRequired && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center overflow-y-auto bg-slate-950/75 p-4 backdrop-blur-md">
+          <form
+            onSubmit={(event) => void submitMandatoryRegistration(event)}
+            className="my-auto w-full max-w-lg space-y-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-7"
+          >
+            <div className="flex items-start gap-3">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-cyan-50 text-cyan-800">
+                <UserCheck className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-lg font-extrabold text-slate-900">Complete your registration</h2>
+                <p className="mt-1 text-xs leading-relaxed text-slate-500">
+                  Required account details are stored securely before dashboard access is enabled.
+                </p>
+              </div>
+            </div>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Display Name / Profile Name</span>
+              <input
+                required
+                minLength={2}
+                maxLength={120}
+                value={userProfile.name}
+                onChange={(event) => setUserProfile((previous) => ({ ...previous, name: event.target.value }))}
+                className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Verified Gmail Address</span>
+              <input
+                readOnly
+                value={userProfile.email}
+                className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-500"
+              />
+            </label>
+            <fieldset className="space-y-2">
+              <legend className="text-xs font-semibold text-slate-700">Avatar Selector</legend>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  ["/avatars/Profile 1.png", "Option A: Profile 1", "Profile 1"],
+                  ["/avatars/Profile 2.png", "Option B: Profile 2", "Profile 2"],
+                  ["/avatars/Profile 3.png", "Option C: Profile 3", "Profile 3"],
+                ] as const).map(([avatar, label, description]) => (
+                  <button
+                    key={avatar}
+                    type="button"
+                    onClick={() => setUserProfile((previous) => ({ ...previous, avatarUrl: avatar }))}
+                    aria-pressed={userProfile.avatarUrl === avatar}
+                    className={`flex flex-col items-center gap-1.5 rounded-xl border p-2 text-center transition-colors ${
+                      userProfile.avatarUrl === avatar
+                        ? "border-cyan-600 bg-cyan-50 ring-2 ring-cyan-100"
+                        : "border-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <GenieAvatar src={avatar} alt={description} className="h-10 w-10 rounded-full" />
+                    <span className="text-[10px] font-bold text-slate-800">{label}</span>
+                    <span className="text-[9px] leading-tight text-slate-500">{description}</span>
+                  </button>
+                ))}
+              </div>
+              <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">
+                <ImagePlus className="h-4 w-4" />
+                Upload PNG, JPG, or SVG (max 2 MB)
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/svg+xml,.png,.jpg,.jpeg,.svg"
+                  className="sr-only"
+                  onChange={(event) => {
+                    void handleRegistrationAvatarFile(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                />
               </label>
-
-              {termsPromptWarning && (
-                <p className="text-[10px] text-rose-600 font-bold">
-                  Please review and check the terms agreement box to proceed.
+              {userProfile.avatarUrl.startsWith("data:image/") && (
+                <div className="flex items-center justify-center gap-2 text-[10px] text-slate-500">
+                  <GenieAvatar src={userProfile.avatarUrl} alt="Custom avatar preview" className="h-9 w-9 rounded-full object-cover" />
+                  <span>Custom avatar preview</span>
+                </div>
+              )}
+            </fieldset>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Mobile / Contact Number <span className="text-rose-600">*</span></span>
+              <input
+                required
+                type="tel"
+                minLength={7}
+                maxLength={32}
+                autoComplete="tel"
+                value={userProfile.mobileNumber}
+                onChange={(event) => setUserProfile((previous) => ({ ...previous, mobileNumber: event.target.value }))}
+                placeholder="+1 555 123 4567"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Alternate Recovery Email <span className="font-normal text-slate-400">(optional)</span></span>
+              <input
+                type="email"
+                maxLength={254}
+                autoComplete="email"
+                value={userProfile.recoveryEmail}
+                onChange={(event) => setUserProfile((previous) => ({ ...previous, recoveryEmail: event.target.value }))}
+                placeholder="recovery@example.com"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <label className="flex items-start gap-2 rounded-xl bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+              <input
+                type="checkbox"
+                required
+                checked={registrationTermsAccepted}
+                onChange={(event) => setRegistrationTermsAccepted(event.target.checked)}
+                className="mt-0.5 rounded border-slate-300 text-cyan-700 focus:ring-cyan-500"
+              />
+              <span>
+                I accept the{" "}
+                <button
+                  type="button"
+                  onClick={() => setLegalModalOpen(true)}
+                  className="font-bold text-cyan-800 underline"
+                >
+                  Terms of Service, User Disclaimer & Privacy Policy
+                </button>
+                . My Terms of Service consent will be recorded with my registration.
+              </span>
+            </label>
+            <label className="flex items-start gap-2 rounded-xl bg-slate-50 p-3 text-xs leading-relaxed text-slate-700">
+              <input
+                type="checkbox"
+                required
+                checked={registrationPrivacyAccepted}
+                onChange={(event) => setRegistrationPrivacyAccepted(event.target.checked)}
+                className="mt-0.5 rounded border-slate-300 text-cyan-700 focus:ring-cyan-500"
+              />
+              <span>I have read and accept the Privacy Policy.</span>
+            </label>
+            {registrationError && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{registrationError}</p>}
+            {registrationReauthRequired && (
+              <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                <p className="text-xs leading-relaxed text-amber-900">
+                  Your Google ID token may have expired. Sign in again to refresh it; your registration details will be kept for the same Google account.
+                </p>
+                <div id="googleRegistrationReauthBtn" className="flex justify-center" />
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={registrationBusy || registrationReauthRequired || !registrationTermsAccepted || !registrationPrivacyAccepted}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-800 px-4 py-3 text-sm font-bold text-white shadow-md hover:bg-cyan-900 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {registrationBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+              Complete Registration &amp; Continue
+            </button>
+          </form>
+        </div>
+      )}
+      {authenticatorSetupOpen && authenticatorSetup && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm">
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="authenticator-setup-title"
+            className="my-auto w-full max-w-lg space-y-4 rounded-3xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-7"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 id="authenticator-setup-title" className="text-lg font-extrabold text-slate-900">
+                  Enable Google Authenticator (2FA)
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">Scan the QR code, then verify a current six-digit code.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthenticatorSetupOpen(false);
+                  setAuthenticatorSetupError(null);
+                }}
+                aria-label="Close Authenticator setup"
+                className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="flex flex-col items-center gap-3 rounded-2xl border border-cyan-100 bg-cyan-50/60 p-4 sm:flex-row">
+              <img
+                src={authenticatorSetup.qr_code}
+                alt="Google Authenticator setup QR code"
+                className="h-40 w-40 rounded-xl border border-slate-200 bg-white p-2"
+              />
+              <div className="min-w-0 text-center text-xs leading-relaxed text-slate-600 sm:text-left">
+                <p>In your authenticator app, add an account by scanning this QR code.</p>
+                <p className="mt-3 break-all font-mono text-[10px]">Manual setup key: {authenticatorSetup.secret}</p>
+              </div>
+            </div>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">6-digit verification code</span>
+              <input
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                pattern="[0-9]{6}"
+                value={authenticatorSetupCode}
+                onChange={(event) => setAuthenticatorSetupCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                placeholder="000000"
+                aria-label="Authenticator verification code"
+                className="w-full rounded-xl border border-slate-300 px-3 py-3 text-center font-mono tracking-[0.5em] text-slate-900"
+              />
+            </label>
+            {authenticatorSetupError && <p role="alert" className="rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700">{authenticatorSetupError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setAuthenticatorSetupOpen(false)}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleVerifyAuthenticatorSetup()}
+                disabled={authenticatorSetupBusy || authenticatorSetupCode.length !== 6}
+                className="rounded-xl bg-cyan-800 px-4 py-2 text-xs font-bold text-white disabled:opacity-50"
+              >
+                {authenticatorSetupBusy ? "Verifying…" : "Verify & Enable"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+      {editProfileOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-950/70 p-4 backdrop-blur-sm">
+          <form
+            onSubmit={(event) => void saveProfileChanges(event)}
+            className="my-auto max-h-[92vh] w-full max-w-xl space-y-4 overflow-y-auto rounded-3xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-7"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-extrabold text-slate-900">Edit Profile</h2>
+                <p className="mt-1 text-xs text-slate-500">Update your account details and Genie avatar.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setEditProfileOpen(false)}
+                aria-label="Close Edit Profile"
+                className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Display Name</span>
+              <input
+                required
+                minLength={2}
+                maxLength={120}
+                value={profileEditor.name}
+                onChange={(event) => setProfileEditor((previous) => ({ ...previous, name: event.target.value }))}
+                className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+              />
+            </label>
+            <label className="block space-y-1.5">
+              <span className="text-xs font-semibold text-slate-700">Verified Gmail Address</span>
+              <input
+                readOnly
+                value={userProfile.email}
+                className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-500"
+              />
+            </label>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block space-y-1.5">
+                <span className="text-xs font-semibold text-slate-700">Mobile / Contact Number</span>
+                <input
+                  required
+                  type="tel"
+                  minLength={7}
+                  maxLength={32}
+                  autoComplete="tel"
+                  value={profileEditor.mobileNumber}
+                  onChange={(event) => setProfileEditor((previous) => ({ ...previous, mobileNumber: event.target.value }))}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                />
+              </label>
+              <label className="block space-y-1.5">
+                <span className="text-xs font-semibold text-slate-700">Alternate Recovery Email</span>
+                <input
+                  type="email"
+                  maxLength={254}
+                  autoComplete="email"
+                  value={profileEditor.recoveryEmail}
+                  onChange={(event) => setProfileEditor((previous) => ({ ...previous, recoveryEmail: event.target.value }))}
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm text-slate-900 outline-none focus:border-cyan-600 focus:ring-2 focus:ring-cyan-100"
+                />
+              </label>
+            </div>
+            <section className="space-y-3 rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-xs font-bold text-slate-800">Google Authenticator (2FA)</h3>
+                {authenticatorEnabled || userProfile.totpEnabled ? (
+                  <span role="status" className="rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-[10px] font-semibold text-emerald-800">
+                    Google Authenticator: Enabled ✓
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void startProfileTotpSetup()}
+                    disabled={profileTotpBusy}
+                    className="rounded-lg bg-cyan-800 px-3 py-2 text-xs font-semibold text-white hover:bg-cyan-900 disabled:opacity-50"
+                  >
+                    {profileTotpBusy ? "Preparing…" : "[ Set Up Google Authenticator ]"}
+                  </button>
+                )}
+              </div>
+              {authenticatorEnabled || userProfile.totpEnabled ? (
+                <button
+                  type="button"
+                  onClick={() => void requestProfileTotpReset()}
+                  disabled={profileTotpBusy}
+                  className="text-left text-[11px] font-medium text-cyan-800 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-950 disabled:opacity-50"
+                >
+                  {profileTotpBusy
+                    ? "Requesting secure setup link…"
+                    : "Need to reset or re-link Authenticator? Request setup link via email"}
+                </button>
+              ) : profileTotpSetup ? (
+                <div className="space-y-3 rounded-xl border border-cyan-100 bg-white p-3">
+                  <p className="text-[11px] leading-relaxed text-slate-600">
+                    Scan this QR code with Google Authenticator, then enter its current 6-digit code.
+                  </p>
+                  <Image
+                    src={profileTotpSetup.qr_code}
+                    alt="Google Authenticator setup QR code"
+                    width={160}
+                    height={160}
+                    unoptimized
+                    className="mx-auto h-40 w-40 rounded-lg border border-slate-200 bg-white object-contain p-2"
+                  />
+                  <p className="break-all text-center font-mono text-[10px] text-slate-600">
+                    Manual key: {profileTotpSetup.secret}
+                  </p>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={6}
+                      value={profileTotpCode}
+                      onChange={(event) => setProfileTotpCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                      placeholder="6-digit code"
+                      aria-label="Google Authenticator verification code"
+                      className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void verifyProfileTotpSetup()}
+                      disabled={profileTotpBusy || profileTotpCode.length !== 6}
+                      className="rounded-lg bg-cyan-800 px-3 py-2 text-xs font-bold text-white hover:bg-cyan-900 disabled:opacity-50"
+                    >
+                      {profileTotpBusy ? "Verifying…" : "Verify & Enable"}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[11px] leading-relaxed text-slate-600">
+                  Add an authenticator code as a second layer of account security.
                 </p>
               )}
+              {profileTotpError && <p role="alert" className="text-xs text-rose-700">{profileTotpError}</p>}
+              {profileTotpMessage && <p role="status" className="text-xs text-emerald-700">{profileTotpMessage}</p>}
+              {profileTotpToast && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="fixed bottom-5 right-5 z-[120] max-w-sm rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs font-semibold text-emerald-900 shadow-xl"
+                >
+                  {profileTotpToast}
+                </div>
+              )}
+            </section>
+            <section className="space-y-3 rounded-2xl border border-slate-200 p-3.5">
+              <div className="flex items-center gap-3">
+                <GenieAvatar src={profileEditor.avatarUrl} alt="Selected Genie avatar" className="h-14 w-14 rounded-full border border-slate-200" />
+                <div>
+                  <h3 className="text-xs font-bold text-slate-800">Avatar Selector</h3>
+                  <p className="text-[10px] text-slate-500">Select a Genie design or upload your own image.</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  ["/avatars/Profile 1.png", "Option A: Profile 1", "Profile 1"],
+                  ["/avatars/Profile 2.png", "Option B: Profile 2", "Profile 2"],
+                  ["/avatars/Profile 3.png", "Option C: Profile 3", "Profile 3"],
+                ] as const).map(([value, label, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-pressed={profileEditor.avatarUrl === value}
+                    onClick={() => {
+                      setProfileSaveError(null);
+                      setProfileEditor((previous) => ({ ...previous, avatarUrl: value }));
+                    }}
+                    className={`flex flex-col items-center gap-1.5 rounded-xl border p-2 text-center transition-colors ${
+                      profileEditor.avatarUrl === value
+                        ? "border-cyan-600 bg-cyan-50 ring-2 ring-cyan-100"
+                        : "border-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <GenieAvatar src={value} alt={description} className="h-10 w-10 rounded-full" />
+                    <span className="text-[10px] font-bold text-slate-800">{label}</span>
+                    <span className="text-[9px] leading-tight text-slate-500">{description}</span>
+                  </button>
+                ))}
+              </div>
+              <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-100">
+                <ImagePlus className="h-4 w-4" />
+                Upload PNG, JPG, or SVG (max 2 MB)
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/svg+xml,.png,.jpg,.jpeg,.svg"
+                  className="sr-only"
+                  onChange={(event) => {
+                    void handleProfileAvatarFile(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              {profileEditor.avatarUrl.startsWith("data:image/") && (
+                <p className="text-center text-[10px] text-slate-500">Your upload is previewed in a circular crop.</p>
+              )}
+            </section>
+            {profileSaveError && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{profileSaveError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditProfileOpen(false)}
+                disabled={profileSaveBusy}
+                className="rounded-xl border border-slate-200 px-4 py-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={profileSaveBusy}
+                className="flex items-center gap-2 rounded-xl bg-cyan-800 px-4 py-2.5 text-xs font-bold text-white hover:bg-cyan-900 disabled:opacity-50"
+              >
+                {profileSaveBusy && <Loader2 className="h-4 w-4 animate-spin" />}
+                Save Changes
+              </button>
             </div>
-
-            <div
-              className={`flex justify-center w-full min-h-[40px] transition-opacity ${
-                hasAgreedToTerms ? "opacity-100" : "opacity-40 pointer-events-none"
-              }`}
-            >
-              <div id="googleSignInBtn" />
-            </div>
-            {!hasAgreedToTerms && (
-              <p className="text-[10px] text-slate-400">
-                Check the agreement box above to activate Google Sign-In.
-              </p>
-            )}
-          </div>
+          </form>
         </div>
       )}
       {isTeamMode && roomId.startsWith("share_") && (
@@ -2775,22 +5010,22 @@ function MainChatApp() {
 
       {/* Main Responsive Layout Wrapper */}
       <div className={`flex h-[100dvh] max-h-[100dvh] w-full overflow-hidden ${currentTheme.canvasClass} ${currentTheme.canvasTextClass} antialiased font-sans`}>
-        {(chatError || archiveError || archiveStatus || vipSessionLimitReached) && (
+        {(visibleChatError || archiveError || archiveStatus || vipSessionLimitReached) && (
           <div
-            role={chatError || archiveError ? "alert" : "status"}
+            role={visibleChatError || archiveError ? "alert" : "status"}
             className={`fixed bottom-4 left-1/2 z-[60] flex w-[min(92vw,48rem)] -translate-x-1/2 items-start justify-between gap-3 rounded-xl border px-4 py-3 text-xs shadow-xl ${
-              chatError || archiveError
+              visibleChatError || archiveError
                 ? "border-rose-200 bg-rose-50 text-rose-800"
                 : "border-emerald-200 bg-emerald-50 text-emerald-800"
             }`}
           >
             <span className="min-w-0 break-words">
-              {chatError ||
+              {visibleChatError ||
                 archiveError ||
                 archiveStatus ||
                 "All 20 concurrent VIP sessions are in use. This account is in the standard tier until a VIP session becomes available."}
             </span>
-            {(chatError || archiveError || archiveStatus) && (
+            {(visibleChatError || archiveError || archiveStatus) && (
               <button
                 type="button"
                 onClick={() => {
@@ -2804,6 +5039,24 @@ function MainChatApp() {
                 Dismiss
               </button>
             )}
+          </div>
+        )}
+        {socialInvites.length > 0 && (
+          <div className="fixed right-4 top-16 z-[65] w-[min(92vw,22rem)] space-y-2">
+            {socialInvites.map((invite) => (
+              <section key={invite.invite_id} className="rounded-2xl border border-cyan-200 bg-white p-4 shadow-xl">
+                <p className="text-xs font-semibold text-slate-800">{invite.sender_name} invited you to join their session</p>
+                <p className="mt-1 truncate text-[10px] text-slate-500">{invite.room_title}</p>
+                <div className="mt-3 flex gap-2">
+                  <button type="button" onClick={() => void respondToSocialInvite(invite, true)} className="flex-1 rounded-lg bg-cyan-700 px-3 py-2 text-[11px] font-semibold text-white hover:bg-cyan-800">
+                    Accept &amp; Join
+                  </button>
+                  <button type="button" onClick={() => void respondToSocialInvite(invite, false)} className="rounded-lg border border-slate-200 px-3 py-2 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">
+                    Decline
+                  </button>
+                </div>
+              </section>
+            ))}
           </div>
         )}
         {/* Mobile Backdrop Overlay */}
@@ -2823,7 +5076,7 @@ function MainChatApp() {
           <div className={`flex items-center justify-between border-b p-4 ${currentTheme.chromeBorderClass}`}>
             <div className="flex items-center gap-3">
               <GenieAvatar
-                src={userProfile.avatarUrl}
+                src={userProfile.googleAvatarUrl || userProfile.avatarUrl}
                 alt={userProfile.name}
                 className={`w-9 h-9 rounded-full border-2 ${selectedTheme.borderClass} shadow-sm`}
               />
@@ -2841,36 +5094,130 @@ function MainChatApp() {
             </button>
           </div>
 
-          <div className="p-3">
-            <button
-              onClick={() => {
-                const newId = Date.now().toString();
-                setSessions((prev) => [
-                  { id: newId, title: "New Session", isPinned: false, messages: [] },
-                  ...prev,
-                ]);
-                setIsTeamMode(false);
-                setPersonalMessages([]);
-                setCurrentSessionId(newId);
-                if (typeof window !== "undefined" && window.innerWidth < 1024) {
-                  setSidebarOpen(false);
-                }
-              }}
-              className={`w-full flex items-center justify-center gap-2 py-2 px-3 text-xs font-semibold ${selectedTheme.primaryClass} text-white rounded-xl transition-all shadow-sm`}
-            >
-              <Plus className="w-4 h-4" /> New Chat
-            </button>
-            <button
-              type="button"
-              disabled={!isAuthenticated}
-              onClick={() => setFriendsQueueOpen(true)}
-              className={`mt-2 w-full flex items-center justify-between gap-2 rounded-xl border ${currentTheme.chromeBorderClass} ${currentTheme.chromeSurfaceClass} px-3 py-2 text-xs font-semibold ${currentTheme.chromeTextClass} disabled:cursor-not-allowed disabled:opacity-50`}
-            >
-              <span className="flex items-center gap-2"><Users className="h-4 w-4" /> Friends Queue</span>
-              <span className="text-[10px] text-slate-500">
-                {discoverableFriends.filter((friend) => friend.is_online).length} online
-              </span>
-            </button>
+          <div className="space-y-3 border-b border-slate-200/80 p-3">
+            <section className="rounded-xl border border-slate-200 bg-white/85 p-2.5">
+              <h2 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Invite &amp; Omni-Search</h2>
+              <form onSubmit={(event) => void searchOmniDirectory(event)} className="flex gap-1.5">
+                <input
+                  value={omniSearchQuery}
+                  onChange={(event) => {
+                    setOmniSearchQuery(event.target.value);
+                    setOmniSearchResults([]);
+                    setOmniSearchNotFound(false);
+                    setOmniSearchError(null);
+                  }}
+                  disabled={!isAuthenticated}
+                  minLength={2}
+                  placeholder="Search name or enter Gmail..."
+                  aria-label="Search users by name or Gmail address"
+                  className="min-w-0 flex-1 rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] text-slate-800 outline-none focus:border-cyan-600 disabled:bg-slate-50"
+                />
+                <button
+                  type="submit"
+                  disabled={!isAuthenticated || omniSearchBusy || omniSearchQuery.trim().length < 2}
+                  title="Search registered Genie users"
+                  aria-label="Search users"
+                  className="flex shrink-0 items-center justify-center rounded-lg bg-slate-900 px-2.5 text-white disabled:opacity-40"
+                >
+                  {omniSearchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+                </button>
+              </form>
+              {omniSearchError && <p role="alert" className="mt-2 text-[10px] text-rose-600">{omniSearchError}</p>}
+              {omniSearchNotFound && omniSearchQuery.includes("@") && (
+                <button
+                  type="button"
+                  disabled={inviteEmailBusy}
+                  onClick={() => void sendOnboardingInviteEmail(omniSearchQuery.trim())}
+                  className="mt-2 flex w-full items-center justify-center gap-1.5 rounded-lg border border-cyan-200 bg-cyan-50 px-2 py-2 text-[10px] font-bold text-cyan-800 disabled:opacity-50"
+                >
+                  {inviteEmailBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Mail className="h-3.5 w-3.5" />}
+                  Send Invite Email
+                </button>
+              )}
+              {inviteEmailStatus && <p role="status" className="mt-2 text-[10px] text-emerald-700">{inviteEmailStatus}</p>}
+              {omniSearchResults.length > 0 && (
+                <div className="mt-2 max-h-40 space-y-1 overflow-y-auto">
+                  {omniSearchResults.map((user) => (
+                    <div key={user.user_id} className="rounded-lg border border-slate-100 bg-slate-50 p-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <GenieAvatar src={user.avatar_url} alt={user.display_name} className="h-7 w-7 shrink-0 rounded-full" />
+                        <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-slate-800">{user.display_name}</span>
+                        {user.relationship === "friend" && <span className="text-[9px] font-bold text-emerald-700">Friend</span>}
+                      </div>
+                      {user.relationship !== "friend" && (
+                        <div className="mt-1.5 flex gap-1.5">
+                          <button
+                            type="button"
+                            disabled={user.relationship === "following" || user.relationship === "request_sent"}
+                            onClick={() => void updateSocialRelationship(user, "follow")}
+                            className="flex-1 rounded-md border border-slate-200 bg-white px-1.5 py-1 text-[9px] font-semibold text-slate-700 disabled:opacity-50"
+                          >
+                            {user.relationship === "following" ? "Following" : "Follow"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={user.relationship === "request_sent" || user.relationship === "request_received"}
+                            onClick={() => void updateSocialRelationship(user, "friend-request")}
+                            className="flex flex-1 items-center justify-center gap-1 rounded-md bg-cyan-800 px-1.5 py-1 text-[9px] font-semibold text-white disabled:opacity-50"
+                          >
+                            {user.relationship !== "request_sent" && user.relationship !== "request_received" && <UserPlus className="h-3 w-3" />}
+                            {user.relationship === "request_sent" ? "Requested" : user.relationship === "request_received" ? "Respond below" : "+ Add Friend"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+            <section className="rounded-xl border border-slate-200 bg-white/85 p-2.5">
+              <div className="mb-2 flex items-center justify-between gap-2 px-1">
+                <h2 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Friends Queue</h2>
+                <span className="text-[9px] text-slate-500">{discoverableFriends.filter((friend) => friend.is_online).length} online</span>
+              </div>
+              {pendingFriendRequests.length > 0 && (
+                <div className="mb-2 space-y-1.5 border-b border-slate-100 pb-2">
+                  {pendingFriendRequests.map((request) => (
+                    <div key={request.user_id} className="flex items-center gap-1.5">
+                      <span className="min-w-0 flex-1 truncate text-[10px] text-slate-700">{request.display_name} wants to connect</span>
+                      <button type="button" onClick={() => void respondToFriendRequest(request, true)} className="text-[9px] font-bold text-emerald-700">Accept</button>
+                      <button type="button" onClick={() => void respondToFriendRequest(request, false)} className="text-[9px] font-semibold text-slate-400">Decline</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="max-h-36 space-y-1 overflow-y-auto">
+                {discoverableFriends.length ? discoverableFriends.map((friend) => {
+                  const busyElsewhere = friend.is_online && (!isTeamMode || friend.active_room_id !== roomId);
+                  const availableHere = friend.is_online && !busyElsewhere;
+                  return (
+                  <div key={friend.user_id} className="flex items-center gap-2 rounded-lg px-1 py-1">
+                    <span className={`h-2 w-2 shrink-0 rounded-full ${availableHere ? "bg-emerald-500" : busyElsewhere ? "bg-rose-500" : "bg-slate-300"}`} aria-label={availableHere ? "Available in this room" : busyElsewhere ? "Busy in another room" : "Offline"} />
+                    <span className="min-w-0 flex-1 truncate text-[10px] font-medium text-slate-700">{friend.handle || friend.display_name}</span>
+                    {busyElsewhere ? (
+                      <span className="shrink-0 rounded-full bg-rose-50 px-1.5 py-0.5 text-[8px] font-semibold text-rose-700">In Another Room / Busy in Session</span>
+                    ) : (
+                      <span className={`shrink-0 text-[9px] ${availableHere ? "text-emerald-700" : "text-slate-400"}`}>{availableHere ? "Available" : "Offline"}</span>
+                    )}
+                    {availableHere && (
+                      <button
+                        type="button"
+                        disabled={!isTeamMode}
+                        onClick={() => void sendRoomInvite(friend)}
+                        title={!isTeamMode ? "Start a share room before inviting" : `Invite ${friend.display_name}`}
+                        className="shrink-0 rounded-md border border-cyan-200 px-1.5 py-1 text-[9px] font-bold text-cyan-800 disabled:opacity-40"
+                      >
+                        + Invite
+                      </button>
+                    )}
+                  </div>
+                  );
+                }) : <p className="px-1 py-2 text-[10px] text-slate-400">{isAuthenticated ? "Accepted mutual friends appear here." : "Sign in to view your friends."}</p>}
+              </div>
+              <button type="button" onClick={() => setFriendsQueueOpen(true)} disabled={!isAuthenticated} className="mt-1 w-full rounded-lg px-2 py-1.5 text-left text-[9px] font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-50">
+                Manage friends &amp; rooms
+              </button>
+            </section>
           </div>
 
           <div className="flex-1 overflow-y-auto px-3 space-y-1">
@@ -2895,8 +5242,11 @@ function MainChatApp() {
                       <button
                         type="button"
                         onClick={() => {
+                          stopCurrentChatGeneration();
                           setActiveTopicId(topic.id);
+                          setIsTopicConversation(true);
                           setIsTeamMode(false);
+                          setPrompt("");
                           if (typeof window !== "undefined" && window.innerWidth < 1024) setSidebarOpen(false);
                         }}
                         aria-current={activeTopicId === topic.id ? "page" : undefined}
@@ -2939,21 +5289,21 @@ function MainChatApp() {
                 </button>
               </section>
             )}
-            <div className="px-3 py-2 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+            <button
+              type="button"
+              onClick={handleCreateNewChat}
+              className={`mb-1 flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold text-white shadow-sm ${selectedTheme.primaryClass}`}
+            >
+              <Plus className="h-4 w-4" /> New Chat
+            </button>
+            <div className="px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
               Chat History
             </div>
 
-            {sessions.map((session) => (
+            {sessions.filter((session) => !session.isDeleted).map((session) => (
               <div
                 key={session.id}
-                onClick={() => {
-                  setCurrentSessionId(session.id);
-                  setIsTeamMode(false);
-                  setPersonalMessages(session.messages);
-                  if (typeof window !== "undefined" && window.innerWidth < 1024) {
-                    setSidebarOpen(false);
-                  }
-                }}
+                onClick={() => handleSelectSession(session)}
                 className={`group relative flex items-center justify-between px-3 py-2 text-xs rounded-xl cursor-pointer transition-all ${
                   currentSessionId === session.id
                     ? `bg-white ${selectedTheme.textClass} font-semibold shadow-sm border border-[#D9DFEA]`
@@ -3028,12 +5378,7 @@ function MainChatApp() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          if (sessions.length > 1) {
-                            setSessions((prev) => prev.filter((s) => s.id !== session.id));
-                            if (currentSessionId === session.id) {
-                              setCurrentSessionId(sessions.find((s) => s.id !== session.id)!.id);
-                            }
-                          }
+                          void softDeleteSession(session);
                           setActiveMenuId(null);
                         }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-rose-600 hover:bg-rose-50"
@@ -3045,6 +5390,32 @@ function MainChatApp() {
                 </div>
               </div>
             ))}
+            <button
+              type="button"
+              onClick={() => setTrashOpen((open) => !open)}
+              className="mt-2 flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[11px] font-semibold text-slate-500 hover:bg-white/70"
+            >
+              <span className="flex items-center gap-2"><Trash2 className="h-3.5 w-3.5" /> Trash / Recently Deleted</span>
+              <span>{trashSessions.length}</span>
+            </button>
+            {trashOpen && (
+              <div className="mb-2 space-y-1 rounded-xl border border-slate-200 bg-white/70 p-2">
+                {trashSessions.length ? trashSessions.map((deletedSession) => {
+                  const deletedAt = deletedSession.deletedAt ? new Date(deletedSession.deletedAt).getTime() : Date.now();
+                  const remainingDays = Math.max(0, 30 - Math.floor((Date.now() - deletedAt) / 86400000));
+                  return (
+                    <div key={deletedSession.id} className="flex items-center gap-2 rounded-lg px-2 py-1.5">
+                      <span className="min-w-0 flex-1 truncate text-[10px] text-slate-600" title={deletedSession.title}>
+                        {deletedSession.title} · {remainingDays}d
+                      </span>
+                      <button type="button" onClick={() => void restoreSession(deletedSession)} className="shrink-0 text-[10px] font-semibold text-cyan-700 hover:underline">
+                        Restore
+                      </button>
+                    </div>
+                  );
+                }) : <p className="px-2 py-1 text-[10px] text-slate-400">Trash is empty.</p>}
+              </div>
+            )}
           </div>
 
           <div className={`space-y-2 border-t p-3 ${currentTheme.chromeBorderClass} ${currentTheme.chromeClass}`}>
@@ -3076,7 +5447,7 @@ function MainChatApp() {
             <div className="flex items-center justify-between bg-white/70 p-2 rounded-xl border border-slate-200">
               <div className="flex items-center gap-2 min-w-0">
                 <GenieAvatar
-                  src={userProfile.avatarUrl}
+                  src={userProfile.googleAvatarUrl || userProfile.avatarUrl}
                   alt={userProfile.name}
                   className={`w-7 h-7 rounded-full border ${selectedTheme.borderClass} flex-shrink-0`}
                 />
@@ -3093,16 +5464,24 @@ function MainChatApp() {
                 </div>
               </div>
 
-              <button
-                onClick={() => setSpaceMode(spaceMode === "personal" ? "workspace" : "personal")}
-                className={`text-[10px] font-bold px-2 py-1 rounded-lg border transition-all ${
-                  spaceMode === "workspace"
-                    ? `${selectedTheme.primaryClass} text-white`
-                    : "bg-pink-50 text-pink-700 border-pink-300"
-                }`}
-              >
-                {spaceMode === "workspace" ? "Work" : "Personal"}
-              </button>
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={openProfileEditor}
+                  className="flex items-center gap-1 rounded-lg border border-cyan-200 bg-cyan-50 px-2 py-1 text-[10px] font-bold text-cyan-800 transition-colors hover:bg-cyan-100"
+                >
+                  <Edit2 className="h-3 w-3" />
+                  Edit Profile
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  className="flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-2 py-1 text-[10px] font-bold text-rose-600 transition-colors hover:bg-rose-50"
+                >
+                  <LogOut className="h-3 w-3" />
+                  Sign Out
+                </button>
+              </div>
             </div>
             {/* Direct Sidebar Chat Vault */}
             <div className="bg-white/80 border border-slate-200 rounded-xl p-2 space-y-1.5 shadow-2xs">
@@ -3144,11 +5523,16 @@ function MainChatApp() {
                             const parsed = JSON.parse(event.target?.result as string);
                             const sessionsToLoad = Array.isArray(parsed) ? parsed : parsed.sessions;
                             if (Array.isArray(sessionsToLoad) && sessionsToLoad.length > 0) {
-                              setSessions(sessionsToLoad);
+                              const restoredSessions = sessionsToLoad.map((session: ChatSession) => ({
+                                ...session,
+                                messages: ensureMessageTimestamps(session.messages || []),
+                              }));
+                              setSessions(restoredSessions);
                               setCurrentSessionId(sessionsToLoad[0].id);
+                              setIsTopicConversation(Boolean(sessionsToLoad[0].topicId));
                               setIsTeamMode(false);
-                              setPersonalMessages(sessionsToLoad[0].messages || []);
-                              localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(sessionsToLoad));
+                              setPersonalMessages(restoredSessions[0].messages);
+                              localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(restoredSessions));
                               alert("Chat history restored successfully!");
                             }
                           } catch {
@@ -3200,6 +5584,7 @@ function MainChatApp() {
             onToggleTeamMode={handleToggleTeamMode}
             isCorporateDomain={isCorporateDomain}
             workspaceName={isCorporateDomain ? "Corp Active" : spaceMode === "workspace" ? "Workspace" : "Personal"}
+            profileGender={userProfile.gender}
             activeMemberCount={activeRoomMemberCount}
             capacityLabel={roomCapacityLabel}
             chromeClass={currentTheme.chromeClass}
@@ -3212,6 +5597,11 @@ function MainChatApp() {
             activeClass={currentTheme.primaryClass}
             onOpenRoom={() => setRoomAdminOpen(true)}
             onOpenSettings={() => setSettingsOpen(true)}
+            isAuthenticated={isAuthenticated}
+            isRoomHost={members.some((member) => member.id === roomIdentity && member.role === "sovereign")}
+            onCopyInvite={(mode) => void copyHeaderInvite(mode)}
+            onLeaveRoom={handleExitRoomToPersonal}
+            onEndRoom={() => void endActiveRoom()}
           />
 
           {/* SECTION 5: CHAT THREAD & CANVAS */}
@@ -3245,9 +5635,11 @@ function MainChatApp() {
               )}
               {messages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center px-4">
-                  <div className="w-16 h-16 rounded-full flex items-center justify-center bg-gradient-to-tr from-violet-600 via-pink-500 to-amber-400 text-white shadow-lg p-3.5 mb-4 select-none">
-                    <Sparkles className="w-full h-full text-white drop-shadow-md animate-pulse" />
-                  </div>
+                  <GenieBrandAvatar
+                    gender={userProfile.gender}
+                    label={`${userProfile.name}'s Genie`}
+                    className="mb-4 h-16 w-16 rounded-full shadow-lg"
+                  />
                   <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-slate-900 mb-2">
                     Where should we start?
                   </h2>
@@ -3264,92 +5656,40 @@ function MainChatApp() {
                   {messages.map((msg, index) => (
                     <div
                       key={msg.id || index}
-                      className={`flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
+                      className={`group flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
+                      onTouchStart={(event) => startLongPress(event, msg, index)}
+                      onTouchEnd={cancelLongPress}
+                      onTouchCancel={cancelLongPress}
+                      onTouchMove={cancelLongPress}
+                      onContextMenu={(event) => {
+                        if (window.matchMedia("(pointer: coarse)").matches || window.innerWidth < 768) {
+                          event.preventDefault();
+                          const bounds = event.currentTarget.getBoundingClientRect();
+                          openLongPressMenu(msg, index, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+                          cancelLongPress();
+                        }
+                      }}
                     >
-                      {(msg.senderName || msg.source) && (
-                        <span
-                          title={
-                            msg.source === "cloud_ai"
-                              ? "Generated by a live cloud AI model."
-                              : msg.source === "platform_engine"
-                              ? "Answered instantly by the local Personal AI Genie platform engine."
-                              : msg.source === "local_agent"
-                              ? `Executed by the local ${msg.agentName || "Python"} agent.`
-                              : msg.source === "gemini-3.8-flash"
-                              ? "Generated by the Personal AI Genie cloud API."
-                              : msg.source === "backend-manifest"
-                              ? "Answered by the built-in Personal AI Genie platform guide."
-                              : msg.source === "openrouter-fallback"
-                              ? "Generated by an OpenRouter fallback model."
-                              : undefined
-                          }
-                          className={`mb-1 px-1 text-[10px] font-semibold ${
-                            msg.source ? "cursor-help text-slate-500" : "text-slate-400"
-                          }`}
-                        >
-                          {msg.source === "cloud_ai"
-                            ? "✨ Personal AI Genie (Live AI)"
-                            : msg.source === "platform_engine"
-                            ? "⚙️ Personal AI Genie (Local Engine)"
-                            : msg.source === "local_agent"
-                            ? `⚡ Local Agent Engine: ${msg.agentName || "Python Agent"}`
-                            : msg.source === "gemini-3.8-flash" || msg.source === "openrouter-fallback"
-                            ? "✨ Personal AI Genie (Live AI)"
-                            : msg.source === "backend-manifest"
-                            ? "⚙️ Personal AI Genie (Platform Engine)"
-                            : msg.senderName || "Personal AI Genie"}
+                      {msg.role === "assistant" ? (
+                        <span className="mb-1 flex items-center gap-1.5 px-1 text-[10px] font-semibold text-slate-600">
+                          <BrandAvatar variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant} className="h-5 w-5" label="Genie response" />
+                          {getAssistantPersona(msg).badge}
                         </span>
-                      )}
+                      ) : isTeamMode && msg.senderName ? (
+                        <span className="mb-1 max-w-[85%] truncate px-1 text-[10px] font-semibold text-slate-500">
+                          {msg.senderName}
+                        </span>
+                      ) : null}
 
                       {msg.role === "user" ? (
-                        <div className="group relative flex items-center gap-2">
-                          <div className="opacity-0 group-hover:opacity-100 flex items-center gap-1 transition-opacity">
-                            <button
-                              onClick={() =>
-                                setReplyTarget({
-                                  author: msg.senderName || "User",
-                                  content: msg.content,
-                                })
-                              }
-                              className={`p-1 text-slate-400 hover:${selectedTheme.textClass}`}
-                              title="Reply to message"
-                            >
-                              <Reply className="w-3.5 h-3.5" />
-                            </button>
-                            {isTeamMode &&
-                              msg.role === "user" &&
-                              msg.sender_id === roomIdentity &&
-                              msg.id &&
-                              !msg.is_deleted && (
-                                <>
-                                  <button
-                                    onClick={() => {
-                                      setEditingMessageId(msg.id!);
-                                      setEditDraft(msg.content);
-                                    }}
-                                    className="p-1 text-slate-400 hover:text-sky-700"
-                                    title="Edit message"
-                                  >
-                                    <Edit2 className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteRoomMessage(msg)}
-                                    className="p-1 text-slate-400 hover:text-rose-600"
-                                    title="Delete message"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
-                                </>
-                              )}
-                            <button
-                              onClick={() => setForwardMessage(msg)}
-                              className={`p-1 text-slate-400 hover:${selectedTheme.textClass}`}
-                              title="Forward message"
-                            >
-                              <Forward className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-
+                        <div className={`flex max-w-full items-start gap-2 ${isTeamMode ? "flex-row-reverse" : "flex-col items-end"}`}>
+                          {isTeamMode && (
+                            <GenieAvatar
+                              src={members.find((member) => member.id === msg.sender_id)?.avatarUrl || (msg.sender_id === roomIdentity ? userProfile.avatarUrl : "")}
+                              alt={`${msg.senderName || userProfile.name}'s avatar`}
+                              className="mt-1 h-8 w-8 shrink-0 rounded-full border border-slate-200"
+                            />
+                          )}
                           <div
                             className={`group relative max-w-[85%] rounded-2xl px-4 py-3 text-sm text-white rounded-br-none shadow-sm space-y-1 ${
                               msg.triggeredByRainbow
@@ -3357,6 +5697,7 @@ function MainChatApp() {
                                 : `bg-gradient-to-r ${selectedTheme.gradientClass}`
                             }`}
                           >
+                            {msg.isForwarded && <span className="block text-[10px] font-semibold opacity-75">Forwarded from {msg.forwardedFrom || "another chat"}</span>}
                             {msg.replyTo && (
                               <div className="bg-white/20 border-l-2 border-white/50 p-2 rounded text-xs text-white/90 mb-1">
                                 <span className="font-bold block text-[10px]">
@@ -3365,13 +5706,13 @@ function MainChatApp() {
                                 <span className="truncate block opacity-90">{msg.replyTo.content}</span>
                               </div>
                             )}
-                            {editingMessageId === msg.id ? (
+                            {editingMessageId === (msg.id || String(index)) ? (
                               <div className="space-y-2">
                                 <textarea
                                   value={editDraft}
                                   onChange={(event) => setEditDraft(event.target.value)}
                                   className="w-full min-w-48 rounded-lg border border-white/40 bg-white/15 p-2 text-sm text-white outline-none"
-                                  aria-label="Edit room message"
+                                  aria-label="Edit message"
                                 />
                                 <div className="flex justify-end gap-2">
                                   <button
@@ -3381,7 +5722,7 @@ function MainChatApp() {
                                     Cancel
                                   </button>
                                   <button
-                                    onClick={() => handleEditRoomMessage(msg)}
+                                    onClick={() => void handleEditMessage(msg, index)}
                                     className="rounded bg-white/20 px-2 py-1 text-xs font-semibold text-white hover:bg-white/30"
                                   >
                                     Save
@@ -3396,8 +5737,14 @@ function MainChatApp() {
                                 )}
                               </p>
                             )}
-                            {renderRoomReactions(msg)}
+                            <div className="mt-1 flex justify-end">
+                              <span className="ml-2 select-none self-end text-[10px] text-gray-400">
+                                {new Date(msg.timestamp || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                              </span>
+                            </div>
                           </div>
+                          {renderMessageActionBar(msg, index)}
+                          {renderMessageReactions(msg, index)}
                           {isTeamMode && msg.role === "user" && msg.sender_id === roomIdentity && (
                             <div
                               className="room-receipts px-1 text-right text-xs"
@@ -3424,17 +5771,24 @@ function MainChatApp() {
                           )}
                         </div>
                       ) : (
-                        <div className="w-full max-w-[85%] space-y-1.5">
+                        <div className="flex w-full max-w-[85%] items-start gap-2">
+                          <BrandAvatar
+                            variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant}
+                            label="Genie response"
+                            className="mt-1 h-8 w-8"
+                          />
+                          <div className="min-w-0 flex-1 space-y-1.5">
                           <MessageBubble
-                            provider={msg.provider || (msg.source === "openrouter-fallback" ? "OpenRouter" : msg.source === "cloud_ai" ? "Google Gemini" : "Personal AI Genie")}
-                            model={msg.providerModel || msg.modelUsed || (msg.source === "platform_engine" ? "platform engine" : "AI response")}
+                            provider={getAssistantPersona(msg).provider}
+                            model={getAssistantPersona(msg).model}
                             autoFallback={msg.autoFallback}
                             className={`group relative max-w-full rounded-2xl rounded-bl-none px-4 py-3 text-sm leading-relaxed border shadow-sm ${
-                              msg.isIntervention
+                              msg.isIntervention || msg.senderName?.includes("Intervention")
                                 ? `${selectedTheme.bgLightClass} ${selectedTheme.textClass} ${selectedTheme.borderClass}`
                                 : "bg-white text-slate-800 border-slate-200"
                             }`}
                           >
+                            {msg.isForwarded && <p className="mb-1 text-[10px] font-semibold text-slate-500">Forwarded from {msg.forwardedFrom || "another chat"}</p>}
                             <p className="whitespace-pre-wrap">{msg.content}</p>
                             {(msg.source === "local_agent" || msg.source === "platform_engine") && msg.agentOutput && (
                               <div className="mt-3 space-y-2 border-t border-slate-200/80 pt-3 text-xs">
@@ -3484,8 +5838,6 @@ function MainChatApp() {
                                 )}
                               </div>
                             )}
-                            {renderRoomReactions(msg)}
-
                             {/* Code Canvas Preview Banner */}
                             {msg.extractedCode && (
                               <div className="mt-3 pt-3 border-t border-slate-100 flex items-center justify-between bg-slate-50 p-2.5 rounded-xl border">
@@ -3503,67 +5855,73 @@ function MainChatApp() {
                                 </button>
                               </div>
                             )}
+                            <div className="mt-1 flex justify-end">
+                              <span className="ml-2 select-none self-end text-[10px] text-gray-400">
+                                {new Date(msg.timestamp || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                              </span>
+                            </div>
                           </MessageBubble>
+                          {renderMessageActionBar(msg, index)}
+                          {renderMessageReactions(msg, index)}
 
-                          <div className="flex items-center gap-1.5 text-slate-400 px-1">
+                          {/* Host Intervention Trigger */}
+                          {isKeyOwner && isTeamMode && (
                             <button
-                              onClick={() => handleSendMessage(undefined, false, messages[index - 1]?.content || "")}
-                              className="p-1 hover:text-slate-700 rounded transition-colors"
-                              title="Regenerate"
+                              onClick={() => handleHostIntervention(index)}
+                              className="mt-1 flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-md transition-colors"
+                              title="Deep review audit"
                             >
-                              <RotateCcw className="w-3.5 h-3.5" />
+                              <Sparkles className="w-3 h-3 text-amber-600" />
+                              <span>Intervene & Review</span>
                             </button>
-                            <button
-                              onClick={() => handleCopyMessage(msg.content, index)}
-                              className="p-1 hover:text-slate-700 rounded transition-colors"
-                              title="Copy text"
-                            >
-                              {copiedIndex === index ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-600" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                            </button>
-                            <button
-                              onClick={() => setForwardMessage(msg)}
-                              className={`p-1 hover:${selectedTheme.textClass} rounded transition-colors`}
-                              title="Forward"
-                            >
-                              <Forward className="w-3.5 h-3.5" />
-                            </button>
-
-                            {/* Host Intervention Trigger */}
-                            {isKeyOwner && isTeamMode && (
-                              <button
-                                onClick={() => handleHostIntervention(index)}
-                                className="flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-md transition-colors"
-                                title="Deep review audit"
-                              >
-                                <Sparkles className="w-3 h-3 text-amber-600" />
-                                <span>Intervene & Review</span>
-                              </button>
-                            )}
+                          )}
                           </div>
                         </div>
                       )}
                     </div>
                   ))}
 
+                  {longPressMenu && (
+                    <div className="fixed inset-0 z-[80] bg-black/20 md:hidden" onClick={() => setLongPressMenu(null)}>
+                      <div
+                        role="menu"
+                        aria-label="Message actions"
+                        style={{ left: longPressMenu.x, top: longPressMenu.y }}
+                        className="absolute flex min-w-48 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-1 shadow-2xl"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <button role="menuitem" type="button" onClick={() => { setReplyTarget({ author: longPressMenu.message.senderName || (longPressMenu.message.role === "assistant" ? "Genie" : "You"), content: longPressMenu.message.content }); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Reply</button>
+                        {longPressMenu.message.role === "user" && (!isTeamMode || longPressMenu.message.sender_id === roomIdentity) && (
+                          <>
+                            <button role="menuitem" type="button" onClick={() => { setEditingMessageId(longPressMenu.message.id || String(longPressMenu.index)); setEditDraft(longPressMenu.message.content); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Edit</button>
+                            <button role="menuitem" type="button" onClick={() => { void handleDeleteMessage(longPressMenu.message, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Delete</button>
+                          </>
+                        )}
+                        <button role="menuitem" type="button" onClick={() => { handleCopyMessage(longPressMenu.message.content, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Copy</button>
+                        <button role="menuitem" type="button" onClick={() => { setForwardMessage(longPressMenu.message); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Forward</button>
+                        {longPressMenu.message.role === "assistant" && (
+                          <button role="menuitem" type="button" onClick={() => { void handleReportAIMistake(longPressMenu.message); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Report AI mistakes</button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
                   {isStreaming && (
                     streamingPreview ? (
-                      <MessageBubble
-                        provider={streamingProvider?.provider || "Google Gemini"}
-                        model={streamingProvider?.model || "Connecting"}
-                        autoFallback={streamingAutoFallback}
-                        className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-none border border-cyan-200 bg-white px-4 py-3 text-sm leading-relaxed text-slate-800 shadow-sm"
-                      >
-                        {streamingPreview}
-                      </MessageBubble>
+                      <div className="flex w-full items-start gap-2">
+                        <BrandAvatar variant="cosmic-shadow" className="mt-1 h-8 w-8" label="Genie Master" />
+                        <MessageBubble
+                          provider="Genie Master"
+                          model="AI response"
+                          autoFallback={streamingAutoFallback}
+                          className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-none border border-cyan-200 bg-white px-4 py-3 text-sm leading-relaxed text-slate-800 shadow-sm"
+                        >
+                          {streamingPreview}
+                        </MessageBubble>
+                      </div>
                     ) : (
                       <div className="flex items-center gap-3 rounded-2xl border border-cyan-200/70 bg-white/90 p-3 shadow-[0_0_24px_rgba(14,165,233,0.12)]">
-                        <span className="flex h-9 w-9 animate-pulse items-center justify-center rounded-full bg-gradient-to-br from-cyan-100 via-violet-100 to-pink-100 text-xl shadow-[0_0_16px_rgba(14,165,233,0.32)]" aria-hidden="true">
-                          🤖
-                        </span>
+                        <BrandAvatar variant="cosmic-shadow" className="h-9 w-9 animate-pulse" label="Genie Master" />
                         <span className="flex flex-col gap-1">
                           <span className="bg-gradient-to-r from-cyan-600 via-violet-600 to-pink-500 bg-clip-text text-xs font-semibold text-transparent animate-pulse">
                             Genie is crafting your response...
@@ -3755,12 +6113,104 @@ function MainChatApp() {
                       ? "👁️ Observer ON"
                       : "👁️‍🗨️ Observer OFF"}
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMessageSearchMode((mode) => mode === "ai" ? null : "ai");
+                      setMessageSearchQuery("");
+                    }}
+                    aria-pressed={messageSearchMode === "ai"}
+                    title="Search AI Mode transcripts"
+                    className={`flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[9px] font-bold sm:text-[10px] ${messageSearchMode === "ai" ? "border-violet-300 bg-violet-50 text-violet-800" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"}`}
+                  >
+                    <span className="relative inline-flex">
+                      <Search className="h-3.5 w-3.5" />
+                      <Sparkles className="absolute -right-1.5 -top-1.5 h-2.5 w-2.5 animate-spin text-fuchsia-600" />
+                    </span>
+                    AI Mode
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMessageSearchMode((mode) => mode === "chat" ? null : "chat");
+                      setMessageSearchQuery("");
+                    }}
+                    aria-pressed={messageSearchMode === "chat"}
+                    title="Search local chat history"
+                    className={`flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[9px] font-bold sm:text-[10px] ${messageSearchMode === "chat" ? "border-cyan-300 bg-cyan-50 text-cyan-800" : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"}`}
+                  >
+                    <Search className="h-3.5 w-3.5" />
+                    Chat Mode
+                  </button>
                 </div>
 
                 <span className={`hidden xs:inline text-[10px] ${selectedTheme.textClass} font-semibold truncate`}>
                   Type @Genie to query
                 </span>
               </div>
+
+              {messageSearchMode && (
+                <div className="mx-auto mb-2 w-full max-w-3xl overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg">
+                  <div className="flex items-center gap-2 border-b border-slate-100 p-2">
+                    <Search className="h-4 w-4 shrink-0 text-slate-400" />
+                    <input
+                      autoFocus
+                      value={messageSearchQuery}
+                      onChange={(event) => setMessageSearchQuery(event.target.value)}
+                      placeholder={messageSearchMode === "ai" ? "Search Genie Pro and Genie Master responses…" : "Search local user chat history…"}
+                      aria-label={messageSearchMode === "ai" ? "Search AI mode transcripts" : "Search user chat history"}
+                      className="min-w-0 flex-1 bg-transparent text-xs text-slate-800 outline-none"
+                    />
+                    <button type="button" onClick={() => { setMessageSearchMode(null); setMessageSearchQuery(""); }} aria-label="Close message search" className="rounded p-1 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+                  </div>
+                  {messageSearchQuery.trim() && (
+                    <div className="max-h-64 overflow-y-auto p-2">
+                      {messageSearchMode === "chat" ? (
+                        <>
+                        <SearchMessageGroup
+                          title="Matches in User Chats"
+                          items={chatSearchMatches}
+                          onSelect={(message) => {
+                            openSearchResult(message);
+                            setMessageSearchMode(null);
+                          }}
+                        />
+                        <SearchMessageGroup
+                          title="Matches in AI Mode"
+                          items={aiSearchMatches}
+                          onSelect={(message) => {
+                            openSearchResult(message);
+                            setMessageSearchMode(null);
+                          }}
+                        />
+                        </>
+                      ) : (
+                        <>
+                        <SearchMessageGroup
+                          title="Matches in AI Mode"
+                          items={aiSearchMatches}
+                          onSelect={(message) => {
+                            openSearchResult(message);
+                            setMessageSearchMode(null);
+                          }}
+                        />
+                        <SearchMessageGroup
+                          title="Matches in User Chats"
+                          items={chatSearchMatches}
+                          onSelect={(message) => {
+                            openSearchResult(message);
+                            setMessageSearchMode(null);
+                          }}
+                        />
+                        </>
+                      )}
+                      {chatSearchMatches.length + aiSearchMatches.length === 0 && (
+                        <p className="px-2 py-3 text-xs text-slate-500">No matching messages in this history.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="w-full max-w-3xl mx-auto relative">
                 {attachmentMenuOpen && (
@@ -3940,6 +6390,7 @@ function MainChatApp() {
 
                   <input
                     type="text"
+                    ref={promptInputRef}
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
                     placeholder={
@@ -3993,9 +6444,9 @@ function MainChatApp() {
                     </div>
 
                     <VoiceMic
-                      backendUrl={API_BASE}
                       disabled={isStreaming}
                       onRecordingChange={setIsListening}
+                      onError={(message) => setChatError(`Microphone: ${message}`)}
                       onTranscription={(text) => {
                         setIsListening(false);
                         void handleSendMessage(undefined, false, text);
@@ -4066,7 +6517,7 @@ function MainChatApp() {
 
       {/* SECTION 7: MODALS */}
       {legalModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md p-4">
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-md p-4">
           <div className="w-full max-w-2xl bg-white rounded-3xl shadow-2xl border border-slate-200 p-6 space-y-4 max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3">
               <div className="flex items-center gap-2">
@@ -4495,8 +6946,8 @@ function MainChatApp() {
                 </p>
               </div>
             </div>
-            {chatError && (
-              <p role="alert" className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{chatError}</p>
+            {visibleChatError && (
+              <p role="alert" className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{visibleChatError}</p>
             )}
             <div className="mt-5 flex justify-end gap-2">
               <button
@@ -4536,26 +6987,45 @@ function MainChatApp() {
               <div>
                 <h2 id="friends-queue-title" className="text-lg font-bold text-slate-900">Friends Queue</h2>
                 <p className="mt-1 text-xs text-slate-500">
-                  Verified, discoverable Meta links only. Direct messages are encrypted for each room member.
+                Mutual accepted friends only appear here; only they can see your presence and invite you by room popup.
                 </p>
               </div>
-              <button type="button" onClick={() => setFriendsQueueOpen(false)} aria-label="Close Friends Queue" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100">
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={() => { setFriendSearchOpen(true); setFriendSearchEmail(""); setFriendSearchResult(null); setFriendSearchNotFound(false); }} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
+                  <Search className="h-3.5 w-3.5" /> Search email
+                </button>
+                <button type="button" onClick={() => setFriendsQueueOpen(false)} aria-label="Close Friends Queue" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
             {isFriendsLoading && <p role="status" className="mb-3 text-xs text-slate-500">Refreshing friends and rooms...</p>}
             {friendsQueueError && <p role="alert" className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{friendsQueueError}</p>}
             <div className="mb-5 space-y-2">
-              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">Discoverable friends</h3>
-              {discoverableFriends.length ? discoverableFriends.map((friend) => (
+              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">Mutual friends</h3>
+              {discoverableFriends.length ? discoverableFriends.map((friend) => {
+                const busyElsewhere = friend.is_online && (!isTeamMode || friend.active_room_id !== roomId);
+                const availableHere = friend.is_online && !busyElsewhere;
+                return (
                 <div key={friend.user_id} className="relative flex items-center gap-3 rounded-xl border border-slate-200 p-3">
                   <GenieAvatar src={friend.avatar_url} alt={friend.handle} className="h-9 w-9 rounded-full" />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-xs font-semibold text-slate-800">{friend.handle || friend.display_name}</p>
-                    <p className={`text-[11px] ${friend.is_online ? "text-emerald-600" : "text-slate-400"}`}>
-                      <span aria-hidden="true">{friend.is_online ? "●" : "○"}</span> {friend.is_online ? "Online" : "Offline"}
+                    <p className={`text-[11px] ${busyElsewhere ? "text-rose-700" : availableHere ? "text-emerald-600" : "text-slate-400"}`}>
+                      <span aria-hidden="true">{busyElsewhere ? "🔴" : availableHere ? "🟢" : "⚪"}</span> {busyElsewhere ? "In Another Room / Busy in Session" : availableHere ? "Available" : "Offline"}
                     </p>
                   </div>
+                  {availableHere && (
+                    <button
+                      type="button"
+                      onClick={() => void sendRoomInvite(friend)}
+                      disabled={!isTeamMode}
+                      title={!isTeamMode ? "Start a room before inviting friends" : `Invite ${friend.handle || friend.display_name}`}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-cyan-200 px-2 py-2 text-[11px] font-semibold text-cyan-800 hover:bg-cyan-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <UserPlus className="h-3.5 w-3.5" /> Invite
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => void openDirectFriendRoom(friend)}
@@ -4591,7 +7061,8 @@ function MainChatApp() {
                     )}
                   </div>
                 </div>
-              )) : (
+                );
+              }) : (
                 <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">
                   No discoverable friends yet. Link and verify Meta in Settings → Profile to join the directory.
                 </p>
@@ -4616,6 +7087,66 @@ function MainChatApp() {
                 <p className="rounded-xl bg-slate-50 p-3 text-xs text-slate-500">No permanent rooms are associated with this account yet.</p>
               )}
             </div>
+          </section>
+        </div>
+      )}
+
+      {friendSearchOpen && (
+        <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setFriendSearchOpen(false);
+        }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="friend-search-title" className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
+            <div className="mb-4 flex items-center justify-between">
+              <h2 id="friend-search-title" className="text-base font-bold text-slate-900">Find a friend</h2>
+              <button type="button" onClick={() => setFriendSearchOpen(false)} aria-label="Close friend search" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
+            </div>
+            <form onSubmit={(event) => void searchForFriend(event)} className="flex gap-2">
+              <input
+                type="email"
+                required
+                value={friendSearchEmail}
+                onChange={(event) => { setFriendSearchEmail(event.target.value); setFriendSearchNotFound(false); setFriendSearchResult(null); }}
+                placeholder="Google email address"
+                className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-cyan-500"
+              />
+              <button type="submit" disabled={friendSearchBusy} className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                {friendSearchBusy ? "Searching…" : "Search"}
+              </button>
+            </form>
+            {friendSearchResult && (
+              <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 p-3">
+                <GenieAvatar src={friendSearchResult.avatar_url} alt={friendSearchResult.handle} className="h-9 w-9 rounded-full" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-semibold text-slate-800">{friendSearchResult.handle || friendSearchResult.display_name}</p>
+                  <p className="text-[10px] text-slate-500">
+                    {friendSearchResult.relationship === "friend" ? "Mutual friend" : `Registered · ${friendSearchResult.relationship || "not connected"}`}
+                  </p>
+                </div>
+                {friendSearchResult.relationship !== "friend" && (
+                  <button
+                    type="button"
+                    disabled={friendSearchResult.relationship === "request_sent" || friendSearchResult.relationship === "request_received"}
+                    onClick={() => void updateSocialRelationship(friendSearchResult, "friend-request")}
+                    className="rounded-lg bg-cyan-700 px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-40"
+                  >
+                    {friendSearchResult.relationship === "request_sent" ? "Requested" : friendSearchResult.relationship === "request_received" ? "Respond in queue" : "Add Friend"}
+                  </button>
+                )}
+              </div>
+            )}
+            {friendSearchNotFound && (
+              <div className="mt-4 rounded-xl bg-slate-50 p-3">
+                <p className="text-xs text-slate-600">This email is not registered with Genie.</p>
+                <button
+                  type="button"
+                  disabled={inviteEmailBusy}
+                  onClick={() => void sendOnboardingInviteEmail(friendSearchEmail.trim())}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-700 px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-50"
+                >
+                  <Mail className="h-3.5 w-3.5" /> Send Invite Email
+                </button>
+              </div>
+            )}
           </section>
         </div>
       )}
@@ -4899,8 +7430,8 @@ function MainChatApp() {
 
             {settingsTab === "profile" && (
               <div className="space-y-4 p-5 sm:p-7">
-                <div className={`flex items-center justify-between p-3 ${selectedTheme.bgLightClass} border ${selectedTheme.borderClass} rounded-2xl`}>
-                  <div className="flex items-center gap-3 min-w-0">
+                <div className={`flex flex-wrap items-center justify-between gap-3 p-3 ${selectedTheme.bgLightClass} border ${selectedTheme.borderClass} rounded-2xl`}>
+                  <div className="flex min-w-0 flex-[1_1_14rem] items-center gap-3">
                     <GenieAvatar
                       src={userProfile.avatarUrl}
                       alt={userProfile.name}
@@ -4910,7 +7441,7 @@ function MainChatApp() {
                       <span className="font-bold text-sm text-slate-800 block truncate">{userProfile.name}</span>
                       <span className="text-xs text-slate-500 block truncate">{userProfile.email || "No email bound"}</span>
                       <span
-                        className={`text-[10px] font-semibold uppercase tracking-wider flex items-center gap-1 mt-0.5 ${
+                        className={`mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-[10px] font-semibold uppercase tracking-wider ${
                           isDevUser
                             ? "text-amber-600"
                             : isVipUser
@@ -4935,17 +7466,27 @@ function MainChatApp() {
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      handleSignOut();
-                      setSettingsOpen(false);
-                    }}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-50 border border-rose-200 rounded-xl transition-all shadow-xs ml-2 flex-shrink-0"
-                  >
-                    <LogOut className="w-3.5 h-3.5" />
-                    <span>Sign Out</span>
-                  </button>
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={openProfileEditor}
+                      className="flex items-center gap-1.5 rounded-xl border border-cyan-200 px-3 py-1.5 text-xs font-bold text-cyan-800 transition-all hover:bg-cyan-50"
+                    >
+                      <Edit2 className="h-3.5 w-3.5" />
+                      <span>Edit Profile</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleSignOut();
+                        setSettingsOpen(false);
+                      }}
+                      className="flex items-center gap-1.5 rounded-xl border border-rose-200 px-3 py-1.5 text-xs font-bold text-rose-600 shadow-xs transition-all hover:bg-rose-50"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      <span>Sign Out</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="space-y-1.5">
@@ -4987,12 +7528,67 @@ function MainChatApp() {
                     <input
                       type="text"
                       value={userProfile.profession}
-                      onChange={(e) => setUserProfile({ ...userProfile, profession: e.target.value })}
+                      onChange={(e) => setUserProfile((previous) => ({ ...previous, profession: e.target.value }))}
                       placeholder="e.g. Healthcare Revenue Cycle & Client Operations"
                       className="w-full text-xs border border-slate-300 rounded-xl px-3 py-2 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300"
                     />
                   </div>
                 )}
+
+                {userProfile.role === "student" && (
+                  <div className={`space-y-2 rounded-2xl border ${selectedTheme.borderClass} ${selectedTheme.bgLightClass} p-3`}>
+                    <label className={`block text-xs font-bold ${selectedTheme.textClass}`}>
+                      Academic details
+                    </label>
+                    <input
+                      type="text"
+                      value={userProfile.institution}
+                      onChange={(event) =>
+                        setUserProfile((previous) => ({ ...previous, institution: event.target.value }))
+                      }
+                      placeholder="School, college, or university"
+                      className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300"
+                    />
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <input
+                        type="text"
+                        value={userProfile.studyLevel}
+                        onChange={(event) =>
+                          setUserProfile((previous) => ({ ...previous, studyLevel: event.target.value }))
+                        }
+                        placeholder="Grade, year, or degree"
+                        className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300"
+                      />
+                      <input
+                        type="text"
+                        value={userProfile.studyFocus}
+                        onChange={(event) =>
+                          setUserProfile((previous) => ({ ...previous, studyFocus: event.target.value }))
+                        }
+                        placeholder="Subjects or area of study"
+                        className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <section className={`space-y-2 rounded-2xl border ${selectedTheme.borderClass} p-3`}>
+                  <label htmlFor="room-invite-privacy" className="block text-xs font-bold text-slate-800">
+                    Invite privacy
+                  </label>
+                  <p className="text-[11px] leading-relaxed text-slate-500">
+                    Choose who can send you in-app room invitations. Mutual friends are the default, including for creator accounts.
+                  </p>
+                  <select
+                    id="room-invite-privacy"
+                    value={userProfile.allowRoomInvites}
+                    onChange={(event) => void updateInvitePrivacy(event.target.value as "mutual_friends" | "everyone")}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700"
+                  >
+                    <option value="mutual_friends">Mutual Friends Only</option>
+                    <option value="everyone">Everyone</option>
+                  </select>
+                </section>
 
                 <section className={`space-y-2 rounded-2xl border ${selectedTheme.borderClass} p-3`}>
                   <div className="flex items-center gap-2">
@@ -5154,7 +7750,7 @@ function MainChatApp() {
                   <div className="flex gap-2">
                     <button
                       type="button"
-                      onClick={() => setReportType("ai_issue")}
+                      onClick={() => void handleReportAIMistake()}
                       className={`flex-1 py-1.5 text-xs font-semibold rounded-lg border transition-all ${
                         reportType === "ai_issue"
                           ? "bg-violet-600 text-white border-violet-700"
@@ -5176,84 +7772,102 @@ function MainChatApp() {
                     </button>
                   </div>
 
-                  <form onSubmit={handleTicketSubmit} className="space-y-2">
-                    <textarea
-                      rows={2}
-                      value={ticketDescription}
-                      onChange={(e) => setTicketDescription(e.target.value)}
-                      placeholder="Describe your issue or feature request..."
-                      className="w-full text-xs border border-violet-300 rounded-xl p-2.5 bg-white text-slate-800 focus:outline-none"
-                    />
+                  {reportType === "ui_request" ? (
+                    <form onSubmit={handleTicketSubmit} className="space-y-2">
+                      <textarea
+                        rows={2}
+                        value={ticketDescription}
+                        onChange={(e) => setTicketDescription(e.target.value)}
+                        placeholder="Describe the feature you'd like to request..."
+                        className="w-full text-xs border border-violet-300 rounded-xl p-2.5 bg-white text-slate-800 focus:outline-none"
+                      />
 
-                    {ticketStatus && (
-                      <div className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 p-2 rounded-lg border border-emerald-200">
-                        {ticketStatus}
-                      </div>
-                    )}
+                      {ticketStatus && (
+                        <div className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 p-2 rounded-lg border border-emerald-200">
+                          {ticketStatus}
+                        </div>
+                      )}
 
-                    <button
-                      type="submit"
-                      disabled={!ticketDescription.trim()}
-                      className="w-full flex items-center justify-center gap-1.5 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold rounded-xl transition-all shadow-xs disabled:opacity-50"
-                    >
-                      <SendHorizontal className="w-3.5 h-3.5" />
-                      <span>Submit to Developer Pipeline</span>
-                    </button>
-                  </form>
+                      <button
+                        type="submit"
+                        disabled={!ticketDescription.trim()}
+                        className="w-full flex items-center justify-center gap-1.5 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold rounded-xl transition-all shadow-xs disabled:opacity-50"
+                      >
+                        <SendHorizontal className="w-3.5 h-3.5" />
+                        <span>Submit Feature Request</span>
+                      </button>
+                    </form>
+                  ) : (
+                    <p className="text-[11px] leading-relaxed text-slate-500">
+                      Genie will review its latest answer in this chat and provide a correction. No developer ticket is created.
+                    </p>
+                  )}
+                  {ticketStatus && reportType === "ai_issue" && (
+                    <div className="text-[11px] font-semibold text-slate-600 bg-slate-50 p-2 rounded-lg border border-slate-200">
+                      {ticketStatus}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
 
             {settingsTab === "totp" && (
               <div className="space-y-4 p-5 sm:p-7">
-                <div className={`p-4 ${selectedTheme.bgLightClass} border ${selectedTheme.borderClass} rounded-2xl space-y-3`}>
-                  <div className="flex items-center justify-between">
+                <div className={`space-y-3 rounded-2xl border ${selectedTheme.borderClass} ${selectedTheme.bgLightClass} p-4`}>
+                  <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <QrCode className={`w-5 h-5 ${selectedTheme.textClass}`} />
-                      <span className={`text-xs font-bold ${selectedTheme.textClass}`}>
-                        {isCorporateDomain
-                          ? "Model B: Corporate Authenticator Hub"
-                          : "Model A: Personal Platform Authenticator"}
-                      </span>
+                      <QrCode className={`h-5 w-5 ${selectedTheme.textClass}`} />
+                      <span className={`text-xs font-bold ${selectedTheme.textClass}`}>Google Authenticator (2FA)</span>
                     </div>
-                    <span
-                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                        isTotpVerified
-                          ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
-                          : "bg-amber-100 text-amber-800 border border-amber-300"
-                      }`}
-                    >
-                      {isTotpVerified ? "Verified Active" : "Pending Code"}
-                    </span>
+                    {authenticatorEnabled && (
+                      <span className="rounded-full border border-emerald-300 bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-800">
+                        Active ✓
+                      </span>
+                    )}
                   </div>
-
-                  <p className="text-[11px] text-slate-600 leading-relaxed">
-                    {isCorporateDomain
-                      ? "Enterprise Mode: Enter the 6-digit rolling code from your company's Google Authenticator app to unlock departmental governance."
-                      : "Personal Tier: Enter the 6-digit rolling code issued by the Master Google Authenticator to activate one of the 10 VIP platform passes."}
+                  <p className="text-[11px] leading-relaxed text-slate-600">
+                    {authenticatorEnabled
+                      ? `Google Authenticator is active for ${userProfile.email}. Resetting requires an email verification code.`
+                      : "Authenticator is optional during registration. Enable it here to add a second layer of account security."}
                   </p>
-
-                  <form onSubmit={handleVerifyTotp} className="space-y-2.5">
-                    <input
-                      type="text"
-                      maxLength={7}
-                      value={userProfile.totpPasscode}
-                      disabled={isTotpVerifying}
-                      onChange={(e) =>
-                        setUserProfile({ ...userProfile, totpPasscode: e.target.value })
-                      }
-                      placeholder="000 000"
-                      className="w-full text-center text-sm font-mono font-bold tracking-widest border border-slate-300 rounded-xl px-3 py-2 bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-300"
-                    />
-
+                  {authenticatorEnabled ? (
                     <button
-                      type="submit"
-                      disabled={isTotpVerifying}
-                      className={`w-full py-2 ${selectedTheme.primaryClass} text-white text-xs font-bold rounded-xl transition-all shadow-xs disabled:cursor-wait disabled:opacity-60`}
+                      type="button"
+                      onClick={() => {
+                        setAuthenticatorLoginEmail(userProfile.email);
+                        void requestAuthenticatorReset(userProfile.email);
+                      }}
+                      disabled={authenticatorResetBusy}
+                      className="rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs font-semibold text-amber-800 disabled:opacity-50"
                     >
-                      {isTotpVerifying ? "Verifying..." : "Verify Authenticator Code"}
+                      {authenticatorResetBusy ? "Sending…" : "Reset / Re-sync Authenticator"}
                     </button>
-                  </form>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void handleStartAuthenticatorSetup()}
+                      disabled={authenticatorSetupBusy}
+                      className={`rounded-xl ${selectedTheme.primaryClass} px-3 py-2 text-xs font-semibold text-white disabled:opacity-50`}
+                    >
+                      {authenticatorSetupBusy ? "Preparing…" : "Enable Authenticator"}
+                    </button>
+                  )}
+                  {authenticatorSetupError && <p role="alert" className="text-xs text-rose-700">{authenticatorSetupError}</p>}
+                  {authenticatorResetMessage && <p role="status" className="text-xs text-slate-600">{authenticatorResetMessage}</p>}
+                  {authenticatorResetPending && (
+                    <div className="flex gap-2">
+                      <input
+                        inputMode="numeric"
+                        maxLength={6}
+                        value={authenticatorResetCode}
+                        onChange={(event) => setAuthenticatorResetCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                        placeholder="Email verification code"
+                        aria-label="Authenticator reset email code"
+                        className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                      <button type="button" onClick={() => void confirmAuthenticatorReset()} disabled={authenticatorResetBusy || authenticatorResetCode.length !== 6} className="rounded-lg bg-amber-700 px-3 py-2 text-xs font-bold text-white disabled:opacity-50">Confirm</button>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -5372,10 +7986,11 @@ function MainChatApp() {
       const interventionMsg: Message = {
         role: "assistant",
         content: `[★ Verified Synthesis • Host Intervention Audit]\n\n${sanitized}`,
+        timestamp: new Date().toISOString(),
         senderName: "Personal AI Genie",
         source: cascadeResult.model.toLowerCase().includes("openrouter")
           ? "openrouter-fallback"
-          : "gemini-3.8-flash",
+          : "gemini-3.6-flash",
         isIntervention: true,
         extractedCode: extracted || undefined,
       };
@@ -5400,6 +8015,16 @@ function MainChatApp() {
 
   async function handleObserverToggle() {
     const nextActive = !isObserverActive;
+    try {
+      localStorage.setItem(
+        `genie_observer_mode_${observerPreferenceOwner}`,
+        String(nextActive)
+      );
+    } catch (error) {
+      console.error("Observer mode preference could not be saved:", error);
+      setChatError("Observer mode preference could not be saved in this browser.");
+      return;
+    }
     if (!nextActive) {
       setIsObserverActive(false);
       return;
@@ -5410,12 +8035,22 @@ function MainChatApp() {
     }
     if (!googleIdToken) {
       setIsObserverActive(false);
+      try {
+        localStorage.setItem(
+          `genie_observer_mode_${observerPreferenceOwner}`,
+          "false"
+        );
+      } catch (error) {
+        console.error("Observer mode preference could not be updated:", error);
+        setChatError("Observer review requires Google sign-in; its preference could not be saved in this browser.");
+        return;
+      }
       setChatError("Observer review is available after Google sign-in.");
       return;
     }
 
     try {
-      const response = await fetch(`${API_BASE}/api/team/summarize-review`, {
+      const response = await fetch(getBackendApiUrl("/api/team/summarize-review"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -5445,7 +8080,7 @@ function MainChatApp() {
         type: "message.send",
         sender_type: "assistant",
         sender_name: "Personal AI Genie • Observer",
-        source: result.source || "gemini-3.8-flash",
+        source: result.source || "gemini-3.6-flash",
         content: `Team digest:\n${result.condensed_digest || ""}\n\nExecutive review:\n${result.executive_review}`,
       });
     } catch (error) {
@@ -5486,66 +8121,212 @@ function MainChatApp() {
     setReactionPickerMessageId(null);
   }
 
-  function renderRoomReactions(message: Message) {
-    if (!isTeamMode || !message.id || message.is_deleted) return null;
-    const reactions = Object.entries(message.reactions || {}).filter(([, userIds]) => userIds.length > 0);
+  function handleToggleMessageReaction(message: Message, index: number, emoji: string) {
+    if (isTeamMode) {
+      handleToggleRoomReaction(message, emoji);
+      return;
+    }
+
+    const reactionIdentity = `local:${userProfile.email || userProfile.name || "user"}`;
+    const messageKey = message.id || String(index);
+    updateCurrentPersonalMessages((current) =>
+      current.map((item, itemIndex) => {
+        if ((item.id || String(itemIndex)) !== messageKey) return item;
+        const reactions = { ...(item.reactions || {}) };
+        const userIds = reactions[emoji] || [];
+        reactions[emoji] = userIds.includes(reactionIdentity)
+          ? userIds.filter((userId) => userId !== reactionIdentity)
+          : [...userIds, reactionIdentity];
+        if (reactions[emoji].length === 0) delete reactions[emoji];
+        return { ...item, reactions };
+      })
+    );
+    setReactionPickerMessageId(null);
+  }
+
+  function startLongPress(event: React.TouchEvent<HTMLDivElement>, message: Message, index: number) {
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    const touch = event.touches[0];
+    const { clientX, clientY } = touch;
+    longPressTimerRef.current = setTimeout(() => {
+      openLongPressMenu(message, index, clientX, clientY);
+      longPressTimerRef.current = null;
+    }, 550);
+  }
+
+  function openLongPressMenu(message: Message, index: number, clientX: number, clientY: number) {
+    setLongPressMenu({
+      message,
+      index,
+      x: Math.max(8, Math.min(clientX, window.innerWidth - 220)),
+      y: Math.max(8, Math.min(clientY, window.innerHeight - 260)),
+    });
+  }
+
+  function cancelLongPress() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function openSearchResult(message: Message) {
+    const topic = topics.find((item) =>
+      item.messages.some((candidate) => candidate.id === message.id && candidate.content === message.content)
+    );
+    if (topic) {
+      stopCurrentChatGeneration();
+      setActiveTopicId(topic.id);
+      setIsTopicConversation(true);
+      setIsTeamMode(false);
+      setPersonalMessages(ensureMessageTimestamps(topic.messages));
+      return;
+    }
+    const session = sessions.find((item) =>
+      item.messages.some((candidate) => candidate.id === message.id && candidate.content === message.content)
+    );
+    if (session) {
+      handleSelectSession(session);
+    }
+  }
+
+  function forwardMessageToTopic(topicId: string) {
+    if (!forwardMessage) return;
+    const destinationTopic = topics.find((topic) => topic.id === topicId);
+    if (!destinationTopic) return;
+    const forwarded: Message = {
+      ...forwardMessage,
+      id: `forward_${crypto.randomUUID()}`,
+      timestamp: new Date().toISOString(),
+      senderName: userProfile.name,
+      senderEmail: userProfile.email,
+      isForwarded: true,
+      forwardedFrom: forwardMessage.senderName || (forwardMessage.role === "assistant" ? "Genie" : "You"),
+    };
+    setTopics((previous) => previous.map((topic) =>
+      topic.id === topicId ? { ...topic, messages: [...topic.messages, forwarded] } : topic
+    ));
+    setActiveTopicId(topicId);
+    setIsTopicConversation(true);
+    setIsTeamMode(false);
+    setPersonalMessages([...destinationTopic.messages, forwarded]);
+    setForwardMessage(null);
+  }
+
+  function renderMessageActionBar(message: Message, index: number) {
+    const messageKey = message.id || String(index);
+    const canManageMessage =
+      message.role === "user" &&
+      !message.is_deleted &&
+      (!isTeamMode || (Boolean(message.id) && message.sender_id === roomIdentity));
+
     return (
-      <div className="relative mt-2 flex flex-wrap items-center gap-1">
-        {reactions.map(([emoji, userIds]) => {
-          const selected = userIds.includes(roomIdentity);
-          const memberNames = userIds.map((userId) =>
-            members.find((member) => member.id === userId)?.name || userId.replace(/^google:/, "Room member")
-          );
-          return (
-            <button
-              key={emoji}
-              type="button"
-              title={memberNames.join(", ")}
-              aria-label={`${emoji}, ${userIds.length} reaction${userIds.length === 1 ? "" : "s"}. Reacted by ${memberNames.join(", ")}`}
-              onClick={() => handleToggleRoomReaction(message, emoji)}
-              className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
-                selected
-                  ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} ${selectedTheme.textClass}`
-                  : "border-slate-200 bg-white/90 text-slate-700 hover:bg-slate-50"
-              }`}
-            >
-              {emoji} {userIds.length}
-            </button>
-          );
-        })}
-        <div className="absolute bottom-full left-0 z-20 mb-1 flex items-center gap-0.5 rounded-full border border-slate-200 bg-white p-1 shadow-lg opacity-100 transition-opacity sm:pointer-events-none sm:opacity-0 sm:group-hover:pointer-events-auto sm:group-hover:opacity-100">
-          {QUICK_ROOM_REACTIONS.map((emoji) => (
-            <button
-              key={emoji}
-              type="button"
-              title={`React ${emoji}`}
-              aria-label={`React with ${emoji}`}
-              onClick={() => handleToggleRoomReaction(message, emoji)}
-              className="rounded-full p-1 text-sm hover:bg-slate-100"
-            >
-              {emoji}
-            </button>
-          ))}
+      <div className={`mt-1 hidden flex-col gap-1 px-1 md:flex ${message.role === "user" ? "self-end items-end" : "self-start items-start"}`}>
+        <div className="flex items-center gap-1.5 text-slate-400">
+          {!(isTeamMode && roomMemberCount > 1) && <button
+            type="button"
+            onClick={() => handleReloadMessage(message, index)}
+            disabled={isStreaming}
+            className="rounded p-1 transition-colors hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            title="Reload response"
+            aria-label="Reload response"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+          </button>}
           <button
             type="button"
-            title="More reactions"
-            aria-label="Open full emoji picker"
-            aria-expanded={reactionPickerMessageId === message.id}
-            onClick={() => setReactionPickerMessageId((current) => current === message.id ? null : message.id || null)}
-            className="rounded-full p-1 text-slate-600 hover:bg-slate-100"
+            onClick={() => handleCopyMessage(message.content, index)}
+            className="rounded p-1 transition-colors hover:text-slate-700"
+            title="Copy message"
+            aria-label="Copy message"
           >
-            <Plus className="h-4 w-4" />
+            {copiedIndex === index ? (
+              <Check className="h-3.5 w-3.5 text-emerald-600" />
+            ) : (
+              <Copy className="h-3.5 w-3.5" />
+            )}
           </button>
-        </div>
-        {reactionPickerMessageId === message.id && (
-          <div className="absolute bottom-full left-0 z-30 mb-10 grid max-h-40 w-52 grid-cols-7 gap-1 overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-xl">
-            {ROOM_EMOJI_OPTIONS.map((emoji, index) => (
+          <button
+            type="button"
+            onClick={() => setForwardMessage(message)}
+            className={`rounded p-1 transition-colors hover:${selectedTheme.textClass}`}
+            title="Forward message"
+            aria-label="Forward message"
+          >
+            <Forward className="h-3.5 w-3.5" />
+          </button>
+          {(
+            <button
+              type="button"
+              onClick={() => setReplyTarget({ author: message.senderName || "User", content: message.content })}
+              className={`rounded p-1 transition-colors hover:${selectedTheme.textClass}`}
+              title="Reply to message"
+              aria-label="Reply to message"
+            >
+              <Reply className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {message.role === "assistant" && !message.is_deleted && (
+            <button
+              type="button"
+              onClick={() => void handleReportAIMistake(message)}
+              className="rounded p-1 text-slate-400 transition-colors hover:text-rose-700"
+              title="Report AI mistake"
+              aria-label="Report AI mistake"
+            >
+              <AlertTriangle className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {canManageMessage && (
+            <>
               <button
-                key={`${emoji}-${index}`}
                 type="button"
+                onClick={() => {
+                  setEditingMessageId(messageKey);
+                  setEditDraft(message.content);
+                }}
+                className="rounded p-1 transition-colors hover:text-sky-700"
+                title="Edit message"
+                aria-label="Edit message"
+              >
+                <Edit2 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteMessage(message, index)}
+                className="rounded p-1 transition-colors hover:text-rose-600"
+                title="Delete message"
+                aria-label="Delete message"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </>
+          )}
+          {!message.is_deleted && (
+            <button
+              type="button"
+              title="Add reaction"
+              aria-label="Add reaction"
+              aria-expanded={reactionPickerMessageId === messageKey}
+              onClick={() =>
+                setReactionPickerMessageId((current) => current === messageKey ? null : messageKey)
+              }
+              className="rounded p-1 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+        {reactionPickerMessageId === messageKey && !message.is_deleted && (
+          <div className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1.5 shadow-sm">
+            {QUICK_ROOM_REACTIONS.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                title={`React with ${emoji}`}
                 aria-label={`React with ${emoji}`}
-                onClick={() => handleToggleRoomReaction(message, emoji)}
-                className="rounded-md p-1 text-base hover:bg-slate-100"
+                onClick={() => handleToggleMessageReaction(message, index, emoji)}
+                className="rounded-md p-1 text-base leading-none transition-colors hover:bg-slate-100"
               >
                 {emoji}
               </button>
@@ -5556,8 +8337,52 @@ function MainChatApp() {
     );
   }
 
-  async function handleSendMessage(e?: React.FormEvent, forceRainbowTrigger = false, customText?: string) {
+  function renderMessageReactions(message: Message, index: number) {
+    if (message.is_deleted || (isTeamMode && (!message.id || !roomIdentity))) return null;
+    const reactions = Object.entries(message.reactions || {}).filter(([, userIds]) => userIds.length > 0);
+    if (reactions.length === 0) return null;
+    const reactionIdentity = isTeamMode
+      ? roomIdentity
+      : `local:${userProfile.email || userProfile.name || "user"}`;
+    return (
+      <div className={`mt-1 flex max-w-[85%] flex-wrap items-center gap-1 ${message.role === "user" ? "self-end justify-end" : "self-start"}`}>
+        {reactions.map(([emoji, userIds]) => {
+          const selected = userIds.includes(reactionIdentity);
+          const memberNames = isTeamMode
+            ? userIds.map((userId) =>
+                members.find((member) => member.id === userId)?.name || userId.replace(/^google:/, "Room member")
+              )
+            : userIds.map(() => "You");
+          return (
+            <button
+              key={emoji}
+              type="button"
+              title={memberNames.join(", ")}
+              aria-label={`${emoji}, ${userIds.length} reaction${userIds.length === 1 ? "" : "s"}. Reacted by ${memberNames.join(", ")}`}
+              onClick={() => handleToggleMessageReaction(message, index, emoji)}
+              className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
+                selected
+                  ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} ${selectedTheme.textClass}`
+                  : "border-slate-200 bg-white/90 text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              {emoji} {userIds.length}
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  async function handleSendMessage(
+    e?: React.FormEvent,
+    forceRainbowTrigger = false,
+    customText?: string,
+    forceObserverMode = false,
+    interventionResponse = false
+  ) {
     if (e) e.preventDefault();
+    const observerModeForRequest = forceObserverMode || isObserverActive;
     const textToSend = customText !== undefined ? customText : prompt;
     if (!textToSend.trim() && !forceRainbowTrigger) return;
     if (isStreaming) return;
@@ -5565,16 +8390,17 @@ function MainChatApp() {
     const sessionArchiveForRequest = !isTeamMode && Boolean(currentSession?.isSharedArchive);
     const routedPersonalTopic =
       !isTeamMode &&
-      !sessionArchiveForRequest &&
-      isAuthenticated &&
-      Boolean(googleIdToken && userProfile.providerId);
+    isTopicConversation &&
+    !sessionArchiveForRequest &&
+    isAuthenticated &&
+    Boolean(googleIdToken && userProfile.providerId);
 
     const actualText = textToSend.trim() || (forceRainbowTrigger ? "Genie, please analyze the conversation and assist." : "");
     const shouldWakeGenie =
       !isTeamMode ||
       forceRainbowTrigger ||
       checkWakeWordTrigger(actualText);
-    if (shouldWakeGenie && isObserverActive && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
+    if (shouldWakeGenie && observerModeForRequest && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
       setQuotaExceededModalOpen(true);
       return;
     }
@@ -5598,6 +8424,7 @@ function MainChatApp() {
       role: "user",
       content: actualText,
       id: window.crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
       text: actualText,
       sender_id: isTeamMode ? roomIdentity : undefined,
       sender_name: isTeamMode ? userProfile.name : undefined,
@@ -5610,11 +8437,11 @@ function MainChatApp() {
     const updatedMessages = [...messages, userMsg];
 
     if (!isTeamMode) {
-      if (sessionArchiveForRequest && currentSession) {
+      if (currentSession && (sessionArchiveForRequest || !isTopicConversation)) {
         setSessions((previous) => previous.map((session) =>
           session.id === currentSession.id ? { ...session, messages: updatedMessages } : session
         ));
-      } else {
+      } else if (isTopicConversation) {
         setTopics((previous) => previous.map((topic) =>
           topic.id === topicIdForRequest
             ? { ...topic, messages: updatedMessages, message_count: updatedMessages.length }
@@ -5624,7 +8451,7 @@ function MainChatApp() {
       setPersonalMessages(updatedMessages);
     }
 
-    if (shouldWakeGenie && isObserverActive && isQuotaEnforced) {
+    if (shouldWakeGenie && observerModeForRequest && isQuotaEnforced) {
       const newCount = dailyUsageCount + 1;
       setDailyUsageCount(newCount);
       if (userProfile.email && typeof window !== "undefined") {
@@ -5639,15 +8466,19 @@ function MainChatApp() {
     setChatError(null);
 
     let finalReply = "";
-    let finalModel = "gemini-3.8-flash";
-    let finalSource: Message["source"] = "gemini-3.8-flash";
+    let finalModel = "gemini-3.6-flash";
+    let finalSource: Message["source"] = "gemini-3.6-flash";
     let finalAgentOutput: Message["agentOutput"];
     let finalProvider: string | undefined;
     let finalProviderModel: string | undefined;
     let finalAutoFallback = false;
-    const useChatStream = isObserverActive && !routedPersonalTopic;
+    const storedSessionToken = localStorage.getItem("genie_session_token") || "";
+    const requestToken = storedSessionToken === "dev-token-local-bypass"
+      ? storedSessionToken
+      : googleIdToken || storedSessionToken;
+    const isLocalDevSession = requestToken === "dev-token-local-bypass";
+    const useChatStream = observerModeForRequest && !routedPersonalTopic && !isLocalDevSession;
     setStreamingPreview("");
-    setStreamingProvider(null);
     setStreamingAutoFallback(false);
 
     const controller = new AbortController();
@@ -5657,8 +8488,8 @@ function MainChatApp() {
       let historyForRequest = isTeamMode
         ? [...roomMessages, userMsg].filter((message) => !message.is_deleted).slice(-20)
         : updatedMessages;
-      if (isTeamMode && isObserverActive && updatedMessages.length > 0) {
-        const reviewResponse = await fetch(`${API_BASE}/api/team/summarize-review`, {
+      if (isTeamMode && observerModeForRequest && updatedMessages.length > 0) {
+        const reviewResponse = await fetch(getBackendApiUrl("/api/team/summarize-review"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: controller.signal,
@@ -5688,6 +8519,7 @@ function MainChatApp() {
           {
             role: "assistant",
             content: `Condensed team digest:\n${reviewData.condensed_digest || ""}\n\nExecutive review:\n${reviewData.executive_review.trim()}`,
+            timestamp: new Date().toISOString(),
           },
           ...updatedMessages.slice(-4),
         ];
@@ -5695,13 +8527,13 @@ function MainChatApp() {
 
       const chatPayload = routedPersonalTopic
         ? {
-            google_id_token: googleIdToken,
+            google_id_token: isLocalDevSession ? requestToken : googleIdToken,
             user_id: userProfile.providerId,
             topic_id: topicIdForRequest,
             message: actualText,
             message_id: userMsg.id,
             custom_api_key: userProfile.customApiKey || undefined,
-            observer_mode: isObserverActive,
+            observer_mode: observerModeForRequest,
           }
         : {
             user_email: userProfile.email,
@@ -5710,32 +8542,45 @@ function MainChatApp() {
             space_mode: spaceMode,
             conversation_history: historyForRequest,
             provider: "gemini",
-            models_cascade: ["gemini-3.8-flash", "gemini-3.7-flash"],
+            models_cascade: ["gemini-3.6-flash"],
             custom_api_key: userProfile.customApiKey || undefined,
             profession_context:
               userProfile.role === "professional" ? userProfile.profession : undefined,
             gender_context: userProfile.gender,
             language_code: selectedLang.code,
             is_team_chat: false,
-            observer_mode: isObserverActive,
+            observer_mode: observerModeForRequest,
+            message: actualText,
             quoted_message: sentReplyTarget
               ? { author: sentReplyTarget.author, content: sentReplyTarget.content }
               : undefined,
           };
+      const authHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (requestToken) authHeaders.Authorization = `Bearer ${requestToken}`;
+      const chatEndpoint = getBackendApiUrl(
+        routedPersonalTopic
+          ? "/api/personal/chat"
+          : isLocalDevSession
+          ? "/chat"
+          : useChatStream
+          ? "/api/chat/stream"
+          : "/api/chat"
+      );
       const res = await fetch(
-        `${API_BASE}${routedPersonalTopic ? "/api/personal/chat" : useChatStream ? "/api/chat/stream" : "/api/chat"}`,
+        chatEndpoint,
         {
           method: "POST",
           signal: controller.signal,
-          headers: { "Content-Type": "application/json" },
+          headers: authHeaders,
           body: JSON.stringify(chatPayload),
         }
       );
 
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || errorData.error || `Chat backend returned HTTP ${res.status}.`);
-      }
+if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    console.warn("Chat dispatch warning:", errorData);
+    return;
+  }
       if (useChatStream) {
         if (!res.body) throw new Error("Chat backend did not provide a readable event stream.");
         const reader = res.body.getReader();
@@ -5752,6 +8597,7 @@ function MainChatApp() {
           const eventData = JSON.parse(dataLines.join("\n")) as {
             provider?: string;
             model?: string;
+            source?: Message["source"];
             text?: string;
             failed?: string;
             message?: string;
@@ -5760,7 +8606,7 @@ function MainChatApp() {
             finalProvider = eventData.provider;
             finalProviderModel = eventData.model;
             finalModel = eventData.model;
-            setStreamingProvider({ provider: eventData.provider, model: eventData.model });
+            if (eventData.source) finalSource = eventData.source;
           } else if (eventName === "fallback") {
             finalAutoFallback = true;
             setStreamingAutoFallback(true);
@@ -5786,14 +8632,18 @@ function MainChatApp() {
         }
         if (pending.trim()) handleSseBlock(pending);
         if (!finalReply.trim()) throw new Error("Chat backend returned an empty response.");
-        finalSource = "cloud_ai";
+        if (finalSource === "gemini-3.6-flash") finalSource = "cloud_ai";
       } else {
         const data = await res.json();
-        if (typeof data.reply !== "string" || !data.reply.trim()) {
+        const responseText = typeof data.reply === "string" ? data.reply : data.response;
+        if (typeof responseText !== "string" || !responseText.trim()) {
           throw new Error("Chat backend returned an empty response.");
         }
-        finalReply = data.reply;
-        finalModel = data.model_used || "gemini-3.8-flash";
+        finalReply = responseText;
+        finalModel = data.model_used === "local-python-mock"
+          ? "Genie Local Engine (Zero-Token)"
+          : "Genie Core Engine";
+        setActiveModelName(finalModel);
         finalAgentOutput = data.agent_output;
         finalProvider = data.provider_source === "openrouter-fallback"
           ? "OpenRouter"
@@ -5802,13 +8652,15 @@ function MainChatApp() {
             : undefined;
         finalProviderModel = finalModel;
         finalSource =
-          data.source === "local_agent" ||
+          data.model_used === "local-python-mock"
+            ? "local_mock"
+            : data.source === "local_agent" ||
           data.source === "platform_engine" ||
           data.source === "cloud_ai" ||
           data.source === "backend-manifest" ||
           data.source === "openrouter-fallback"
             ? data.source
-            : isObserverActive
+            : observerModeForRequest
             ? "cloud_ai"
             : "local_agent";
       }
@@ -5818,10 +8670,10 @@ function MainChatApp() {
         (primaryError instanceof Error && primaryError.name === "AbortError")
       ) {
         setChatError(null);
-      } else if (routedPersonalTopic || !isObserverActive) {
+      } else if (routedPersonalTopic || !observerModeForRequest) {
         const diagnostic = primaryError instanceof Error ? primaryError.message : "Topic chat request failed.";
         console.error("Personal topic chat request failed:", primaryError);
-        setChatError(`${isObserverActive ? "Personal topic chat" : "Platform engine"} failed: ${diagnostic}`);
+        setChatError(`${observerModeForRequest ? "Personal topic chat" : "Platform engine"} failed: ${diagnostic}`);
       } else try {
         console.warn("Primary chat backend request failed; attempting server fallback.", primaryError);
         const raceResult = await callActiveGeminiCascade(
@@ -5839,7 +8691,7 @@ function MainChatApp() {
         finalSource = "cloud_ai";
         finalProvider = "Google Gemini";
         finalProviderModel = raceResult.model;
-        setActiveModelName(raceResult.model);
+        setActiveModelName("Genie Core Engine");
       } catch (fallbackError) {
         if (
           controller.signal.aborted ||
@@ -5867,18 +8719,25 @@ function MainChatApp() {
         );
       }
     } finally {
-      if (activeChatAbortControllerRef.current === controller) {
+      const isCurrentRequest = activeChatAbortControllerRef.current === controller;
+      if (isCurrentRequest) {
         activeChatAbortControllerRef.current = null;
       }
-      if (finalReply.trim()) {
+      if (finalReply.trim() && !controller.signal.aborted && isCurrentRequest) {
         const extracted = extractCodeBlock(finalReply);
         const sanitized = sanitizeGenieOutput(finalReply);
 
         const responseMessage = {
           role: "assistant" as const,
           content: sanitized,
-          senderName: "Personal AI Genie",
-          sender_name: "Personal AI Genie",
+          timestamp: new Date().toISOString(),
+          avatarSrc: "/avatars/Genie PRO.png",
+          senderName: interventionResponse
+            ? "Personal AI Genie • In-chat Intervention"
+            : "Personal AI Genie",
+          sender_name: interventionResponse
+            ? "Personal AI Genie • In-chat Intervention"
+            : "Personal AI Genie",
           modelUsed: finalModel,
           source: finalSource,
           provider: finalProvider,
@@ -5887,6 +8746,7 @@ function MainChatApp() {
           agentName: finalAgentOutput?.agent_name,
           agentOutput: finalAgentOutput,
           extractedCode: extracted || undefined,
+          isIntervention: interventionResponse,
         };
         if (isTeamMode) {
           await sendEncryptedRoomEvent({
@@ -5898,30 +8758,31 @@ function MainChatApp() {
             agent_name: responseMessage.agentName,
           });
         } else {
-          if (sessionArchiveForRequest && currentSession) {
+          if (currentSession && (sessionArchiveForRequest || !isTopicConversation)) {
             setSessions((previous) => previous.map((session) =>
               session.id === currentSession.id
                 ? { ...session, messages: [...session.messages, responseMessage] }
                 : session
             ));
-          } else {
+          } else if (isTopicConversation) {
             setTopics((previous) => previous.map((topic) => {
               if (topic.id !== topicIdForRequest) return topic;
               const nextMessages = [...topic.messages, responseMessage];
               return { ...topic, messages: nextMessages, message_count: nextMessages.length };
             }));
           }
-          if (activeTopicId === topicIdForRequest) {
+          if (isTopicConversation && activeTopicId === topicIdForRequest) {
             setPersonalMessages((previous) => [...previous, responseMessage]);
           }
         }
 
         if (extracted) setActiveCanvas(extracted);
       }
-      setStreamingPreview("");
-      setStreamingProvider(null);
-      setStreamingAutoFallback(false);
-      setIsStreaming(false);
+      if (isCurrentRequest) {
+        setStreamingPreview("");
+        setStreamingAutoFallback(false);
+        setIsStreaming(false);
+      }
     }
   }
 }

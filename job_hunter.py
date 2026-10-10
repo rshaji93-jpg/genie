@@ -54,7 +54,7 @@ Evaluate the candidate for this position and provide:
 3. Tailored Application Hook: A 2-sentence elevator pitch tailored for this specific hiring manager.
 """
     interaction = client.interactions.create(
-        model="gemini-3.8-flash",
+        model="gemini-3.6-flash",
         input=prompt
     )
     return interaction.output_text

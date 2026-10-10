@@ -51,6 +51,7 @@ __pycache__/
 *.so
 .Python
 backend/data/*.sqlite3
+backend/data/session_signing.key
 env/
 venv/
 .venv/

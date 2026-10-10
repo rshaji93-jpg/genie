@@ -15,11 +15,10 @@ interface ChatRequestBody {
 }
 
 const GEMINI_MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
+  "gemini-3.6-flash",
 ];
 const OPENROUTER_MODELS = [
-  "google/gemini-2.0-flash-001",
+  "google/gemini-3.6-flash",
   "meta-llama/llama-3.3-70b-instruct",
 ];
 

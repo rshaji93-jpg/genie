@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import ClientRuntimeRecovery from "./ClientRuntimeRecovery";
 
 export const metadata: Metadata = {
   title: "Personal AI Genie — Autonomous Workspace & AI Companion",
@@ -76,18 +77,8 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full">
       <body className="h-full min-h-[100dvh] w-full bg-slate-50 text-slate-900 antialiased overflow-x-hidden">
+        <ClientRuntimeRecovery />
         {children}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              if ('serviceWorker' in navigator) {
-                window.addEventListener('load', () => {
-                  navigator.serviceWorker.register('/sw.js').catch(() => {});
-                });
-              }
-            `,
-          }}
-        />
       </body>
     </html>
   );

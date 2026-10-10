@@ -3,21 +3,59 @@
 import { Mic, MicOff } from "lucide-react";
 import { PointerEvent, useEffect, useRef, useState } from "react";
 
+interface SpeechRecognitionResultItem {
+  isFinal: boolean;
+  0: { transcript: string };
+}
+
+interface SpeechRecognitionResultList {
+  length: number;
+  [index: number]: SpeechRecognitionResultItem;
+}
+
+interface SpeechRecognitionResultEvent {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionErrorEvent {
+  error: string;
+}
+
+interface BrowserSpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechRecognitionResultEvent) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+
+interface BrowserSpeechRecognitionConstructor {
+  new(): BrowserSpeechRecognition;
+}
+
 interface VoiceMicProps {
-  backendUrl: string;
   disabled?: boolean;
+  language?: string;
   onRecordingChange?: (recording: boolean) => void;
+  onError?: (message: string) => void;
   onTranscription: (text: string) => void;
 }
 
 export default function VoiceMic({
-  backendUrl,
   disabled = false,
+  language = "en-US",
   onRecordingChange,
+  onError,
   onTranscription,
 }: VoiceMicProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState("");
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -28,6 +66,7 @@ export default function VoiceMic({
 
   useEffect(
     () => () => {
+      recognitionRef.current?.abort();
       recorderRef.current?.stop();
       streamRef.current?.getTracks().forEach((track) => track.stop());
     },
@@ -35,9 +74,69 @@ export default function VoiceMic({
   );
 
   async function startRecording() {
-    if (startingRef.current || recorderRef.current || disabled) return;
+    if (startingRef.current || recognitionRef.current || recorderRef.current || disabled) return;
     startingRef.current = true;
     setError("");
+
+    const speechWindow = window as typeof window & {
+      SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+      webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    };
+    const SpeechRecognition =
+      speechWindow.webkitSpeechRecognition || speechWindow.SpeechRecognition;
+    if (SpeechRecognition) {
+      try {
+        const recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = language;
+        recognition.onresult = (event) => {
+          const transcript = Array.from(
+            { length: event.results.length - event.resultIndex },
+            (_, index) => event.results[event.resultIndex + index],
+          )
+            .filter((result) => result.isFinal)
+            .map((result) => result[0].transcript.trim())
+            .filter(Boolean)
+            .join(" ");
+          if (transcript) onTranscription(transcript);
+        };
+        recognition.onerror = (event) => {
+          if (event.error === "aborted" || event.error === "no-speech") return;
+          const message =
+            event.error === "not-allowed" || event.error === "service-not-allowed"
+              ? "Microphone permission was denied. Allow microphone access and try again."
+              : "Speech recognition failed. Please try again.";
+          setError(message);
+          onError?.(message);
+        };
+        recognition.onend = () => {
+          if (recognitionRef.current !== recognition) return;
+          recognitionRef.current = null;
+          setIsRecording(false);
+          onRecordingChange?.(false);
+          touchModeRef.current = false;
+        };
+        recognitionRef.current = recognition;
+        recognition.start();
+        setIsRecording(true);
+        onRecordingChange?.(true);
+        if (touchModeRef.current && !touchHoldRef.current) stopRecording();
+        return;
+      } catch (recognitionError) {
+        recognitionRef.current = null;
+        const message =
+          recognitionError instanceof Error
+            ? recognitionError.message
+            : "Speech recognition could not start.";
+        setError(message);
+        onError?.(message);
+        return;
+      } finally {
+        startingRef.current = false;
+      }
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
@@ -81,12 +180,18 @@ export default function VoiceMic({
       const message =
         recordingError instanceof Error ? recordingError.message : "Microphone access is unavailable.";
       setError(message);
+      onError?.(message);
     } finally {
       startingRef.current = false;
     }
   }
 
   function stopRecording() {
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      recognition.stop();
+      return;
+    }
     const recorder = recorderRef.current;
     if (recorder && recorder.state !== "inactive") recorder.stop();
   }
@@ -99,10 +204,18 @@ export default function VoiceMic({
     try {
       const formData = new FormData();
       formData.append("file", audio, `voice-message.${extension}`);
-      const response = await fetch(`${backendUrl}/api/voice/transcribe`, {
+      const response = await fetch("/api/py/api/voice/transcribe", {
         method: "POST",
         body: formData,
       });
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.toLowerCase().includes("application/json")) {
+        throw new Error(
+          response.ok
+            ? "The transcription service returned an unexpected response."
+            : `Transcription failed (HTTP ${response.status}).`,
+        );
+      }
       const result = (await response.json()) as { text?: string; detail?: string };
       if (!response.ok) {
         throw new Error(result.detail || `Transcription failed (HTTP ${response.status}).`);
@@ -110,11 +223,12 @@ export default function VoiceMic({
       if (!result.text?.trim()) throw new Error("No speech was detected.");
       onTranscription(result.text.trim());
     } catch (transcriptionError) {
-      setError(
+      const message =
         transcriptionError instanceof Error
           ? transcriptionError.message
-          : "Voice transcription failed.",
-      );
+          : "Voice transcription failed.";
+      setError(message);
+      onError?.(message);
     }
   }
 

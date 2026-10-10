@@ -40,7 +40,7 @@ def route_request(user_input: str, previous_id: str | None = None):
     prompt = f"{ROUTING_PROMPT}\nUser input: {user_input}"
     
     kwargs = {
-        "model": "gemini-3.8-flash",
+        "model": "gemini-3.6-flash",
         "input": prompt,
     }
     if previous_id:
@@ -76,7 +76,7 @@ def run_local_agent(task: str) -> dict:
 
 def main():
     print("=" * 65)
-    print("  PERSONAL AI MANAGER AGENT ONLINE (gemini-3.8-flash)")
+    print("  PERSONAL AI MANAGER AGENT ONLINE (gemini-3.6-flash)")
     print("  Active Subordinates: [Job Hunt Agent, Security Scanner]")
     print("  Type 'exit' to shut down.")
     print("=" * 65)

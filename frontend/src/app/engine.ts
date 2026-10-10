@@ -14,7 +14,7 @@ export interface Message {
   };
 }
 
-const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash"] as const;
+const GEMINI_MODELS = ["gemini-3.6-flash"] as const;
 
 export function getBackendBaseUrl(): string {
   const configuredUrl =
@@ -30,8 +30,17 @@ export function getBackendBaseUrl(): string {
   ) {
     return "/api/py";
   }
-
   return "/api/py";
+}
+
+export function getBackendApiUrl(path: string): string {
+  const baseUrl = getBackendBaseUrl().replace(/\/+$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const pathPrefix = /\/api\/py$/.test(baseUrl) ? "/api/py" : /\/api$/.test(baseUrl) ? "/api" : "";
+  const endpoint = pathPrefix
+    ? normalizedPath.replace(/^(?:\/api\/)+/, "/")
+    : normalizedPath.replace(/^(\/api\/){2,}/, "/api/");
+  return `${baseUrl}${endpoint}`;
 }
 
 export function checkWakeWordTrigger(text: string): boolean {
@@ -50,6 +59,7 @@ export function checkWakeWordTrigger(text: string): boolean {
 
 interface BackendChatResponse {
   reply?: string;
+  response?: string;
   model_used?: string;
   error?: string;
   detail?: string;
@@ -81,7 +91,7 @@ export async function callActiveGeminiCascade(
     senderEmail: msg.senderEmail,
   }));
   const cleanProvidedKey = providedKey?.trim() || undefined;
-  const backendUrl = `${getBackendBaseUrl()}/api/chat`;
+  const backendUrl = getBackendApiUrl("/api/chat");
   let backendFailure: string;
 
   try {
@@ -104,8 +114,9 @@ export async function callActiveGeminiCascade(
       backendFailure = await responseError(response);
     } else {
       const data = (await response.json()) as BackendChatResponse;
-      if (data.reply?.trim()) {
-        return { text: data.reply.trim(), model: data.model_used || "genie-backend" };
+      const reply = data.reply || data.response;
+      if (reply?.trim()) {
+        return { text: reply.trim(), model: data.model_used || "genie-backend" };
       }
       backendFailure = "Backend returned an empty chat response.";
     }
