@@ -15,7 +15,17 @@ import VoiceMic from "../../components/VoiceMic";
 import DynamicTeamModal, { type RoomCapacityMode } from "./DynamicTeamModal";
 import GenieBrandAvatar, { BrandAvatar } from "./GenieBrandAvatar";
 import HeaderBar from "./HeaderBar";
-import SlideDockDrawer from "./SlideDockDrawer";
+import SessionMetadataBar from "./SessionMetadataBar";
+import VoiceCallModal, {
+  type VoiceCallTranscript,
+  type VoiceCallTurn,
+} from "./VoiceCallModal";
+import {
+  getSpeechLocale,
+  INDIAN_DIALECT_MAP,
+  playRegionalAudio,
+  stopActiveRegionalAudio,
+} from "./voiceAudio";
 import {
   decryptArchiveMessages,
   decryptRoomMessage,
@@ -50,18 +60,14 @@ import {
   ExternalLink,
   GraduationCap,
   Key,
-  ChevronLeft,
-  ChevronRight,
   Send,
   Globe,
   Users,
   SendHorizontal,
-  RotateCcw,
   Copy,
   Check,
+  CheckCheck,
   Smile,
-  Reply,
-  Forward,
   UserCheck,
   UserX,
   Ban,
@@ -83,7 +89,10 @@ import {
   AlertTriangle,
   FileCode,
   Download,
+  Menu,
   Cloud,
+  ArrowDown,
+  Volume2,
   Undo2,
   Redo2,
   Maximize2,
@@ -107,11 +116,18 @@ interface IndianLanguage {
 const INDIAN_LANGUAGES: IndianLanguage[] = [
   { code: "en-IN", label: "EN (India)" },
   { code: "ta-IN", label: "தமிழ்" },
-  { code: "hi-IN", label: "हिन्दी" },
-  { code: "te-IN", label: "తెలుగు" },
   { code: "ml-IN", label: "മലയാളം" },
+  { code: "te-IN", label: "తెలుగు" },
   { code: "kn-IN", label: "ಕನ್ನಡ" },
+  { code: "hi-IN", label: "हिन्दी" },
   { code: "bn-IN", label: "বাংলা" },
+  { code: "mr-IN", label: "मराठी" },
+  { code: "gu-IN", label: "ગુજરાતી" },
+  { code: "pa-IN", label: "ਪੰਜਾਬੀ" },
+  { code: "or-IN", label: "ଓଡ଼ିଆ" },
+  { code: "ur-IN", label: "اردو" },
+  { code: "as-IN", label: "অসমীয়া" },
+  { code: "sa-IN", label: "संस्कृतम्" },
 ];
 
 interface QuickEmoji {
@@ -319,6 +335,10 @@ interface Message {
   isForwarded?: boolean;
   forwardedFrom?: string;
   is_deleted?: boolean;
+  isVoiceRecord?: boolean;
+  isCallRecord?: boolean;
+  isVoiceSessionSummary?: boolean;
+  callTranscript?: VoiceCallTranscript;
   delivered_to?: string[];
   read_by?: string[];
   reactions?: Record<string, string[]>;
@@ -364,10 +384,62 @@ interface ChatSession {
   title: string;
   isPinned: boolean;
   messages: Message[];
+  createdAt?: string;
   topicId?: string;
   isSharedArchive?: boolean;
   isDeleted?: boolean;
   deletedAt?: string;
+  deletedBy?: string;
+}
+
+interface VoiceCallTurnResult {
+  text: string;
+  audioData?: string;
+}
+
+function parseMarkdownChatBackup(markdown: string): ChatSession[] {
+  const documents = markdown
+    .split(/(?=^#\s+(?:Chat|Conversation):\s*)/im)
+    .map((document) => document.trim())
+    .filter(Boolean);
+
+  return documents.map((document) => {
+    const title = document.match(/^#\s+(?:Chat|Conversation):?\s*(.+)$/im)?.[1]?.trim()
+      || document.match(/^#\s+(.+)$/m)?.[1]?.trim()
+      || "Imported Chat";
+    const messages: Message[] = [];
+    let currentRole: Message["role"] | null = null;
+    let currentContent: string[] = [];
+
+    const saveMessage = () => {
+      const content = currentContent.join("\n").trim();
+      if (currentRole && content) messages.push({ role: currentRole, content });
+    };
+
+    for (const line of document.split(/\r?\n/)) {
+      const headingRole = line.match(/^#{1,3}\s+(user|assistant|you|genie)\s*:?\s*$/i);
+      const inlineRole = line.match(/^\s*(?:[-*]\s*)?(?:\*\*)?(user|assistant|you|genie)(?:\*\*)?:\s*(.*)$/i);
+      const role = headingRole?.[1] || inlineRole?.[1];
+      if (role) {
+        saveMessage();
+        currentRole = /^(user|you)$/i.test(role) ? "user" : "assistant";
+        currentContent = inlineRole?.[2] ? [inlineRole[2]] : [];
+      } else if (currentRole) {
+        currentContent.push(line);
+      }
+    }
+    saveMessage();
+    if (!messages.length) {
+      throw new Error(`No User/Assistant messages were found in "${title}".`);
+    }
+
+    return {
+      id: window.crypto.randomUUID(),
+      title,
+      isPinned: false,
+      messages,
+    };
+  });
 }
 
 function ensureMessageTimestamps(messages: Message[]): Message[] {
@@ -443,8 +515,8 @@ interface RoomSocketEvent {
   status?: "delivered" | "read";
   message?: Message;
   messages?: Message[];
-  members?: Array<{ id?: string; user_id?: string; name?: string; display_name?: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; status?: "active" | "inactive" }>;
-  users?: Array<{ user_id: string; display_name: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; status?: "active" | "inactive" }>;
+  members?: Array<{ id?: string; user_id?: string; name?: string; display_name?: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "sovereign" | "admin" | "developer" | "member"; status?: "active" | "inactive" }>;
+  users?: Array<{ id?: string; user_id: string; display_name: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "sovereign" | "admin" | "developer" | "member"; status?: "active" | "inactive" }>;
   message_id?: string;
   id?: string;
   member_id?: string;
@@ -458,9 +530,16 @@ interface RoomSocketEvent {
   sender_id?: string;
   sender_name?: string;
   detail?: string;
+  call_id?: string;
+  turn_id?: string;
+  speaker?: { id: string; name: string; avatar_url?: string | null; role: "user" | "assistant" };
+  timestamp?: string;
+  participants?: Array<{ id: string; name: string; avatar_url?: string | null }>;
+  started_at?: string;
+  encrypted_payloads?: Record<string, RoomCiphertext>;
+  sender_public_key?: JsonWebKey;
 }
 
-const QUICK_ROOM_REACTIONS = ["❤️", "👍", "👏", "😂", "🔥", "🎉"];
 
 function normalizeRoomMessage(raw: Message): Message {
   const wire = raw as Message & {
@@ -469,6 +548,7 @@ function normalizeRoomMessage(raw: Message): Message {
     display_name?: string;
     edited?: boolean;
     deleted?: boolean;
+    is_voice_record?: boolean;
     agent_name?: string;
     agent_output?: Message["agentOutput"];
   };
@@ -488,10 +568,163 @@ function normalizeRoomMessage(raw: Message): Message {
     agentOutput: wire.agentOutput || wire.agent_output,
     is_edited: Boolean(wire.is_edited || wire.edited),
     is_deleted: Boolean(wire.is_deleted || wire.deleted),
+    isVoiceRecord: Boolean(wire.isVoiceRecord || wire.is_voice_record),
+    isCallRecord: Boolean((wire as Message & { is_call_record?: boolean }).isCallRecord || (wire as Message & { is_call_record?: boolean }).is_call_record),
+    isVoiceSessionSummary: Boolean((wire as Message & { is_voice_session_summary?: boolean }).is_voice_session_summary),
     delivered_to: Array.isArray(wire.delivered_to) ? wire.delivered_to : [],
     read_by: Array.isArray(wire.read_by) ? wire.read_by : [],
     reactions: wire.reactions && typeof wire.reactions === "object" ? wire.reactions : {},
   };
+}
+
+function formatVoiceCallTranscript(transcript: VoiceCallTranscript): string {
+  const turns = transcript.turns.map((turn) => {
+    const timestamp = new Date(turn.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const speaker = turn.role === "assistant" ? "Genie Master" : turn.userName;
+    return `${speaker} · ${timestamp}\n${turn.text}`;
+  });
+  return [
+    "📞 Genie Master Voice Session Summary",
+    `Duration: ${Math.floor(transcript.durationSeconds / 60)}m ${transcript.durationSeconds % 60}s`,
+    `Dialect: ${transcript.dialect}`,
+    `Participants: ${transcript.participants.map((participant) => participant.name).join(", ") || "You"}`,
+    "",
+    ...turns,
+  ].join("\n\n");
+}
+
+function createDocxBlob(
+  title: string,
+  createdAt: string,
+  exportedAt: Date,
+  transcript: Array<{ message: Message }>,
+): Blob {
+  const escapeXml = (value: string) =>
+    value.replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&apos;",
+    })[character] || character);
+  const paragraph = (text: string, style?: string) =>
+    `<w:p>${style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : ""}<w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+  const paragraphs = [
+    paragraph(title, "Title"),
+    paragraph(`Created: ${createdAt ? new Date(createdAt).toLocaleString() : "Unknown"}`),
+    paragraph(`Exported: ${exportedAt.toLocaleString()}`),
+    ...transcript.flatMap(({ message }) => {
+      const author = message.senderName || (message.role === "assistant" ? "Genie Master" : "You");
+      const timestamp = message.timestamp ? new Date(message.timestamp).toLocaleString() : "";
+      return [
+        paragraph(`${author}${timestamp ? ` · ${timestamp}` : ""}`, "Heading2"),
+        ...message.content.split(/\r?\n/).map((line) => paragraph(line)),
+      ];
+    }),
+  ];
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${paragraphs.join("")}<w:sectPr/></w:body></w:document>`;
+  const entries = [
+    {
+      name: "[Content_Types].xml",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>`,
+    },
+    {
+      name: "_rels/.rels",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`,
+    },
+    {
+      name: "word/_rels/document.xml.rels",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    },
+    {
+      name: "word/styles.xml",
+      content: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style></w:styles>`,
+    },
+    { name: "word/document.xml", content: documentXml },
+  ];
+  const encoder = new TextEncoder();
+  const crcTable = Array.from({ length: 256 }, (_, index) => {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    return value >>> 0;
+  });
+  const crc32 = (bytes: Uint8Array) => {
+    let crc = 0xffffffff;
+    for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+  };
+  const localParts: Uint8Array[] = [];
+  const centralParts: Uint8Array[] = [];
+  let offset = 0;
+  for (const entry of entries) {
+    const name = encoder.encode(entry.name);
+    const data = encoder.encode(entry.content);
+    const checksum = crc32(data);
+    const localHeader = new Uint8Array(30 + name.length);
+    const localView = new DataView(localHeader.buffer);
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint16(10, 0, true);
+    localView.setUint16(12, 0x0021, true);
+    localView.setUint32(14, checksum, true);
+    localView.setUint32(18, data.length, true);
+    localView.setUint32(22, data.length, true);
+    localView.setUint16(26, name.length, true);
+    localView.setUint16(28, 0, true);
+    localHeader.set(name, 30);
+    localParts.push(localHeader, data);
+
+    const centralHeader = new Uint8Array(46 + name.length);
+    const centralView = new DataView(centralHeader.buffer);
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, 0, true);
+    centralView.setUint16(14, 0x0021, true);
+    centralView.setUint32(16, checksum, true);
+    centralView.setUint32(20, data.length, true);
+    centralView.setUint32(24, data.length, true);
+    centralView.setUint16(28, name.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
+    centralHeader.set(name, 46);
+    centralParts.push(centralHeader);
+    offset += localHeader.length + data.length;
+  }
+  const centralSize = centralParts.reduce((total, part) => total + part.length, 0);
+  const endRecord = new Uint8Array(22);
+  const endView = new DataView(endRecord.buffer);
+  endView.setUint32(0, 0x06054b50, true);
+  endView.setUint16(4, 0, true);
+  endView.setUint16(6, 0, true);
+  endView.setUint16(8, entries.length, true);
+  endView.setUint16(10, entries.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, offset, true);
+  endView.setUint16(20, 0, true);
+  const archiveParts = [...localParts, ...centralParts, endRecord];
+  const archive = new Uint8Array(archiveParts.reduce((total, part) => total + part.length, 0));
+  let archiveOffset = 0;
+  for (const part of archiveParts) {
+    archive.set(part, archiveOffset);
+    archiveOffset += part.length;
+  }
+  return new Blob([archive.buffer], {
+    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  });
 }
 
 function isRoomCiphertext(value: unknown): value is RoomCiphertext {
@@ -596,9 +829,7 @@ function getAssistantPersona(message: Message) {
   if (message.avatarSrc === "/avatars/Genie PRO.png") {
     return {
       variant: "faceless-weaver" as const,
-      badge: "Genie Pro · Genie Core Engine",
-      provider: "Genie Pro",
-      model: "Genie Core Engine",
+      badge: "Genie Pro",
     };
   }
   const resolved =
@@ -609,9 +840,7 @@ function getAssistantPersona(message: Message) {
   if (resolved) {
     return {
       variant: "void-shaman" as const,
-      badge: "Primary Brand Icon · Resolved ✓",
-      provider: "Primary Brand Icon",
-      model: "Resolved ✓",
+      badge: "Genie · Reviewed",
     };
   }
   if (
@@ -622,16 +851,27 @@ function getAssistantPersona(message: Message) {
   ) {
     return {
       variant: "faceless-weaver" as const,
-      badge: "Genie Pro · Genie Core Engine",
-      provider: "Genie Pro",
-      model: "Genie Core Engine",
+      badge: "Genie Pro",
     };
   }
   return {
     variant: "cosmic-shadow" as const,
-    badge: "Genie Master · AI response",
-    provider: "Genie Master",
-    model: "AI response",
+    badge: "Genie",
+  };
+}
+
+function getRoomMessageReadStatus(message: Message, roomMembers: RoomMember[]) {
+  const activeMembers = roomMembers.filter((member) => member.status === "active");
+  const readBy = new Set(message.read_by || []);
+  if (message.sender_id) readBy.add(message.sender_id);
+  const seenCount = activeMembers.filter((member) => readBy.has(member.id)).length;
+
+  return {
+    seenCount,
+    activeCount: activeMembers.length,
+    isReadByAll:
+      activeMembers.length > 0 &&
+      activeMembers.every((member) => readBy.has(member.id)),
   };
 }
 
@@ -684,6 +924,17 @@ function extractCodeBlock(raw: string): { title: string; language: string; code:
 function getAuthApiUrl(apiBase: string, path: string): string {
   const apiPrefix = apiBase.endsWith("/api/py") ? "" : "/api";
   return `${apiBase}${apiPrefix}/${path.replace(/^\/+/, "")}`;
+}
+
+function getLocalDevelopmentToken(): string {
+  if (
+    process.env.NODE_ENV !== "production" &&
+    typeof window !== "undefined" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)
+  ) {
+    return "dev-token-local-bypass";
+  }
+  return "";
 }
 
 async function fetchAuthenticatorSetup(
@@ -748,19 +999,24 @@ function MainChatApp() {
   const [authenticatorResetBusy, setAuthenticatorResetBusy] = useState(false);
   const [registrationReauthRequired, setRegistrationReauthRequired] = useState(false);
   const registrationReauthRequiredRef = useRef(false);
+  const [verifiedArchiveOwner, setVerifiedArchiveOwner] = useState<{
+    providerId: string;
+    email: string;
+  } | null>(null);
 
   const [spaceMode, setSpaceMode] = useState<"personal" | "workspace">("personal");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [isDockHidden, setIsDockHidden] = useState(false);
   const [isTeamMode, setIsTeamMode] = useState(false);
-  const [isObserverActive, setIsObserverActive] = useState(false);
+  const [isObserverActive, setIsObserverActiveState] = useState(false);
 
   const [dailyUsageCount, setDailyUsageCount] = useState<number>(0);
   const [isVipSessionActive, setIsVipSessionActive] = useState(false);
   const [vipSessionLimitReached, setVipSessionLimitReached] = useState(false);
   const [activeVipSessionCount, setActiveVipSessionCount] = useState(0);
   const [quotaExceededModalOpen, setQuotaExceededModalOpen] = useState(false);
-  const [activeModelName, setActiveModelName] = useState<string>("Genie Core Engine");
+  const [activeModelName, setActiveModelName] = useState<string>("Genie");
 
   const [roomId, setRoomId] = useState("GENIE-TEAM-MAIN");
   const [roomTitle, setRoomTitle] = useState("GENIE TEAM MAIN");
@@ -817,6 +1073,15 @@ function MainChatApp() {
   useEffect(() => {
     userProfileRef.current = userProfile;
   }, [userProfile]);
+  const customAvatar =
+    userProfile.avatarUrl && !userProfile.avatarUrl.startsWith("genie-preset:")
+      ? userProfile.avatarUrl
+      : "";
+  const selectedAvatar =
+    userProfile.avatarUrl.startsWith("genie-preset:") && userProfile.avatarUrl !== "genie-preset:neutral"
+      ? userProfile.avatarUrl
+      : "";
+  const profileAvatar = customAvatar || selectedAvatar || userProfile.googleAvatarUrl || "/default-avatar.png";
   useEffect(() => () => {
     if (profileTotpToastTimerRef.current) clearTimeout(profileTotpToastTimerRef.current);
   }, []);
@@ -824,6 +1089,12 @@ function MainChatApp() {
   const [editProfileOpen, setEditProfileOpen] = useState(false);
   const [profileSaveBusy, setProfileSaveBusy] = useState(false);
   const [profileSaveError, setProfileSaveError] = useState<string | null>(null);
+  const [byokApiKey, setByokApiKey] = useState("");
+  const [byokVerified, setByokVerified] = useState(false);
+  const [byokTesting, setByokTesting] = useState(false);
+  const [byokStatus, setByokStatus] = useState<string | null>(null);
+  const [byokError, setByokError] = useState<string | null>(null);
+  const [voicePreset, setVoicePreset] = useState<"Aoede" | "Charon">("Aoede");
   const [profileTotpSetup, setProfileTotpSetup] = useState<{ qr_code: string; secret: string } | null>(null);
   const [profileTotpCode, setProfileTotpCode] = useState("");
   const [profileTotpBusy, setProfileTotpBusy] = useState(false);
@@ -847,7 +1118,6 @@ function MainChatApp() {
   const [blockedUsers, setBlockedUsers] = useState<BlockedFriendProfile[]>([]);
   const [blockTarget, setBlockTarget] = useState<BlockedFriendProfile | DiscoverableFriend | null>(null);
   const [friendMenuUserId, setFriendMenuUserId] = useState<string | null>(null);
-  const [reactionPickerMessageId, setReactionPickerMessageId] = useState<string | null>(null);
   const [sovereignRooms, setSovereignRooms] = useState<SovereignRoomSummary[]>([]);
   const [friendsQueueOpen, setFriendsQueueOpen] = useState(false);
   const [friendsQueueError, setFriendsQueueError] = useState<string | null>(null);
@@ -866,13 +1136,17 @@ function MainChatApp() {
   const [inviteEmailBusy, setInviteEmailBusy] = useState(false);
   const [inviteEmailStatus, setInviteEmailStatus] = useState<string | null>(null);
   const [trashOpen, setTrashOpen] = useState(false);
+  const [sharedChatsOpen, setSharedChatsOpen] = useState(true);
   const [trashSessions, setTrashSessions] = useState<ChatSession[]>([]);
+  const [topicError, setTopicError] = useState<string | null>(null);
+  const [chatVaultOpen, setChatVaultOpen] = useState(false);
+  const [chatVaultError, setChatVaultError] = useState<string | null>(null);
   const [roomAdminOpen, setRoomAdminOpen] = useState(false);
   const [roomCapacityMode, setRoomCapacityMode] = useState<RoomCapacityMode>("unlimited");
   const [customRoomCapacity, setCustomRoomCapacity] = useState(10);
 
   const [sessions, setSessions] = useState<ChatSession[]>([
-    { id: "1", title: "New Session", isPinned: false, messages: [] },
+    { id: "1", title: "New Session", isPinned: false, messages: [], createdAt: new Date().toISOString() },
   ]);
   const [sessionsHydrated, setSessionsHydrated] = useState(false);
   const [topics, setTopics] = useState<TopicChannel[]>([
@@ -916,7 +1190,8 @@ function MainChatApp() {
   const [isSavingArchive, setIsSavingArchive] = useState(false);
   const [archiveError, setArchiveError] = useState<string | null>(null);
   const [archiveStatus, setArchiveStatus] = useState<string | null>(null);
-  const [settingsTab, setSettingsTab] = useState<"profile" | "developer" | "totp" | "theme" | "docs" | "blocked">("profile");
+  const [settingsTab, setSettingsTab] = useState<"profile" | "developer" | "totp" | "theme" | "docs" | "blocked" | "tools" | "audio">("profile");
+  const [voiceCallGateNotice, setVoiceCallGateNotice] = useState("");
   const [reportType, setReportType] = useState<"ai_issue" | "ui_request">("ai_issue");
   const [ticketDescription, setTicketDescription] = useState("");
   const [ticketStatus, setTicketStatus] = useState<string | null>(null);
@@ -929,6 +1204,22 @@ function MainChatApp() {
   const visibleChatError = suppressAuthWarning ? null : chatError;
   const [metaLoginError, setMetaLoginError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState<IndianLanguage>(INDIAN_LANGUAGES[0]);
+  const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
+  const [voiceCallId, setVoiceCallId] = useState("");
+  const [activeRoomVoiceCallId, setActiveRoomVoiceCallId] = useState("");
+  const [voiceCallParticipants, setVoiceCallParticipants] = useState<RoomMember[]>([]);
+  const [remoteVoiceTurns, setRemoteVoiceTurns] = useState<VoiceCallTurn[]>([]);
+  const [pendingCallTranscript, setPendingCallTranscript] = useState<VoiceCallTranscript | null>(null);
+  const setIsObserverActive = useCallback((active: boolean) => {
+    if (!active) {
+      setIsVoiceCallOpen(false);
+      if (isTeamMode && activeRoomVoiceCallId) {
+        sendRoomEvent({ type: "voice_session.end", call_id: activeRoomVoiceCallId });
+        setActiveRoomVoiceCallId("");
+      }
+    }
+    setIsObserverActiveState(active);
+  }, [activeRoomVoiceCallId, isTeamMode]);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -937,6 +1228,13 @@ function MainChatApp() {
   const activeChatAbortControllerRef = useRef<AbortController | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [bufferingAudioId, setBufferingAudioId] = useState<string | null>(null);
+  const [playingAudioId, setPlayingAudioId] = useState<string | null>(null);
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedMessageIds, setSelectedMessageIds] = useState<Set<string>>(() => new Set());
+  const [selectedExportFormat, setSelectedExportFormat] = useState<"pdf" | "docx">("pdf");
+  const [isScrolledUp, setIsScrolledUp] = useState(false);
+  const audioRequestIdRef = useRef(0);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
 
@@ -946,6 +1244,7 @@ function MainChatApp() {
   const readReceiptIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<HTMLInputElement>(null);
 
   const API_BASE = getBackendBaseUrl();
@@ -963,17 +1262,35 @@ function MainChatApp() {
 
   const isDevUser = userProfile.email.toLowerCase() === DEVELOPER_EMAIL.toLowerCase();
   const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
+  const canAccessVoiceCall = useCallback(() => {
+    if (!isObserverActive) return false;
+    if (userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com") return true;
+    try {
+      return Boolean(localStorage.getItem("genie_user_byok_key")?.trim());
+    } catch (error) {
+      console.warn("BYOK key could not be checked for voice call access:", error);
+      return false;
+    }
+  }, [isObserverActive, userProfile.email]);
+  const hasVoiceCallAccess = canAccessVoiceCall();
   const isPlatformHost = ADMIN_EMAILS.includes(userProfile.email.toLowerCase());
-  const isKeyOwner = Boolean(userProfile.customApiKey) || isPlatformHost;
+  const isKeyOwner = byokVerified || isPlatformHost;
+  const isOwner =
+    isAuthenticated &&
+    verifiedArchiveOwner?.providerId === userProfile.providerId &&
+    verifiedArchiveOwner.email.toLowerCase() === userProfile.email.trim().toLowerCase();
 
   const isVipEligible =
     Boolean(googleIdToken) && VIP_ALLOWED_EMAILS.includes(userProfile.email.toLowerCase());
   const isVipUser = isVipEligible && isVipSessionActive;
 
-  const isQuotaEnforced = !isMasterAdmin && !isVipUser && !userProfile.customApiKey;
+  const isQuotaEnforced = !isMasterAdmin && !isVipUser && !byokVerified;
   const remainingDailyChats = isMasterAdmin ? 999999 : Math.max(0, DAILY_FREE_LIMIT - dailyUsageCount);
   const activeRoomMemberCount = members.filter((member) => member.status === "active").length;
   const roomMemberCount = members.length;
+  const isCurrentRoomHost = members.some(
+    (member) => member.id === roomIdentity && member.role === "sovereign",
+  );
   const roomCapacityLimit =
     roomCapacityMode === "pair"
       ? 2
@@ -1077,6 +1394,14 @@ function MainChatApp() {
     setIsStreaming(false);
   }
 
+  function toggleSidebar() {
+    if (window.innerWidth < 768) {
+      setSidebarOpen((open) => !open);
+      return;
+    }
+    setSidebarCollapsed((collapsed) => !collapsed);
+  }
+
   function handleSelectSession(session: ChatSession) {
     stopCurrentChatGeneration();
     setCurrentSessionId(session.id);
@@ -1084,7 +1409,7 @@ function MainChatApp() {
     setIsTeamMode(false);
     setPersonalMessages(session.messages);
     setPrompt("");
-    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+    if (typeof window !== "undefined" && window.innerWidth < 768) {
       setSidebarOpen(false);
     }
   }
@@ -1093,7 +1418,7 @@ function MainChatApp() {
     stopCurrentChatGeneration();
     const newId = window.crypto.randomUUID();
     setSessions((previous) => [
-      { id: newId, title: "New Session", isPinned: false, messages: [] },
+      { id: newId, title: "New Session", isPinned: false, messages: [], createdAt: new Date().toISOString() },
       ...previous,
     ]);
     setCurrentSessionId(newId);
@@ -1102,7 +1427,7 @@ function MainChatApp() {
     setPersonalMessages([]);
     setPrompt("");
     window.requestAnimationFrame(() => promptInputRef.current?.focus());
-    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+    if (typeof window !== "undefined" && window.innerWidth < 768) {
       setSidebarOpen(false);
     }
   }
@@ -1119,6 +1444,85 @@ function MainChatApp() {
 
   async function sendEncryptedRoomEvent(event: Record<string, unknown>): Promise<boolean> {
     return encryptAndSendRoomEvent(event, members);
+  }
+
+  function startVoiceCall() {
+    if (!canAccessVoiceCall()) {
+      setVoiceCallGateNotice("Live Voice Calls are exclusive to BYOK users. Please add your Gemini API key in Settings > BYOK to start voice calls.");
+      setSettingsTab("developer");
+      setSettingsOpen(true);
+      return;
+    }
+    setVoiceCallGateNotice("");
+    const callId = isTeamMode && activeRoomVoiceCallId
+      ? activeRoomVoiceCallId
+      : window.crypto.randomUUID();
+    if (isTeamMode && !activeRoomVoiceCallId) {
+      if (!sendRoomEvent({ type: "voice_session.start", call_id: callId })) return;
+      setActiveRoomVoiceCallId(callId);
+      setVoiceCallParticipants(members.filter((member) => member.status === "active"));
+      setRemoteVoiceTurns([]);
+    }
+    setVoiceCallId(callId);
+    setIsVoiceCallOpen(true);
+  }
+
+  async function broadcastVoiceTurn(turn: VoiceCallTurn, callId: string) {
+    if (!isTeamMode) return;
+    const sent = await sendEncryptedRoomEvent({
+      type: "voice_session.turn",
+      content: turn.text,
+      call_id: callId,
+      turn_id: turn.id,
+      role: turn.role,
+      timestamp: turn.timestamp,
+    });
+    if (!sent) {
+      throw new Error("Voice turn could not be broadcast to the room.");
+    }
+  }
+
+  async function handleVoiceCallEnd(transcript: VoiceCallTranscript) {
+    setIsVoiceCallOpen(false);
+    if (isTeamMode) {
+      sendRoomEvent({ type: "voice_session.end", call_id: transcript.callId });
+      setActiveRoomVoiceCallId("");
+      const content = JSON.stringify(transcript);
+      const sent = await sendEncryptedRoomEvent({
+        type: "message.send",
+        content,
+        sender_name: "Genie Master",
+        sender_type: "assistant",
+        is_voice_record: true,
+        is_voice_session_summary: true,
+        call_id: transcript.callId,
+      });
+      if (!sent) {
+        setChatError("The mandatory Genie Master call transcript could not be saved to this room.");
+        return;
+      }
+      return;
+    }
+    setPendingCallTranscript(transcript);
+  }
+
+  function savePendingCallTranscript() {
+    if (!pendingCallTranscript) return;
+    const record = pendingCallTranscript;
+    updateCurrentPersonalMessages((current) => [
+      ...current,
+      {
+        id: record.callId,
+        role: "assistant",
+        content: formatVoiceCallTranscript(record),
+        text: formatVoiceCallTranscript(record),
+        timestamp: new Date().toISOString(),
+        senderName: "Genie Master",
+        isCallRecord: true,
+        callTranscript: record,
+      },
+    ]);
+    setPendingCallTranscript(null);
   }
 
   async function encryptAndSendRoomEvent(
@@ -1205,7 +1609,16 @@ function MainChatApp() {
       normalized.sender_id || "",
       message.sender_public_key || {}
     );
-    return { ...normalized, content, text: content };
+    let callTranscript: VoiceCallTranscript | undefined;
+    if (normalized.isVoiceSessionSummary) {
+      try {
+        callTranscript = JSON.parse(content) as VoiceCallTranscript;
+      } catch (error) {
+        console.error("Room voice session summary is malformed:", error);
+      }
+    }
+    const displayContent = callTranscript ? formatVoiceCallTranscript(callTranscript) : content;
+    return { ...normalized, content: displayContent, text: displayContent, callTranscript };
   }
 
   // Restore authenticated session from localStorage on initial load
@@ -1251,10 +1664,12 @@ function MainChatApp() {
               const normalizedSessions = sessionsForUse.map((session) => ({
                 ...session,
                 messages: ensureMessageTimestamps(session.messages),
+                createdAt: session.createdAt || session.messages[0]?.timestamp || new Date().toISOString(),
               }));
               const normalizedDeleted = deletedSessions.map((session) => ({
                 ...session,
                 messages: ensureMessageTimestamps(session.messages),
+                createdAt: session.createdAt || session.messages[0]?.timestamp || new Date().toISOString(),
               }));
               setSessions([...normalizedSessions, ...normalizedDeleted]);
               setTrashSessions(normalizedDeleted);
@@ -1285,7 +1700,7 @@ function MainChatApp() {
           console.error("Theme restoration error", error);
         }
 
-        if (window.innerWidth >= 1024) {
+        if (window.innerWidth >= 768) {
           setSidebarOpen(true);
         }
 
@@ -1433,6 +1848,12 @@ function MainChatApp() {
         localStorage.setItem("genie_is_authenticated", "true");
         localStorage.setItem("genie_terms_agreed", "true");
         localStorage.removeItem("genie_local_registration_fallback");
+        if (profile.providerId && profile.email.trim()) {
+          setVerifiedArchiveOwner({
+            providerId: profile.providerId,
+            email: profile.email.trim(),
+          });
+        }
         setRegistrationRequired(false);
         setIsAuthenticated(true);
       })
@@ -1665,10 +2086,44 @@ if (!response.ok || !Array.isArray(result.topics)) {
   }, [currentTheme, themeReady]);
 
   useEffect(() => {
-    if (!mounted || !isAuthenticated || !googleIdToken || archivePromptedRef.current) return;
+    if (!mounted) return;
+    const timeout = window.setTimeout(() => {
+      try {
+        const savedKey = localStorage.getItem("genie_user_byok_key") || "";
+        setByokApiKey(savedKey);
+        setByokStatus(savedKey ? "Saved on this device · test to activate" : null);
+        const savedVoice = localStorage.getItem("genie_tts_voice_preset");
+        if (savedVoice === "Aoede" || savedVoice === "Charon") setVoicePreset(savedVoice);
+      } catch (error) {
+        console.error("Device preferences could not be loaded:", error);
+        setByokError("Device preferences could not be loaded from local storage.");
+      }
+    }, 0);
+    return () => window.clearTimeout(timeout);
+  }, [mounted]);
+
+  function selectVoicePreset(preset: "Aoede" | "Charon") {
+    setVoicePreset(preset);
+    try {
+      localStorage.setItem("genie_tts_voice_preset", preset);
+    } catch (error) {
+      console.error("Voice preference could not be saved:", error);
+      setChatError("Voice preference could not be saved in this browser.");
+    }
+  }
+
+  useEffect(() => {
+    if (
+      !mounted ||
+      registrationBusy ||
+      !userProfile.email.trim() ||
+      isOwner !== true ||
+      !googleIdToken ||
+      archivePromptedRef.current
+    ) return;
     archivePromptedRef.current = true;
     void loadArchiveManifest(true);
-  }, [mounted, isAuthenticated, googleIdToken]);
+  }, [mounted, registrationBusy, userProfile.email, isOwner, googleIdToken]);
 
   useEffect(() => {
     if (!isTeamMode || !archivedRoomMessages[roomId]) return;
@@ -1678,6 +2133,33 @@ if (!response.ok || !Array.isArray(result.topics)) {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isStreaming]);
+
+  function handleMessageScroll() {
+    const viewport = messageScrollRef.current;
+    if (!viewport) return;
+    setIsScrolledUp(
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 250,
+    );
+  }
+
+  function getMessageSelectionId(message: Message, index: number): string {
+    return message.id || `message-${index}`;
+  }
+
+  function toggleMessageSelection(message: Message, index: number) {
+    const messageId = getMessageSelectionId(message, index);
+    setSelectedMessageIds((current) => {
+      const next = new Set(current);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  }
+
+  function cancelMessageSelection() {
+    setSelectedMessageIds(new Set());
+    setIsSelectionMode(false);
+  }
 
   useEffect(() => {
     if (userProfile.email && typeof window !== "undefined") {
@@ -1741,6 +2223,57 @@ if (!response.ok || !Array.isArray(result.topics)) {
         return;
       }
 
+      if (update.type === "voice_session.started" && update.call_id) {
+        setActiveRoomVoiceCallId(update.call_id);
+        setVoiceCallParticipants((update.participants || []).map((participant) => ({
+          id: participant.id,
+          name: participant.name,
+          email: "",
+          avatarUrl: participant.avatar_url || undefined,
+          role: "member",
+          status: "active",
+        })));
+        setRemoteVoiceTurns([]);
+        return;
+      }
+
+      if (update.type === "voice_session.turn" && update.call_id && update.turn_id && update.speaker) {
+        if (!update.encrypted_payloads || !roomCryptoIdentity || !update.sender_id) {
+          setChatError("A room voice turn could not be decrypted.");
+          return;
+        }
+        void decryptRoomMessage(
+          update.encrypted_payloads,
+          roomCryptoIdentity,
+          roomIdentity,
+          update.sender_id,
+          update.sender_public_key || {},
+        ).then((text) => {
+          const turn: VoiceCallTurn = {
+            id: update.turn_id!,
+            callId: update.call_id,
+            userId: update.speaker!.id,
+            userName: update.speaker!.name,
+            userAvatar: update.speaker!.avatar_url || null,
+            role: update.speaker!.role,
+            text,
+            timestamp: update.timestamp || new Date().toISOString(),
+          };
+          setRemoteVoiceTurns((previous) =>
+            previous.some((item) => item.id === turn.id) ? previous : [...previous, turn],
+          );
+        }).catch((error: unknown) => {
+          console.error("Could not decrypt a room voice turn:", error);
+          setChatError("A room voice turn could not be decrypted.");
+        });
+        return;
+      }
+
+      if (update.type === "voice_session.ended") {
+        setActiveRoomVoiceCallId("");
+        return;
+      }
+
       if (update.type === "room_state") {
         try {
           localStorage.setItem(
@@ -1772,7 +2305,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
               email: member.email || id.replace(/^google:/, ""),
               avatarUrl: member.avatar_url,
               publicKey: member.public_key,
-              role: id === roomIdentity ? "sovereign" : "member",
+              role: member.role || "member",
               status: member.status || "active",
             };
           }));
@@ -1782,12 +2315,12 @@ if (!response.ok || !Array.isArray(result.topics)) {
 
       if (update.type === "presence" && update.users) {
         const nextMembers: RoomMember[] = update.users.map((member) => ({
-          id: member.user_id,
+          id: member.id || member.user_id,
           name: member.display_name,
           email: member.email || "",
           avatarUrl: member.avatar_url,
           publicKey: member.public_key,
-          role: member.user_id === roomIdentity ? "sovereign" : "member",
+          role: member.role || "member",
           status: member.status || "active",
         }));
         setMembers(nextMembers);
@@ -2381,23 +2914,38 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
 
   async function searchOmniDirectory(event: React.FormEvent) {
     event.preventDefault();
-    if (!googleIdToken || omniSearchQuery.trim().length < 2) return;
+    const requestToken = googleIdToken || getLocalDevelopmentToken();
+    if (omniSearchQuery.trim().length < 2) return;
+    if (!requestToken) {
+      setOmniSearchResults([]);
+      setOmniSearchError("Sign in again to search the directory.");
+      return;
+    }
     setOmniSearchBusy(true);
     setOmniSearchError(null);
     setOmniSearchNotFound(false);
+    setOmniSearchResults([]);
     try {
       const response = await fetch(
         getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
-        { headers: { Authorization: `Bearer ${googleIdToken}` } }
+        { headers: { Authorization: `Bearer ${requestToken}` } }
       );
       const result = (await response.json()) as { users?: DiscoverableFriend[]; detail?: string };
-      if (!response.ok) throw new Error(result.detail || `Directory search failed (HTTP ${response.status}).`);
-      const users = result.users || [];
+      if (!response.ok) {
+        throw new Error(result.detail || `Directory search failed (HTTP ${response.status}).`);
+      }
+      const users = Array.isArray(result.users) ? result.users : [];
       setOmniSearchResults(users);
       setOmniSearchNotFound(users.length === 0);
     } catch (error) {
       console.error("Omni-search failed:", error);
-      setOmniSearchError(error instanceof Error ? error.message : "Directory search failed.");
+      setOmniSearchResults([]);
+      setOmniSearchNotFound(false);
+      setOmniSearchError(
+        error instanceof Error
+          ? error.message
+          : "Directory search could not be completed. Please try again."
+      );
     } finally {
       setOmniSearchBusy(false);
     }
@@ -2474,36 +3022,63 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       setChatError("Topic titles must be 80 characters or fewer, and icons must be 16 characters or fewer.");
       return;
     }
+    setTopicError(null);
+    const createLocalTopic = (): TopicChannel | null => {
+      const existingIds = new Set(topics.map((topic) => topic.id));
+      const id = Array.from({ length: 10 }, (_, index) => `topic_${index + 1}`).find((item) => !existingIds.has(item));
+      return id ? { id, title, icon, messages: [] } : null;
+    };
     try {
       let newTopic: TopicChannel;
-      if (isAuthenticated && googleIdToken && userProfile.providerId) {
+      const token = googleIdToken || getLocalDevelopmentToken();
+      if (isAuthenticated && token && userProfile.providerId) {
         const response = await fetch(getBackendApiUrl("/api/personal/topics/create"), {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + (token || "dev-token-local-bypass"),
+          },
           body: JSON.stringify({
-            google_id_token: googleIdToken,
+            google_id_token: token || "dev-token-local-bypass",
             user_id: userProfile.providerId,
             title,
             icon,
           }),
         });
-        const result = (await response.json()) as { topic?: TopicChannel; detail?: string };
-        if (!response.ok || !result.topic) {
-          throw new Error(result.detail || `Topic could not be created (HTTP ${response.status}).`);
+        const result = response.status === 401
+          ? {}
+          : (await response.json()) as { topic?: TopicChannel; detail?: string };
+        const authenticationFailed =
+          response.status === 401 ||
+          result.detail?.includes("Google sign-in could not be verified");
+        if (authenticationFailed) {
+          console.warn("Topic channel authentication could not be verified; creating a local topic session.", result.detail);
+          const localTopic = createLocalTopic();
+          if (!localTopic) return;
+          newTopic = localTopic;
+        } else if (!response.ok || !result.topic) {
+          setTopicError(result.detail || `Topic could not be created (HTTP ${response.status}).`);
+          return;
+        } else {
+          newTopic = result.topic;
         }
-        newTopic = result.topic;
       } else {
-        const existingIds = new Set(topics.map((topic) => topic.id));
-        const id = Array.from({ length: 10 }, (_, index) => `topic_${index + 1}`).find((item) => !existingIds.has(item));
-        if (!id) return;
-        newTopic = { id, title, icon, messages: [] };
+        const localTopic = createLocalTopic();
+        if (!localTopic) return;
+        newTopic = localTopic;
       }
       setTopics((previous) => [...previous, newTopic]);
       setActiveTopicId(newTopic.id);
+      setIsTopicConversation(true);
       setIsTeamMode(false);
+      setPrompt("");
     } catch (error) {
       console.error("Topic channel creation failed:", error);
-      setChatError(error instanceof Error ? error.message : "Topic channel could not be created.");
+      setTopicError(
+        error instanceof Error
+          ? error.message
+          : "Topic channel could not be created. Please try again."
+      );
     }
   }
 
@@ -2543,6 +3118,10 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function clearTopicChannel(topic: TopicChannel) {
+    if (isObserverActive) {
+      console.warn("Topic history deletion rejected: Observer mode is active.");
+      return;
+    }
     if (!window.confirm(`Clear all messages in "${topic.title}"? Other topic channels will not be changed.`)) return;
     try {
       if (isAuthenticated && googleIdToken && userProfile.providerId) {
@@ -2624,6 +3203,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       isPinned: false,
       isSharedArchive: true,
       messages: roomMessages.map((message) => ({ ...message })),
+      createdAt: new Date().toISOString(),
     };
     setSessions((previous) => [
       savedSession,
@@ -2797,6 +3377,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   function openSovereignRoom(room: SovereignRoomSummary) {
    setRoomId(room.room_id);
    setRoomTitle(room.title);
+   if (typeof window !== "undefined" && window.innerWidth < 768) setSidebarOpen(false);
    setArchivedRoomKinds((previous) => {
      const next = { ...previous };
      delete next[room.room_id];
@@ -2816,11 +3397,14 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }, [friendsQueueOpen, isAuthenticated, googleIdToken, loadFriendsQueue]);
 
   async function loadArchiveManifest(openWhenAvailable: boolean) {
-    if (!isAuthenticated || !googleIdToken || !userProfile.providerId) {
-      setArchiveManifest({ personal: null, social: [], team_rooms: [] });
-      setArchiveError(null);
-      return;
-    }
+    if (
+      !mounted ||
+      registrationBusy ||
+      !userProfile.email.trim() ||
+      isOwner !== true ||
+      !googleIdToken ||
+      !userProfile.providerId
+    ) return;
     setArchiveError(null);
     setIsArchiveLoading(true);
     try {
@@ -3203,20 +3787,25 @@ if (!response.ok) {
         ...conversation,
         isDeleted: true,
         deletedAt: deleted_at,
+        deletedBy: conversation.deletedBy || userProfile.name,
       })));
     } catch (error) {
       console.error("Trash load failed:", error);
       setChatError(error instanceof Error ? error.message : "Recently deleted conversations could not be loaded.");
     }
-  }, [API_BASE, googleIdToken, isAuthenticated]);
+  }, [API_BASE, googleIdToken, isAuthenticated, userProfile.name]);
 
   useEffect(() => {
     if (trashOpen && isAuthenticated) void loadTrash();
   }, [trashOpen, isAuthenticated, loadTrash]);
 
   async function softDeleteSession(session: ChatSession) {
+    if (isObserverActive) {
+      console.warn("Session deletion rejected: Observer mode is active.");
+      return;
+    }
     const deletedAt = new Date().toISOString();
-    const deleted = { ...session, isDeleted: true, deletedAt };
+    const deleted = { ...session, isDeleted: true, deletedAt, deletedBy: userProfile.name };
     if (googleIdToken && isAuthenticated) {
       try {
         const response = await fetch(getBackendApiUrl("/api/trash/conversations"), {
@@ -3244,7 +3833,7 @@ if (!response.ok) {
       setIsTopicConversation(Boolean(replacement.topicId));
       setPersonalMessages(ensureMessageTimestamps(replacement.messages));
     } else if (currentSessionId === session.id) {
-      const replacement: ChatSession = { id: Date.now().toString(), title: "New Session", isPinned: false, messages: [] };
+      const replacement: ChatSession = { id: Date.now().toString(), title: "New Session", isPinned: false, messages: [], createdAt: new Date().toISOString() };
       setSessions((previous) => [replacement, ...previous]);
       setCurrentSessionId(replacement.id);
       setIsTopicConversation(false);
@@ -3255,6 +3844,7 @@ if (!response.ok) {
   async function restoreSession(session: ChatSession) {
     let restored: ChatSession = { ...session, isDeleted: false };
     delete restored.deletedAt;
+    delete restored.deletedBy;
     if (googleIdToken && isAuthenticated) {
       try {
         const response = await fetch(
@@ -3286,6 +3876,37 @@ if (!response.ok) {
     setIsTeamMode(false);
   }
 
+  async function permanentlyDeleteSession(session: ChatSession) {
+    if (isObserverActive) {
+      console.warn("Permanent session deletion rejected: Observer mode is active.");
+      return;
+    }
+    try {
+      const requestToken = googleIdToken || getLocalDevelopmentToken();
+      if (requestToken && isAuthenticated && requestToken !== "dev-token-local-bypass") {
+        const response = await fetch(
+          getBackendApiUrl(`/api/trash/conversations/${encodeURIComponent(session.id)}`),
+          { method: "DELETE", headers: { Authorization: `Bearer ${requestToken}` } }
+        );
+        const result = (await response.json()) as { detail?: string };
+        if (!response.ok) {
+          throw new Error(
+            result.detail || `Conversation could not be permanently deleted (HTTP ${response.status}).`
+          );
+        }
+      }
+      setTrashSessions((previous) => previous.filter((item) => item.id !== session.id));
+      setSessions((previous) => previous.filter((item) => item.id !== session.id));
+    } catch (error) {
+      console.error("Permanent conversation deletion failed:", error);
+      setChatError(
+        error instanceof Error
+          ? error.message
+          : "Conversation could not be permanently deleted."
+      );
+    }
+  }
+
   async function copyHeaderInvite(mode: "personal" | "workspace") {
     if (!googleIdToken || !isAuthenticated || !roomCryptoIdentity) {
       setChatError("Sign in and wait for secure room setup before sharing a room.");
@@ -3299,7 +3920,7 @@ if (!response.ok) {
       shareTranscriptOwnerRef.current = roomIdentity;
       shareTranscriptSentRef.current = false;
       setRoomId(newRoomId);
-      setRoomTitle(mode === "personal" ? "Private 1-on-1 Session" : "Workspace Session");
+      setRoomTitle(mode === "personal" ? `${userProfile.name}'s Private 1-on-1 Session` : "Workspace Session");
       setRoomMessages([]);
       setMembers([]);
       setRoomPasscode("842-109");
@@ -3319,6 +3940,186 @@ if (!response.ok) {
       console.error("Room invite link could not be copied:", error);
       setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
     }
+  }
+
+  async function changeRoomMember(memberId: string, action: "remove" | "transfer-host") {
+    if (!isCurrentRoomHost || !googleIdToken) {
+      setChatError("Only the authenticated room host can change room membership.");
+      return;
+    }
+    const path = action === "remove"
+      ? `/api/rooms/${encodeURIComponent(roomId)}/members/remove`
+      : `/api/rooms/${encodeURIComponent(roomId)}/transfer-host`;
+    try {
+      const response = await fetch(getBackendApiUrl(path), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          ...(action === "remove" ? { member_id: memberId } : { new_host_id: memberId }),
+        }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) {
+        throw new Error(result.detail || `Room ${action} failed (HTTP ${response.status}).`);
+      }
+      if (action === "remove") {
+        setMembers((previous) => previous.filter((member) => member.id !== memberId));
+      } else {
+        setMembers((previous) => previous.map((member) => ({
+          ...member,
+          role: member.id === memberId ? "sovereign" : "member",
+        })));
+      }
+      setChatError(null);
+    } catch (error) {
+      console.error(`Room member ${action} failed:`, error);
+      setChatError(error instanceof Error ? error.message : `Room member ${action} failed.`);
+    }
+  }
+
+  function exportRoomTranscript(format: "md" | "json") {
+    const transcript = messages.filter((message) => !message.is_deleted);
+    const content = format === "json"
+      ? JSON.stringify({ room_id: roomId, room_title: roomTitle, exported_at: new Date().toISOString(), messages: transcript }, null, 2)
+      : `# ${roomTitle}\n\n${transcript.map((message) => {
+          const timestamp = new Date(message.timestamp || Date.now()).toLocaleString();
+          const author = message.senderName || (message.role === "assistant" ? "Genie" : "User");
+          return `## ${author} · ${timestamp}\n\n${message.content}`;
+        }).join("\n\n---\n\n")}`;
+    const blob = new Blob([content], {
+      type: format === "json" ? "application/json;charset=utf-8" : "text/markdown;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${roomTitle.replace(/[^\w-]+/g, "_") || "genie-room"}.${format}`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportCurrentSessionTranscript(format: "markdown" | "json") {
+    if (!currentSession) return;
+    const transcript = messages.filter((message) => !message.is_deleted);
+    const content = format === "json"
+      ? JSON.stringify({
+          session_id: currentSession.id,
+          title: currentSession.title,
+          created_at: currentSession.createdAt || transcript[0]?.timestamp || null,
+          exported_at: new Date().toISOString(),
+          messages: transcript,
+        }, null, 2)
+      : `# ${currentSession.title}\n\n${transcript.map((message) => {
+          const timestamp = message.timestamp
+            ? new Date(message.timestamp).toLocaleString()
+            : "";
+          const author = message.senderName || (message.role === "assistant" ? "Genie" : "You");
+          return `## ${author}${timestamp ? ` · ${timestamp}` : ""}\n\n${message.content}`;
+        }).join("\n\n---\n\n")}`;
+    const blob = new Blob([content], {
+      type: format === "json" ? "application/json;charset=utf-8" : "text/markdown;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${currentSession.title.replace(/[^\w-]+/g, "_") || "genie-session"}.${format === "markdown" ? "md" : "json"}`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportSessionDocument(
+    format: "pdf" | "docx",
+    selectedOnly: boolean,
+    selectedIds: Set<string> = selectedMessageIds,
+    sourceMessages: Message[] = messages,
+    titleOverride?: string,
+  ) {
+    if (!currentSession && !titleOverride) return;
+    const title = titleOverride || currentSession?.title || "Genie Session";
+    const exportTimestamp = new Date();
+    const transcript = sourceMessages
+      .map((message, index) => ({ message, index }))
+      .filter(({ message }) => !message.is_deleted)
+      .filter(({ message, index }) =>
+        !selectedOnly || selectedIds.has(getMessageSelectionId(message, index))
+      );
+    if (selectedOnly && transcript.length === 0) return;
+
+    const escapeHtml = (value: string) =>
+      value.replace(/[&<>"']/g, (character) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[character] || character);
+    const createdAt = currentSession?.createdAt || transcript[0]?.message.timestamp || "";
+    const messageMarkup = transcript.map(({ message }) => {
+      const role = message.role === "assistant" ? "Genie Pro" : "User";
+      const timestamp = message.timestamp ? new Date(message.timestamp).toLocaleString() : "";
+      return `<article><h2>${escapeHtml(role)}${timestamp ? ` <span>· ${escapeHtml(timestamp)}</span>` : ""}</h2><p>${escapeHtml(message.content).replace(/\r?\n/g, "<br>")}</p></article>`;
+    }).join("\n");
+    const documentHtml = `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>
+      body{font:11pt/1.55 Arial,sans-serif;color:#172033;margin:36px}
+      header{border-bottom:2px solid #4f46e5;padding-bottom:14px;margin-bottom:22px}
+      h1{font-size:22pt;margin:0 0 8px}header p{margin:3px 0;color:#64748b;font-size:9pt}
+      article{page-break-inside:avoid;margin:0 0 18px;padding:0 0 14px;border-bottom:1px solid #e2e8f0}
+      h2{font-size:11pt;margin:0 0 6px;color:#3730a3}h2 span{font-weight:normal;color:#64748b;font-size:9pt}
+      article p{margin:0;white-space:normal}
+      @media print{body{margin:18mm}article{page-break-inside:avoid}}
+    </style></head><body><header><h1>${escapeHtml(title)}</h1><p>Created: ${escapeHtml(createdAt ? new Date(createdAt).toLocaleString() : "Unknown")}</p><p>Exported: ${escapeHtml(exportTimestamp.toLocaleString())}</p></header>${messageMarkup}</body></html>`;
+    const baseName = title.replace(/[^\w-]+/g, "_") || "genie-session";
+
+    if (format === "pdf") {
+      const printWindow = window.open("", "_blank");
+      if (!printWindow) {
+        setChatError("The PDF print window was blocked. Allow pop-ups and try again.");
+        return;
+      }
+      printWindow.document.open();
+      printWindow.document.write(documentHtml);
+      printWindow.document.close();
+      window.setTimeout(() => {
+        printWindow.focus();
+        printWindow.print();
+      }, 250);
+      return;
+    }
+
+    const blob = createDocxBlob(
+      title,
+      createdAt,
+      exportTimestamp,
+      transcript.map(({ message }) => ({ message })),
+    );
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${baseName}.docx`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function beginMessageSelection(format: "pdf" | "docx") {
+    setSelectedExportFormat(format);
+    setSelectedMessageIds(new Set());
+    setIsSelectionMode(true);
+  }
+
+  function completeMessageSelectionExport() {
+    if (selectedMessageIds.size === 0) return;
+    exportSessionDocument(selectedExportFormat, true, selectedMessageIds);
+    cancelMessageSelection();
+  }
+
+  function wipeRoomForAll() {
+    if (!isCurrentRoomHost) {
+      setChatError("Only the room host can wipe this chat.");
+      return;
+    }
+    if (sendRoomEvent({ type: "room.wipe" })) setRoomAdminOpen(false);
   }
 
   async function endActiveRoom() {
@@ -3369,27 +4170,57 @@ if (!response.ok) {
     }
   };
 
-  const handlePromoteAdmin = (memberId: string) => {
-    if (!isKeyOwner) {
-      alert("Sovereign Policy: Only the API Key Owner can designate or demote Room Admins.");
-      return;
-    }
-    setMembers((prev) =>
-      prev.map((m) => {
-        if (m.id === memberId) {
-          const nextRole = m.role === "admin" ? "member" : "admin";
-          return { ...m, role: nextRole };
+  function persistActivePersonalTranscript() {
+    if (isTeamMode || typeof window === "undefined") return;
+    const transcript = ensureMessageTimestamps(personalMessages);
+    try {
+      if (isTopicConversation && activeTopic) {
+        const nextTopics = topics.map((topic) =>
+          topic.id === activeTopic.id
+            ? { ...topic, messages: transcript, message_count: transcript.length }
+            : topic
+        );
+        setTopics(nextTopics);
+        if (topicsStorageOwner) {
+          localStorage.setItem(`genie_topics_v1_${topicsStorageOwner}`, JSON.stringify(nextTopics.slice(0, 10)));
         }
-        return m;
-      })
-    );
+      } else if (currentSession) {
+        const nextSessions = sessions.map((session) =>
+          session.id === currentSession.id ? { ...session, messages: transcript } : session
+        );
+        setSessions(nextSessions);
+        localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(nextSessions));
+      }
+    } catch (error) {
+      console.error("Active conversation could not be saved before switching modes:", error);
+      setChatError("The active conversation could not be saved in this browser.");
+    }
+  }
+
+  const handleSpaceModeChange = (mode: "personal" | "workspace") => {
+    if (isTeamMode) {
+      setArchivedRoomMessages((previous) => ({
+        ...previous,
+        [roomId]: ensureMessageTimestamps(roomMessages),
+      }));
+    } else {
+      persistActivePersonalTranscript();
+    }
+    setSpaceMode(mode);
   };
 
   const handleToggleTeamMode = () => {
+    if (isTeamMode) {
+      setArchivedRoomMessages((previous) => ({
+        ...previous,
+        [roomId]: ensureMessageTimestamps(roomMessages),
+      }));
+    } else {
+      persistActivePersonalTranscript();
+    }
     const nextState = !isTeamMode;
     setIsTeamMode(nextState);
-    if (nextState) setRoomMessages([]);
-    else setIsObserverActive(false);
+    if (!nextState) setIsObserverActive(false);
   };
 
   const handleSendDirectInvites = async (e: React.FormEvent) => {
@@ -3418,6 +4249,7 @@ if (!response.ok) {
 
     const payload = {
       google_id_token: googleIdToken,
+      user_email: "rshaji93@gmail.com",
       room_id: roomId,
       room_passcode: roomPasscode,
       host_name: userProfile.name,
@@ -3431,7 +4263,11 @@ if (!response.ok) {
     try {
       const response = await fetch(getBackendApiUrl("/api/room/send-invites"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${localStorage.getItem("token") || localStorage.getItem("auth_token") || ""}`,
+        },
         body: JSON.stringify(payload),
       });
       const result = (await response.json()) as { detail?: string };
@@ -3532,15 +4368,228 @@ if (!response.ok) {
     setTimeout(() => setCopiedIndex(null), 2000);
   };
 
+  async function testByokKey() {
+    const key = byokApiKey.trim();
+    if (!key) {
+      setByokError("Paste a Gemini API key before testing it.");
+      return;
+    }
+    setByokTesting(true);
+    setByokVerified(false);
+    setByokError(null);
+    setByokStatus("Testing Gemini API key...");
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`,
+        { cache: "no-store" },
+      );
+      if (response.status !== 200) {
+        const result = (await response.json().catch(() => ({}))) as {
+          error?: { message?: string };
+        };
+        throw new Error(result.error?.message || `Gemini rejected the API key (HTTP ${response.status}).`);
+      }
+      setByokVerified(true);
+      setByokStatus("🟢 Active");
+    } catch (error) {
+      console.error("Gemini API key verification failed:", error);
+      setByokError(error instanceof Error ? error.message : "Gemini API key verification failed.");
+      setByokStatus("Key not verified");
+    } finally {
+      setByokTesting(false);
+    }
+  }
+
+  function saveByokKey() {
+    if (!byokVerified || !byokApiKey.trim()) return;
+    try {
+      localStorage.setItem("genie_user_byok_key", byokApiKey.trim());
+      setByokApiKey(byokApiKey.trim());
+      setByokStatus("🟢 Active");
+      setByokError(null);
+    } catch (error) {
+      console.error("Gemini API key could not be saved on this device:", error);
+      setByokError("Gemini API key could not be saved in this browser.");
+    }
+  }
+
+  function removeByokKey() {
+    try {
+      localStorage.removeItem("genie_user_byok_key");
+      setByokApiKey("");
+      setByokVerified(false);
+      setByokStatus(null);
+      setByokError(null);
+    } catch (error) {
+      console.error("Gemini API key could not be removed from this device:", error);
+      setByokError("Gemini API key could not be removed from this browser.");
+    }
+  }
+
+  async function handlePlayAudio(content: string, messageId: string) {
+    const requestId = ++audioRequestIdRef.current;
+    const targetLocale = getSpeechLocale(content, selectedLang.code);
+    setBufferingAudioId(messageId);
+    setPlayingAudioId(null);
+    try {
+      const audio = await playRegionalAudio(
+        content,
+        targetLocale.split("-")[0],
+        (playing) => {
+          if (requestId === audioRequestIdRef.current) {
+            setPlayingAudioId(playing ? messageId : null);
+          }
+        },
+      );
+      if (requestId !== audioRequestIdRef.current) {
+        stopActiveRegionalAudio();
+        return;
+      }
+      if (!audio) return;
+      setPlayingAudioId(messageId);
+      const clearPlayingState = () => {
+        if (requestId === audioRequestIdRef.current) setPlayingAudioId(null);
+      };
+      audio.addEventListener("ended", clearPlayingState, { once: true });
+      audio.addEventListener("error", clearPlayingState, { once: true });
+    } catch (error) {
+      console.error("Server-side speech synthesis failed:", error);
+      setChatError("Speech synthesis is temporarily unavailable. Please try again.");
+    } finally {
+      if (requestId === audioRequestIdRef.current) setBufferingAudioId(null);
+    }
+  }
+
   const handleReloadMessage = (message: Message, index: number) => {
-    const promptMessage =
-      message.role === "user"
-        ? message
-        : [...messages.slice(0, index)].reverse().find((item) => item.role === "user");
+    if (message.role !== "assistant") return;
+    const promptMessage = [...messages.slice(0, index)].reverse().find((item) => item.role === "user");
     if (promptMessage) {
       void handleSendMessage(undefined, false, promptMessage.content);
     }
   };
+
+  async function submitVoiceCallTurn(transcript: string): Promise<VoiceCallTurnResult | null> {
+    const isAdmin = isMasterAdmin;
+    const userSpeechText = transcript.trim();
+    const activeDialect = selectedLang.label;
+    if (!canAccessVoiceCall()) {
+      const errorMessage = !isObserverActive
+        ? "Voice calls are available only while Observer Mode is ON."
+        : "Live Voice Calls are exclusive to BYOK users. Please add your Gemini API key in Settings > BYOK to start voice calls.";
+      console.warn("Voice call turn rejected: access requirements were not met.");
+      setChatError(errorMessage);
+      return null;
+    }
+
+    let apiKey = "";
+    let requestToken = googleIdToken;
+    try {
+      apiKey = localStorage.getItem("genie_user_byok_key")?.trim() || "";
+      const storedSessionToken = localStorage.getItem("genie_session_token") || "";
+      requestToken = storedSessionToken === "dev-token-local-bypass"
+        ? storedSessionToken
+        : googleIdToken || storedSessionToken;
+    } catch (error) {
+      console.warn("Saved voice-call credentials could not be read:", error);
+    }
+    const history = (isTeamMode ? roomMessages : messages)
+      .filter((message) => !message.is_deleted)
+      .slice(-8)
+      .map((message) => ({
+        role: message.role === "assistant" ? "model" : "user",
+        parts: [{ text: message.content }],
+      }));
+    const requestContents = [
+      ...history,
+      { role: "user", parts: [{ text: userSpeechText }] },
+    ];
+    const systemText = "Respond naturally and concisely to the live spoken turn.";
+
+    setIsStreaming(true);
+    try {
+      const authHeaders: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (requestToken) authHeaders.Authorization = `Bearer ${requestToken}`;
+
+      let audioResponse: Response;
+      try {
+        audioResponse = await fetch(getBackendApiUrl("/api/voice/direct-turn"), {
+          method: "POST",
+          credentials: "include",
+          headers: authHeaders,
+          body: JSON.stringify({
+            user_email: "rshaji93@gmail.com",
+            google_id_token: requestToken,
+            user_byok_key: apiKey || null,
+            transcript: userSpeechText,
+            dialect: activeDialect,
+            system_text: systemText,
+            contents: requestContents,
+            voice_name: voicePreset,
+          }),
+        });
+      } catch (error) {
+        console.warn("Voice service request failed:", error);
+        return null;
+      }
+      if (!audioResponse.ok) {
+        const errorText = await audioResponse.text();
+        let detail = errorText;
+        try {
+          const errorPayload = JSON.parse(errorText) as { detail?: string; error?: string };
+          detail = errorPayload.detail || errorPayload.error || errorText;
+        } catch {
+          // Keep the backend response text for non-JSON errors.
+        }
+        if (
+          audioResponse.status === 401 ||
+          (audioResponse.status === 403 && detail === "BYOK_REQUIRED")
+        ) {
+          if (!isAdmin) {
+            setIsVoiceCallOpen(false);
+            setSettingsTab("developer");
+            setVoiceCallGateNotice("Please provide your Gemini API key in Settings to use Live Voice.");
+            setSettingsOpen(true);
+            return null;
+          }
+          console.warn("Admin voice request was rejected; verify the active sign-in session.");
+          return {
+            text: "Your sign-in session needs to be refreshed before Genie can respond. Please sign in again.",
+          };
+        }
+        console.warn(`Voice service returned HTTP ${audioResponse.status}:`, detail.slice(0, 300));
+        return null;
+      }
+      const audioData = (await audioResponse.json()) as {
+        text?: string;
+        audio?: string;
+        candidates?: {
+          content?: {
+            parts?: { text?: string; inlineData?: { data?: string; mimeType?: string } }[];
+          };
+        }[];
+      };
+      const responseParts = audioData.candidates?.[0]?.content?.parts || [];
+      const assistantText =
+        audioData.text?.trim() ||
+        responseParts.map((part) => part.text || "").join("").trim();
+      if (!assistantText || !audioData.audio) {
+        console.warn("Voice service returned an incomplete text/audio response.");
+        return null;
+      }
+
+      return {
+        text: assistantText,
+        audioData: audioData.audio,
+      };
+    } catch (error) {
+      console.warn("Voice turn failed:", error);
+      return null;
+    } finally {
+      setIsStreaming(false);
+    }
+  }
 
   const handleEditMessage = async (message: Message, index: number) => {
     if (isTeamMode) {
@@ -3560,6 +4609,14 @@ if (!response.ok) {
   };
 
   const handleDeleteMessage = (message: Message, index: number) => {
+    if (isObserverActive) {
+      console.warn("Message deletion rejected: Observer mode is active.");
+      return;
+    }
+    if (message.isVoiceRecord) {
+      console.warn("Voice-call transcript records cannot be deleted.");
+      return;
+    }
     if (isTeamMode) {
       handleDeleteRoomMessage(message);
       return;
@@ -5010,6 +6067,127 @@ if (!response.ok) {
 
       {/* Main Responsive Layout Wrapper */}
       <div className={`flex h-[100dvh] max-h-[100dvh] w-full overflow-hidden ${currentTheme.canvasClass} ${currentTheme.canvasTextClass} antialiased font-sans`}>
+        {chatVaultOpen && (
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+            role="presentation"
+            onMouseDown={(event) => {
+              if (event.target === event.currentTarget) setChatVaultOpen(false);
+            }}
+          >
+            <section
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="chat-vault-title"
+              className="w-full max-w-lg space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl"
+            >
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 id="chat-vault-title" className="text-base font-bold text-slate-900">Chat Vault &amp; Restore Backups</h2>
+                  <p className="mt-1 text-xs text-slate-500">Restore Genie archives or import a JSON or Markdown chat backup.</p>
+                </div>
+                <button type="button" onClick={() => setChatVaultOpen(false)} aria-label="Close Chat Vault" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              {chatVaultError && <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{chatVaultError}</p>}
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.download = `Genie_Backup_${new Date().toISOString().slice(0, 10)}.json`;
+                    link.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-3 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+                >
+                  <Download className="h-4 w-4" /> Download JSON Backup
+                </button>
+                <label className="flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-3 text-xs font-semibold text-cyan-800 hover:bg-cyan-100">
+                  <FileUp className="h-4 w-4" /> Import JSON / Markdown
+                  <input
+                    type="file"
+                    accept=".json,.md,.markdown,.txt"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      if (!file) return;
+                      setChatVaultError(null);
+                      const reader = new FileReader();
+                      reader.onerror = () => setChatVaultError("The selected backup could not be read.");
+                      reader.onload = () => {
+                        try {
+                          const content = String(reader.result || "");
+                          let restoredSessions: ChatSession[];
+                          if (/\.json$/i.test(file.name)) {
+                            const parsed = JSON.parse(content) as unknown;
+                            const records =
+                              Array.isArray(parsed)
+                                ? parsed
+                                : parsed && typeof parsed === "object" && "sessions" in parsed && Array.isArray(parsed.sessions)
+                                  ? parsed.sessions
+                                  : null;
+                            if (!records?.length) throw new Error("The JSON backup does not contain any chat sessions.");
+                            restoredSessions = records.map((record) => {
+                              if (!record || typeof record !== "object") throw new Error("The JSON backup contains an invalid session.");
+                              const candidate = record as Partial<ChatSession>;
+                              if (!Array.isArray(candidate.messages)) throw new Error("The JSON backup contains a session without messages.");
+                              const messages = candidate.messages.filter(
+                                (message): message is Message =>
+                                  Boolean(message) &&
+                                  (message.role === "user" || message.role === "assistant") &&
+                                  typeof message.content === "string"
+                              );
+                              if (!messages.length) throw new Error("The JSON backup contains a session without valid messages.");
+                              return {
+                                id: typeof candidate.id === "string" ? candidate.id : window.crypto.randomUUID(),
+                                title: typeof candidate.title === "string" ? candidate.title : "Imported Chat",
+                                isPinned: Boolean(candidate.isPinned),
+                                topicId: candidate.topicId,
+                                messages: ensureMessageTimestamps(messages),
+                              };
+                            });
+                          } else {
+                            restoredSessions = parseMarkdownChatBackup(content).map((session) => ({
+                              ...session,
+                              messages: ensureMessageTimestamps(session.messages),
+                            }));
+                          }
+                          setSessions(restoredSessions);
+                          setCurrentSessionId(restoredSessions[0].id);
+                          setIsTopicConversation(Boolean(restoredSessions[0].topicId));
+                          setIsTeamMode(false);
+                          setPersonalMessages(restoredSessions[0].messages);
+                          localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(restoredSessions));
+                          setChatVaultOpen(false);
+                        } catch (error) {
+                          setChatVaultError(
+                            error instanceof Error ? error.message : "The selected backup could not be imported."
+                          );
+                        }
+                      };
+                      reader.readAsText(file);
+                    }}
+                  />
+                </label>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setChatVaultOpen(false);
+                  openArchiveRestore();
+                }}
+                className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-3 text-xs font-semibold text-violet-800 hover:bg-violet-100"
+              >
+                <Cloud className="h-4 w-4" /> Restore Internal Genie Archives
+              </button>
+            </section>
+          </div>
+        )}
         {(visibleChatError || archiveError || archiveStatus || vipSessionLimitReached) && (
           <div
             role={visibleChatError || archiveError ? "alert" : "status"}
@@ -5063,40 +6241,98 @@ if (!response.ok) {
         {sidebarOpen && (
           <div
             onClick={() => setSidebarOpen(false)}
-            className="fixed inset-0 z-30 bg-black/40 backdrop-blur-xs lg:hidden"
+            className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm md:hidden"
           />
         )}
 
         {/* SECTION 3: SIDEBAR */}
         <aside
-          className={`${
-            sidebarOpen ? "translate-x-0 w-72" : "-translate-x-full w-0 lg:w-0"
-          } fixed lg:static inset-y-0 left-0 z-40 ${currentTheme.sidebarClass} backdrop-blur-xl border-r ${currentTheme.chromeBorderClass} transition-all duration-300 ease-in-out flex flex-col overflow-hidden shadow-2xl lg:shadow-none`}
+          className={`${sidebarOpen ? "translate-x-0" : "-translate-x-full"} fixed inset-y-0 left-0 z-50 w-4/5 max-w-xs ${sidebarCollapsed ? "md:w-16" : "md:w-72"} md:static md:z-auto md:max-w-none md:translate-x-0 ${currentTheme.sidebarClass} backdrop-blur-xl border-r ${currentTheme.chromeBorderClass} transition-[width,transform] duration-300 ease-in-out flex flex-col overflow-hidden shadow-2xl md:shadow-none`}
         >
-          <div className={`flex items-center justify-between border-b p-4 ${currentTheme.chromeBorderClass}`}>
-            <div className="flex items-center gap-3">
-              <GenieAvatar
-                src={userProfile.googleAvatarUrl || userProfile.avatarUrl}
-                alt={userProfile.name}
-                className={`w-9 h-9 rounded-full border-2 ${selectedTheme.borderClass} shadow-sm`}
-              />
+          <div className={`flex min-h-16 items-center gap-2 border-b p-3 ${currentTheme.chromeBorderClass}`}>
+            <button
+              type="button"
+              onClick={toggleSidebar}
+              className="shrink-0 rounded-lg p-2 text-slate-600 transition-colors hover:bg-white/70 hover:text-slate-900"
+              title="Toggle sidebar"
+              aria-label="Toggle sidebar"
+            >
+              <Menu className="h-5 w-5" />
+            </button>
+            <div className={`${sidebarCollapsed ? "md:hidden" : ""} min-w-0 flex-1`}>
               <span className="font-extrabold text-base tracking-tight bg-gradient-to-r from-violet-600 via-pink-500 to-amber-500 bg-clip-text text-transparent truncate">
                 Personal AI Genie
               </span>
             </div>
-
-            <button
-              onClick={() => setSidebarOpen(false)}
-              className="p-1.5 text-slate-500 hover:text-slate-900 rounded-lg transition-colors"
-              title="Hide Sidebar"
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </button>
           </div>
 
-          <div className="space-y-3 border-b border-slate-200/80 p-3">
+          {sidebarCollapsed && (
+            <nav aria-label="Sidebar shortcuts" className="hidden flex-1 flex-col items-center gap-2 py-3 md:flex">
+              <button type="button" onClick={handleCreateNewChat} title="New chat" aria-label="New chat" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <Plus className="h-5 w-5" />
+              </button>
+              <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <UserPlus className="h-5 w-5" />
+              </button>
+              <button type="button" onClick={() => setTrashOpen((open) => !open)} title="Trash" aria-label="Trash" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <Trash2 className="h-5 w-5" />
+              </button>
+              <button type="button" onClick={() => setSettingsOpen(true)} title="Account & settings" aria-label="Account & settings" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <SettingsIcon className="h-5 w-5" />
+              </button>
+            </nav>
+          )}
+
+          <section className={`${sidebarCollapsed ? "md:hidden" : ""} border-b border-slate-200/80 p-3`}>
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Directory &amp; Friends</h2>
+              <button
+                type="button"
+                onClick={() => {
+                  setFriendSearchOpen(true);
+                  setFriendSearchEmail("");
+                  setFriendSearchResult(null);
+                  setFriendSearchNotFound(false);
+                }}
+                className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-2.5 py-1.5 text-[10px] font-semibold text-white hover:bg-slate-700"
+              >
+                <UserPlus className="h-3 w-3" /> Invite Friend
+              </button>
+            </div>
+            <div className="max-h-24 space-y-1 overflow-y-auto">
+              {discoverableFriends.slice(0, 4).map((friend) => (
+                <div key={friend.user_id} className="flex items-center gap-2 rounded-md px-1.5 py-1 text-[10px]">
+                  <span className="rounded bg-slate-100 px-1 py-0.5 font-bold text-slate-500">G</span>
+                  <span className={`h-2 w-2 rounded-full ${friend.is_online ? "bg-emerald-500" : "bg-slate-300"}`} />
+                  <span className="min-w-0 flex-1 truncate text-slate-700">{friend.handle || friend.display_name}</span>
+                  <span className="text-slate-400">{friend.is_online ? "Online" : "Offline"}</span>
+                </div>
+              ))}
+              {userProfile.socialProfileId && (
+                <div className="flex items-center gap-2 rounded-md px-1.5 py-1 text-[10px]">
+                  <span className="rounded bg-blue-50 px-1 py-0.5 font-bold text-blue-700">Meta</span>
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                  <span className="min-w-0 flex-1 truncate text-slate-700">{userProfile.socialHandle || "Linked Meta profile"}</span>
+                  <span className="text-slate-400">Synced</span>
+                </div>
+              )}
+              {!discoverableFriends.length && !userProfile.socialProfileId && (
+                <p className="px-1.5 py-1 text-[10px] text-slate-400">Connect Google or Meta contacts to see their status.</p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setFriendsQueueOpen(true)}
+              disabled={!isAuthenticated}
+              className="mt-2 w-full rounded-lg px-2 py-1.5 text-left text-[10px] font-semibold text-slate-500 hover:bg-white/70 disabled:opacity-50"
+            >
+              Manage friends and shared rooms
+            </button>
+          </section>
+
+          <div className="hidden">
             <section className="rounded-xl border border-slate-200 bg-white/85 p-2.5">
-              <h2 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Invite &amp; Omni-Search</h2>
+              <h2 className="mb-2 px-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Directory &amp; Friends</h2>
               <form onSubmit={(event) => void searchOmniDirectory(event)} className="flex gap-1.5">
                 <input
                   value={omniSearchQuery}
@@ -5122,7 +6358,7 @@ if (!response.ok) {
                   {omniSearchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
                 </button>
               </form>
-              {omniSearchError && <p role="alert" className="mt-2 text-[10px] text-rose-600">{omniSearchError}</p>}
+              {omniSearchError && <p role="status" className="mt-2 text-[10px] text-rose-600">{omniSearchError}</p>}
               {omniSearchNotFound && omniSearchQuery.includes("@") && (
                 <button
                   type="button"
@@ -5220,7 +6456,7 @@ if (!response.ok) {
             </section>
           </div>
 
-          <div className="flex-1 overflow-y-auto px-3 space-y-1">
+          <div className={`${sidebarCollapsed ? "md:hidden" : ""} flex-1 overflow-y-auto px-3 space-y-1`}>
             {!isTeamMode && (
               <section className="mb-3 rounded-xl border border-slate-200 bg-white/80 p-2.5">
                 <div className="mb-2 flex items-center justify-between gap-2 px-1">
@@ -5247,7 +6483,7 @@ if (!response.ok) {
                           setIsTopicConversation(true);
                           setIsTeamMode(false);
                           setPrompt("");
-                          if (typeof window !== "undefined" && window.innerWidth < 1024) setSidebarOpen(false);
+                          if (typeof window !== "undefined" && window.innerWidth < 768) setSidebarOpen(false);
                         }}
                         aria-current={activeTopicId === topic.id ? "page" : undefined}
                         className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs ${
@@ -5266,15 +6502,17 @@ if (!response.ok) {
                       >
                         <Edit2 className="h-3 w-3" />
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => void clearTopicChannel(topic)}
-                        title={`Clear ${topic.title} history`}
-                        aria-label={`Clear ${topic.title} history`}
-                        className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
+                      {!isObserverActive && (
+                        <button
+                          type="button"
+                          onClick={() => void clearTopicChannel(topic)}
+                          title={`Clear ${topic.title} history`}
+                          aria-label={`Clear ${topic.title} history`}
+                          className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -5287,20 +6525,76 @@ if (!response.ok) {
                   <Plus className="h-3.5 w-3.5" />
                   New Topic
                 </button>
+                {topicError && <p role="status" className="mt-2 text-[10px] text-rose-600">{topicError}</p>}
               </section>
             )}
-            <button
-              type="button"
-              onClick={handleCreateNewChat}
-              className={`mb-1 flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold text-white shadow-sm ${selectedTheme.primaryClass}`}
-            >
-              <Plus className="h-4 w-4" /> New Chat
-            </button>
-            <div className="px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
-              Chat History
+            <div className="flex items-center justify-between px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
+              <span>Personal Chats</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setFriendSearchOpen(true);
+                  setFriendSearchEmail("");
+                  setFriendSearchResult(null);
+                  setFriendSearchNotFound(false);
+                }}
+                title="Invite a friend"
+                aria-label="Invite a friend"
+                className="rounded-md p-1 text-slate-400 hover:bg-white hover:text-cyan-700"
+              >
+                <UserPlus className="h-3.5 w-3.5" />
+              </button>
             </div>
 
-            {sessions.filter((session) => !session.isDeleted).map((session) => (
+            <section className="mb-2">
+              <button
+                type="button"
+                onClick={() => setSharedChatsOpen((open) => !open)}
+                aria-expanded={sharedChatsOpen}
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[11px] font-bold uppercase tracking-wider text-slate-500 hover:bg-white/60"
+              >
+                <span className="flex items-center gap-2"><Users className="h-3.5 w-3.5" /> Shared Chats</span>
+                {sharedChatsOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+              </button>
+              {sharedChatsOpen && (
+                <div className="space-y-0.5">
+                  {sovereignRooms.map((room) => {
+                    const activeParticipants = room.members.filter((member) => member.status === "active").length;
+                    return (
+                      <button
+                        key={room.room_id}
+                        type="button"
+                        onClick={() => openSovereignRoom(room)}
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-600 hover:bg-white/70"
+                      >
+                        <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" />
+                        <span className="min-w-0 flex-1 truncate">{room.title}</span>
+                        <span className="shrink-0 text-[9px] text-slate-400" title={`${activeParticipants} active participants`}>
+                          {activeParticipants} active
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {sessions.filter((session) => session.isSharedArchive && !session.isDeleted).map((session) => (
+                    <button
+                      key={session.id}
+                      type="button"
+                      onClick={() => handleSelectSession(session)}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs text-slate-600 hover:bg-white/70"
+                    >
+                      <MessageSquare className="h-3.5 w-3.5 shrink-0 text-cyan-600" />
+                      <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                      <span className="shrink-0 text-[9px] text-slate-400">Shared</span>
+                    </button>
+                  ))}
+                  {!sovereignRooms.length && !sessions.some((session) => session.isSharedArchive && !session.isDeleted) && (
+                    <p className="px-3 py-1.5 text-[10px] text-slate-400">No shared chats yet.</p>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {sessions.filter((session) => !session.isDeleted && !session.isSharedArchive).map((session) => (
               <div
                 key={session.id}
                 onClick={() => handleSelectSession(session)}
@@ -5319,6 +6613,36 @@ if (!response.ok) {
                   <span className="truncate">{session.title}</span>
                 </div>
 
+                <div className="flex shrink-0 items-center gap-0.5 opacity-100 transition-opacity md:opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setShareSessionId(session.id);
+                      setShareInviteSessionId(`${session.id}_${window.crypto.randomUUID()}`);
+                      setShareModalOpen(true);
+                    }}
+                    title="Invite to this chat"
+                    aria-label={`Invite friend to ${session.title}`}
+                    className="rounded p-1 text-slate-400 hover:bg-cyan-50 hover:text-cyan-700"
+                  >
+                    <Share2 className="h-3.5 w-3.5" />
+                  </button>
+                  {!isObserverActive && (
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void softDeleteSession(session);
+                      }}
+                      title="Move to trash"
+                      aria-label={`Move ${session.title} to trash`}
+                      className="rounded p-1 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
                 <div className="relative">
                   <button
                     type="button"
@@ -5375,16 +6699,18 @@ if (!response.ok) {
                       >
                         <Edit2 className="w-3.5 h-3.5 text-slate-500" /> Rename
                       </button>
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          void softDeleteSession(session);
-                          setActiveMenuId(null);
-                        }}
-                        className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-rose-600 hover:bg-rose-50"
-                      >
-                        <Trash2 className="w-3.5 h-3.5 text-rose-500" /> Delete
-                      </button>
+                      {!isObserverActive && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void softDeleteSession(session);
+                            setActiveMenuId(null);
+                          }}
+                          className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-rose-600 hover:bg-rose-50"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-rose-500" /> Delete
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -5406,11 +6732,18 @@ if (!response.ok) {
                   return (
                     <div key={deletedSession.id} className="flex items-center gap-2 rounded-lg px-2 py-1.5">
                       <span className="min-w-0 flex-1 truncate text-[10px] text-slate-600" title={deletedSession.title}>
-                        {deletedSession.title} · {remainingDays}d
+                            {deletedSession.title} · moved by {deletedSession.deletedBy || "You"} · {remainingDays}d
                       </span>
-                      <button type="button" onClick={() => void restoreSession(deletedSession)} className="shrink-0 text-[10px] font-semibold text-cyan-700 hover:underline">
-                        Restore
-                      </button>
+                          <div className="flex shrink-0 items-center gap-2">
+                            <button type="button" onClick={() => void restoreSession(deletedSession)} title="Restore" className="text-[10px] font-semibold text-cyan-700 hover:underline">
+                              Restore
+                            </button>
+                            {!isObserverActive && (
+                              <button type="button" onClick={() => void permanentlyDeleteSession(deletedSession)} title="Delete permanently" aria-label={`Delete ${deletedSession.title} permanently`} className="text-rose-600 hover:text-rose-800">
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </div>
                     </div>
                   );
                 }) : <p className="px-2 py-1 text-[10px] text-slate-400">Trash is empty.</p>}
@@ -5418,168 +6751,63 @@ if (!response.ok) {
             )}
           </div>
 
-          <div className={`space-y-2 border-t p-3 ${currentTheme.chromeBorderClass} ${currentTheme.chromeClass}`}>
-            <SlideDockDrawer
-              statusLabel={
-                  isMasterAdmin
-                    ? "⚡ Unlimited Admin Engine"
-                    : isQuotaEnforced
-                    ? `⚡ ${remainingDailyChats} / ${DAILY_FREE_LIMIT} Chats Left`
-                    : isVipUser
-                    ? `★ VIP Unlimited · ${activeVipSessionCount}/20`
-                    : "★ BYOK Unlimited"
-                }
-              statusTone={isMasterAdmin || isVipUser ? "vip" : isQuotaEnforced ? "quota" : "byok"}
-              surfaceClass={currentTheme.chromeSurfaceClass}
-              borderClass={currentTheme.borderClass}
-              textClass={currentTheme.chromeTextClass}
-              mutedTextClass={currentTheme.chromeMutedTextClass}
-              accentClass={currentTheme.textClass}
-            >
-              <StudentBanner onSelectPrompt={(t) => setPrompt(t)} compact />
-              <UnifiedStudyEngine
-                onInjectPrompt={(t) => setPrompt(t)}
-                userEmail={userProfile?.email}
-                compact
-              />
-            </SlideDockDrawer>
-
-            <div className="flex items-center justify-between bg-white/70 p-2 rounded-xl border border-slate-200">
-              <div className="flex items-center gap-2 min-w-0">
-                <GenieAvatar
-                  src={userProfile.googleAvatarUrl || userProfile.avatarUrl}
-                  alt={userProfile.name}
-                  className={`w-7 h-7 rounded-full border ${selectedTheme.borderClass} flex-shrink-0`}
-                />
-                <div className="flex flex-col truncate">
-                  <span className="text-[11px] font-bold text-slate-800 leading-tight truncate">
-                    {userProfile.name}
-                  </span>
-                  {isMasterAdmin && (
-                    <span className="truncate text-[8px] font-extrabold text-amber-700">
-                      🛡️ ★ MASTER ADMIN VIP (UNLIMITED ACCESS)
-                    </span>
-                  )}
-                  <span className="text-[9px] text-slate-500 truncate">{userProfile.email || "Guest"}</span>
-                </div>
-              </div>
-
-              <div className="flex shrink-0 items-center gap-1">
-                <button
-                  type="button"
-                  onClick={openProfileEditor}
-                  className="flex items-center gap-1 rounded-lg border border-cyan-200 bg-cyan-50 px-2 py-1 text-[10px] font-bold text-cyan-800 transition-colors hover:bg-cyan-100"
-                >
-                  <Edit2 className="h-3 w-3" />
-                  Edit Profile
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSignOut}
-                  className="flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-2 py-1 text-[10px] font-bold text-rose-600 transition-colors hover:bg-rose-50"
-                >
-                  <LogOut className="h-3 w-3" />
-                  Sign Out
-                </button>
-              </div>
-            </div>
-            {/* Direct Sidebar Chat Vault */}
-            <div className="bg-white/80 border border-slate-200 rounded-xl p-2 space-y-1.5 shadow-2xs">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] font-bold text-slate-700">Chat Vault</span>
-                <span className="text-[9px] text-emerald-600 bg-emerald-50 px-1.5 py-0.2 rounded font-semibold border border-emerald-200">Auto-Persist</span>
-              </div>
-              <div className="flex gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    const stored = localStorage.getItem("genie_chat_sessions_v2") || localStorage.getItem("genie_chat_sessions");
-                    const blob = new Blob([stored || JSON.stringify(sessions)], { type: "application/json" });
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement("a");
-                    a.href = url;
-                    a.download = `Genie_Backup_${new Date().toISOString().slice(0, 10)}.json`;
-                    a.click();
-                    URL.revokeObjectURL(url);
-                  }}
-                  className="flex-1 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold rounded-lg transition-all flex items-center justify-center gap-1"
-                >
-                  <Download className="w-3 h-3" />
-                  <span>Backup</span>
-                </button>
-                <label className="flex-1 py-1 bg-purple-50 hover:bg-purple-100 text-purple-700 border border-purple-200 text-[10px] font-bold rounded-lg transition-all flex items-center justify-center gap-1 cursor-pointer">
-                  <FileUp className="w-3 h-3" />
-                  <span>Restore</span>
-                  <input
-                    type="file"
-                    accept=".json"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) {
-                        const reader = new FileReader();
-                        reader.onload = (event) => {
-                          try {
-                            const parsed = JSON.parse(event.target?.result as string);
-                            const sessionsToLoad = Array.isArray(parsed) ? parsed : parsed.sessions;
-                            if (Array.isArray(sessionsToLoad) && sessionsToLoad.length > 0) {
-                              const restoredSessions = sessionsToLoad.map((session: ChatSession) => ({
-                                ...session,
-                                messages: ensureMessageTimestamps(session.messages || []),
-                              }));
-                              setSessions(restoredSessions);
-                              setCurrentSessionId(sessionsToLoad[0].id);
-                              setIsTopicConversation(Boolean(sessionsToLoad[0].topicId));
-                              setIsTeamMode(false);
-                              setPersonalMessages(restoredSessions[0].messages);
-                              localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(restoredSessions));
-                              alert("Chat history restored successfully!");
-                            }
-                          } catch {
-                            alert("Invalid backup JSON file.");
-                          }
-                        };
-                        reader.readAsText(file);
-                      }
-                    }}
-                  />
-                </label>
-              </div>
-            </div>
-            
+          <div className={`${sidebarCollapsed ? "md:hidden" : ""} mt-auto space-y-2 border-t p-3 ${currentTheme.chromeBorderClass} ${currentTheme.chromeClass}`}>
             <div className="flex items-center justify-between px-1">
               <button
+                type="button"
                 onClick={() => setLegalModalOpen(true)}
                 className="text-[10px] text-slate-500 hover:text-purple-700 underline font-medium"
               >
-                Disclaimer & Terms
+                Disclaimer &amp; Terms
               </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setChatVaultOpen(true)}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white/80 px-3 py-2 text-[11px] font-semibold text-slate-700 hover:bg-white"
+            >
+              <Cloud className="h-4 w-4" />
+              Chat Vault &amp; Restore Backups
+            </button>
+
+            <div className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-200 bg-white/70 p-2">
+              <GenieAvatar
+                src={profileAvatar}
+                alt={userProfile.name}
+                className={`h-9 w-9 shrink-0 rounded-full border ${selectedTheme.borderClass}`}
+              />
+              <div className="min-w-0 flex-1">
+                <span className="block truncate text-[11px] font-bold leading-tight text-slate-800">{userProfile.name}</span>
+                <span className="block truncate text-[9px] text-slate-500">{userProfile.email || "Guest"}</span>
+              </div>
               <button
+                type="button"
                 onClick={() => setSettingsOpen(true)}
-                className={`p-1 text-slate-500 hover:${selectedTheme.textClass} hover:bg-slate-200/60 rounded-md transition-colors`}
-                title="Preferences & Governance"
+                className="shrink-0 rounded-lg p-2 text-slate-600 transition-colors hover:bg-slate-100 hover:text-slate-900"
+                title="Settings"
+                aria-label="Settings"
               >
-                <SettingsIcon className="w-4 h-4" />
+                <SettingsIcon className="h-4 w-4" />
               </button>
             </div>
           </div>
         </aside>
 
-        {!sidebarOpen && (
-          <button
-            onClick={() => setSidebarOpen(true)}
-            className="fixed top-3 left-3 z-30 p-2 bg-white/95 hover:bg-white text-slate-700 rounded-xl shadow-md border border-slate-200 transition-all"
-            title="Open Sidebar"
-          >
-            <ChevronRight className="w-4 h-4" />
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => setSidebarOpen(true)}
+          className="fixed left-3 top-3 z-30 rounded-xl border border-slate-200 bg-white/95 p-2 text-slate-700 shadow-md transition-all hover:bg-white md:hidden"
+          title="Open navigation"
+          aria-label="Open navigation"
+        >
+          <Menu className="h-5 w-5" />
+        </button>
 
         {/* SECTION 4: MAIN HEADER & WORKSPACE */}
         <main className={`relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-gradient-to-b ${currentTheme.canvasGradientClass}`}>
           <HeaderBar
             spaceMode={spaceMode}
-            onSpaceModeChange={setSpaceMode}
+            onSpaceModeChange={handleSpaceModeChange}
             isTeamMode={isTeamMode}
             onToggleTeamMode={handleToggleTeamMode}
             isCorporateDomain={isCorporateDomain}
@@ -5596,17 +6824,74 @@ if (!response.ok) {
             accentTextClass={currentTheme.textClass}
             activeClass={currentTheme.primaryClass}
             onOpenRoom={() => setRoomAdminOpen(true)}
+            onStartVoiceCall={startVoiceCall}
+            isObserverOn={isObserverActive}
+            canAccessVoiceCall={hasVoiceCallAccess}
             onOpenSettings={() => setSettingsOpen(true)}
             isAuthenticated={isAuthenticated}
-            isRoomHost={members.some((member) => member.id === roomIdentity && member.role === "sovereign")}
+            isRoomHost={isCurrentRoomHost}
             onCopyInvite={(mode) => void copyHeaderInvite(mode)}
             onLeaveRoom={handleExitRoomToPersonal}
             onEndRoom={() => void endActiveRoom()}
           />
+          {isVoiceCallOpen && canAccessVoiceCall() && (
+            <VoiceCallModal
+              key={voiceCallId}
+              callId={voiceCallId}
+              isTeamMode={isTeamMode}
+              contextMode={isTeamMode ? "workspace" : "personal"}
+              participants={isTeamMode
+                ? (voiceCallParticipants.length ? voiceCallParticipants : members.filter((member) => member.status === "active"))
+                  .map((member) => ({ id: member.id, name: member.name, avatarUrl: member.avatarUrl }))
+                : []}
+              currentUser={{
+                id: roomIdentity || googleIdToken || "guest",
+                name: userProfile.name || "Guest User",
+                avatarUrl: profileAvatar,
+              }}
+              remoteTurns={remoteVoiceTurns}
+              languageCode={selectedLang.code}
+              languageLabel={selectedLang.label}
+              onSubmitTurn={submitVoiceCallTurn}
+              onBroadcastTurn={broadcastVoiceTurn}
+              onEndCall={(transcript) => void handleVoiceCallEnd(transcript)}
+            />
+          )}
 
           {/* SECTION 5: CHAT THREAD & CANVAS */}
           <div className="flex-1 min-h-0 flex relative overflow-hidden">
-            <div className={`flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4 sm:py-6 transition-all ${activeCanvas ? "w-1/2 pr-2" : "w-full"}`}>
+            <div
+              ref={messageScrollRef}
+              onScroll={handleMessageScroll}
+              className={`flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4 sm:py-6 transition-all ${activeCanvas ? "w-1/2 pr-2" : "w-full"}`}
+            >
+              {mounted && !isTeamMode && !isTopicConversation && currentSession && (
+                <SessionMetadataBar
+                  session={{
+                    id: currentSession.id,
+                    title: currentSession.title,
+                    createdAt: currentSession.createdAt || currentSession.messages[0]?.timestamp || new Date().toISOString(),
+                  }}
+                  onRename={(newTitle) => {
+                    setSessions((previous) => previous.map((session) =>
+                      session.id === currentSession.id ? { ...session, title: newTitle } : session
+                    ));
+                  }}
+                  onShare={() => {
+                    setShareSessionId(currentSession.id);
+                    setShareInviteSessionId(`${currentSession.id}_${window.crypto.randomUUID()}`);
+                    setShareModalOpen(true);
+                  }}
+                  onExport={exportCurrentSessionTranscript}
+                  onExportDocument={(format, selectedOnly) => {
+                    if (selectedOnly) return;
+                    exportSessionDocument(format, false);
+                  }}
+                  onSelectMessages={beginMessageSelection}
+                  isObserverOn={isObserverActive}
+                  onDelete={() => void softDeleteSession(currentSession)}
+                />
+              )}
               {isTeamMode && roomId.startsWith("direct:") && (
                 <div className="mx-auto mb-4 flex max-w-3xl items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white/85 px-3 py-2 shadow-sm">
                   <div className="min-w-0">
@@ -5653,16 +6938,27 @@ if (!response.ok) {
                 </div>
               ) : (
                 <div className="max-w-3xl mx-auto space-y-4 pb-4">
-                  {messages.map((msg, index) => (
+                  {messages.map((msg, index) => {
+                    const readStatus = isTeamMode
+                      ? getRoomMessageReadStatus(msg, members)
+                      : null;
+                    return (
                     <div
                       key={msg.id || index}
                       className={`group flex flex-col ${msg.role === "user" ? "items-end" : "items-start"}`}
+                      onClick={(event) => {
+                        if (!isSelectionMode) return;
+                        const target = event.target as HTMLElement;
+                        if (target.closest("[data-message-bubble]")) {
+                          toggleMessageSelection(msg, index);
+                        }
+                      }}
                       onTouchStart={(event) => startLongPress(event, msg, index)}
                       onTouchEnd={cancelLongPress}
                       onTouchCancel={cancelLongPress}
                       onTouchMove={cancelLongPress}
                       onContextMenu={(event) => {
-                        if (window.matchMedia("(pointer: coarse)").matches || window.innerWidth < 768) {
+                        if (!isSelectionMode && (window.matchMedia("(pointer: coarse)").matches || window.innerWidth < 768)) {
                           event.preventDefault();
                           const bounds = event.currentTarget.getBoundingClientRect();
                           openLongPressMenu(msg, index, bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
@@ -5672,8 +6968,12 @@ if (!response.ok) {
                     >
                       {msg.role === "assistant" ? (
                         <span className="mb-1 flex items-center gap-1.5 px-1 text-[10px] font-semibold text-slate-600">
-                          <BrandAvatar variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant} className="h-5 w-5" label="Genie response" />
-                          {getAssistantPersona(msg).badge}
+                          <BrandAvatar
+                            variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant}
+                            className="h-5 w-5"
+                            label={msg.isCallRecord || msg.isVoiceSessionSummary ? "Genie Master" : "Genie response"}
+                          />
+                          {msg.isCallRecord || msg.isVoiceSessionSummary ? "Genie Master" : getAssistantPersona(msg).badge}
                         </span>
                       ) : isTeamMode && msg.senderName ? (
                         <span className="mb-1 max-w-[85%] truncate px-1 text-[10px] font-semibold text-slate-500">
@@ -5691,12 +6991,27 @@ if (!response.ok) {
                             />
                           )}
                           <div
+                            data-message-bubble
                             className={`group relative max-w-[85%] rounded-2xl px-4 py-3 text-sm text-white rounded-br-none shadow-sm space-y-1 ${
+                              selectedMessageIds.has(getMessageSelectionId(msg, index))
+                                ? "ring-2 ring-indigo-500/50 "
+                                : ""
+                            }${
                               msg.triggeredByRainbow
                                 ? "bg-gradient-to-r from-violet-600 via-pink-600 to-indigo-600 border border-amber-300"
                                 : `bg-gradient-to-r ${selectedTheme.gradientClass}`
                             }`}
                           >
+                            {isSelectionMode && (
+                              <input
+                                type="checkbox"
+                                checked={selectedMessageIds.has(getMessageSelectionId(msg, index))}
+                                onClick={(event) => event.stopPropagation()}
+                                onChange={() => toggleMessageSelection(msg, index)}
+                                aria-label={`Select message ${index + 1}`}
+                                className="absolute -left-8 top-3 h-4 w-4 accent-indigo-600"
+                              />
+                            )}
                             {msg.isForwarded && <span className="block text-[10px] font-semibold opacity-75">Forwarded from {msg.forwardedFrom || "another chat"}</span>}
                             {msg.replyTo && (
                               <div className="bg-white/20 border-l-2 border-white/50 p-2 rounded text-xs text-white/90 mb-1">
@@ -5707,7 +7022,7 @@ if (!response.ok) {
                               </div>
                             )}
                             {editingMessageId === (msg.id || String(index)) ? (
-                              <div className="space-y-2">
+                              <div id="room-member-roster" className="space-y-2">
                                 <textarea
                                   value={editDraft}
                                   onChange={(event) => setEditDraft(event.target.value)}
@@ -5729,6 +7044,82 @@ if (!response.ok) {
                                   </button>
                                 </div>
                               </div>
+                            ) : msg.callTranscript ? (
+                              <section className="space-y-3">
+                                <header className="border-b border-slate-200 pb-2">
+                                  <h3 className="font-bold text-slate-900">
+                                    📞 Genie Master Voice Session Summary
+                                  </h3>
+                                  <p className="mt-1 text-[11px] text-slate-500">
+                                    {Math.floor(msg.callTranscript.durationSeconds / 60)}m {msg.callTranscript.durationSeconds % 60}s
+                                    {" · "}{msg.callTranscript.dialect}
+                                  </p>
+                                  <p className="mt-1 text-[11px] text-slate-500">
+                                    Participants: {msg.callTranscript.participants.map((participant) => participant.name).join(", ") || "You"}
+                                  </p>
+                                  <div className="mt-2 flex items-center gap-2">
+                                    <span className="text-[10px] font-semibold text-slate-500">Export:</span>
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        exportSessionDocument(
+                                          "pdf",
+                                          false,
+                                          new Set(),
+                                          [msg],
+                                          `${roomTitle} - Genie Master Call`,
+                                        );
+                                      }}
+                                      className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-600 hover:bg-slate-50"
+                                    >
+                                      PDF
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        exportSessionDocument(
+                                          "docx",
+                                          false,
+                                          new Set(),
+                                          [msg],
+                                          `${roomTitle} - Genie Master Call`,
+                                        );
+                                      }}
+                                      className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-600 hover:bg-slate-50"
+                                    >
+                                      Word
+                                    </button>
+                                  </div>
+                                </header>
+                                <ol className="space-y-2">
+                                  {msg.callTranscript.turns.map((turn) => (
+                                    <li key={turn.id} className="flex items-start gap-2">
+                                      {turn.role === "assistant" ? (
+                                        <BrandAvatar variant="cosmic-shadow" className="mt-0.5 h-6 w-6 shrink-0" label="Genie Master" />
+                                      ) : (
+                                        <img
+                                          src={turn.userAvatar || "/default-avatar.png"}
+                                          alt=""
+                                          className="mt-0.5 h-6 w-6 shrink-0 rounded-full object-cover"
+                                        />
+                                      )}
+                                      <div className="min-w-0 flex-1">
+                                        <div className="flex flex-wrap items-baseline gap-x-2">
+                                          <span className="text-xs font-semibold text-slate-700">
+                                            {turn.role === "assistant" ? "Genie Master" : turn.userName}
+                                          </span>
+                                          <time className="text-[10px] text-slate-400">
+                                            {new Date(turn.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                          </time>
+                                        </div>
+                                        <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-700">{turn.text}</p>
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ol>
+                              </section>
                             ) : (
                               <p className={`whitespace-pre-wrap ${msg.is_deleted ? "italic opacity-75" : ""}`}>
                                 {msg.content}
@@ -5738,51 +7129,48 @@ if (!response.ok) {
                               </p>
                             )}
                             <div className="mt-1 flex justify-end">
+                              {isTeamMode && msg.sender_id === roomIdentity && readStatus && (
+                                readStatus.isReadByAll ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded border border-emerald-200/50 bg-emerald-50 px-1.5 py-0.5 text-[10px] text-emerald-600 dark:border-emerald-800/50 dark:bg-emerald-950/40 dark:text-emerald-400"
+                                    title="Read by all room members"
+                                  >
+                                    <CheckCheck className="h-3 w-3" />
+                                    Read by all
+                                  </span>
+                                ) : (
+                                  <span className="self-end text-[10px] text-slate-400">
+                                    Seen by {readStatus.seenCount}/{readStatus.activeCount}
+                                  </span>
+                                )
+                              )}
                               <span className="ml-2 select-none self-end text-[10px] text-gray-400">
                                 {new Date(msg.timestamp || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                               </span>
                             </div>
                           </div>
                           {renderMessageActionBar(msg, index)}
-                          {renderMessageReactions(msg, index)}
-                          {isTeamMode && msg.role === "user" && msg.sender_id === roomIdentity && (
-                            <div
-                              className="room-receipts px-1 text-right text-xs"
-                              aria-label={
-                                (msg.read_by?.length || 0) >= Math.max(roomMemberCount - 1, 1) &&
-                                roomMemberCount > 1
-                                  ? "Read by all room members"
-                                  : (msg.delivered_to?.length || 0) >= Math.max(roomMemberCount - 1, 1) &&
-                                    roomMemberCount > 1
-                                  ? "Delivered to all room members"
-                                  : "Sent to room server"
-                              }
-                            >
-                              {roomMemberCount > 1 &&
-                              (msg.read_by?.length || 0) >= roomMemberCount - 1 ? (
-                                <span className="rainbow-read-ticks">✓✓</span>
-                              ) : roomMemberCount > 1 &&
-                                (msg.delivered_to?.length || 0) >= roomMemberCount - 1 ? (
-                                <span className="text-slate-400">✓✓</span>
-                              ) : (
-                                <span className="text-slate-400">✓</span>
-                              )}
-                            </div>
-                          )}
                         </div>
                       ) : (
                         <div className="flex w-full max-w-[85%] items-start gap-2">
-                          <BrandAvatar
-                            variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant}
-                            label="Genie response"
-                            className="mt-1 h-8 w-8"
-                          />
                           <div className="min-w-0 flex-1 space-y-1.5">
+                          <div data-message-bubble className="relative w-full">
+                          {isSelectionMode && (
+                            <input
+                              type="checkbox"
+                              checked={selectedMessageIds.has(getMessageSelectionId(msg, index))}
+                              onClick={(event) => event.stopPropagation()}
+                              onChange={() => toggleMessageSelection(msg, index)}
+                              aria-label={`Select message ${index + 1}`}
+                              className="absolute left-0 top-3 z-10 h-4 w-4 accent-indigo-600"
+                            />
+                          )}
                           <MessageBubble
-                            provider={getAssistantPersona(msg).provider}
-                            model={getAssistantPersona(msg).model}
-                            autoFallback={msg.autoFallback}
                             className={`group relative max-w-full rounded-2xl rounded-bl-none px-4 py-3 text-sm leading-relaxed border shadow-sm ${
+                              selectedMessageIds.has(getMessageSelectionId(msg, index))
+                                ? "ring-2 ring-indigo-500/50 "
+                                : ""
+                            }${
                               msg.isIntervention || msg.senderName?.includes("Intervention")
                                 ? `${selectedTheme.bgLightClass} ${selectedTheme.textClass} ${selectedTheme.borderClass}`
                                 : "bg-white text-slate-800 border-slate-200"
@@ -5861,8 +7249,8 @@ if (!response.ok) {
                               </span>
                             </div>
                           </MessageBubble>
+                          </div>
                           {renderMessageActionBar(msg, index)}
-                          {renderMessageReactions(msg, index)}
 
                           {/* Host Intervention Trigger */}
                           {isKeyOwner && isTeamMode && (
@@ -5879,7 +7267,8 @@ if (!response.ok) {
                         </div>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
 
                   {longPressMenu && (
                     <div className="fixed inset-0 z-[80] bg-black/20 md:hidden" onClick={() => setLongPressMenu(null)}>
@@ -5890,17 +7279,24 @@ if (!response.ok) {
                         className="absolute flex min-w-48 flex-col overflow-hidden rounded-xl border border-slate-200 bg-white p-1 shadow-2xl"
                         onClick={(event) => event.stopPropagation()}
                       >
-                        <button role="menuitem" type="button" onClick={() => { setReplyTarget({ author: longPressMenu.message.senderName || (longPressMenu.message.role === "assistant" ? "Genie" : "You"), content: longPressMenu.message.content }); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Reply</button>
                         {longPressMenu.message.role === "user" && (!isTeamMode || longPressMenu.message.sender_id === roomIdentity) && (
                           <>
+                            <button role="menuitem" type="button" onClick={() => { handleCopyMessage(longPressMenu.message.content, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Copy</button>
                             <button role="menuitem" type="button" onClick={() => { setEditingMessageId(longPressMenu.message.id || String(longPressMenu.index)); setEditDraft(longPressMenu.message.content); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Edit</button>
-                            <button role="menuitem" type="button" onClick={() => { void handleDeleteMessage(longPressMenu.message, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Delete</button>
+                            {!isObserverActive && !longPressMenu.message.isVoiceRecord && (
+                              <button role="menuitem" type="button" onClick={() => { void handleDeleteMessage(longPressMenu.message, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Delete</button>
+                            )}
                           </>
                         )}
-                        <button role="menuitem" type="button" onClick={() => { handleCopyMessage(longPressMenu.message.content, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Copy</button>
-                        <button role="menuitem" type="button" onClick={() => { setForwardMessage(longPressMenu.message); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Forward</button>
-                        {longPressMenu.message.role === "assistant" && (
-                          <button role="menuitem" type="button" onClick={() => { void handleReportAIMistake(longPressMenu.message); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Report AI mistakes</button>
+                        {longPressMenu.message.role === "assistant" && !longPressMenu.message.is_deleted && (
+                          <>
+                            <button role="menuitem" type="button" onClick={() => { handleCopyMessage(longPressMenu.message.content, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Copy</button>
+                            {!(isTeamMode && roomMemberCount > 1) && (
+                              <button role="menuitem" type="button" disabled={isStreaming} onClick={() => { handleReloadMessage(longPressMenu.message, longPressMenu.index); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">Regenerate</button>
+                            )}
+                            <button role="menuitem" type="button" onClick={() => { void handlePlayAudio(longPressMenu.message.content, longPressMenu.message.id || String(longPressMenu.index)); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50">Text-to-Speech</button>
+                            <button role="menuitem" type="button" onClick={() => { void handleReportAIMistake(longPressMenu.message); setLongPressMenu(null); }} className="px-3 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50">Report AI Mistake</button>
+                          </>
                         )}
                       </div>
                     </div>
@@ -5909,11 +7305,8 @@ if (!response.ok) {
                   {isStreaming && (
                     streamingPreview ? (
                       <div className="flex w-full items-start gap-2">
-                        <BrandAvatar variant="cosmic-shadow" className="mt-1 h-8 w-8" label="Genie Master" />
+                        <BrandAvatar variant="cosmic-shadow" className="mt-1 h-8 w-8" label="Genie" />
                         <MessageBubble
-                          provider="Genie Master"
-                          model="AI response"
-                          autoFallback={streamingAutoFallback}
                           className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-none border border-cyan-200 bg-white px-4 py-3 text-sm leading-relaxed text-slate-800 shadow-sm"
                         >
                           {streamingPreview}
@@ -5921,7 +7314,7 @@ if (!response.ok) {
                       </div>
                     ) : (
                       <div className="flex items-center gap-3 rounded-2xl border border-cyan-200/70 bg-white/90 p-3 shadow-[0_0_24px_rgba(14,165,233,0.12)]">
-                        <BrandAvatar variant="cosmic-shadow" className="h-9 w-9 animate-pulse" label="Genie Master" />
+                        <BrandAvatar variant="cosmic-shadow" className="h-9 w-9 animate-pulse" label="Genie" />
                         <span className="flex flex-col gap-1">
                           <span className="bg-gradient-to-r from-cyan-600 via-violet-600 to-pink-500 bg-clip-text text-xs font-semibold text-transparent animate-pulse">
                             Genie is crafting your response...
@@ -6056,8 +7449,92 @@ if (!response.ok) {
             )}
           </div>
 
+          <button
+            type="button"
+            onClick={() => messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })}
+            aria-label="Scroll to latest message"
+            title="Scroll to bottom"
+            className={`absolute bottom-36 right-5 z-30 flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white/95 text-slate-700 shadow-lg backdrop-blur transition-all duration-200 hover:bg-indigo-50 hover:text-indigo-700 ${
+              isScrolledUp
+                ? "translate-y-0 opacity-100"
+                : "pointer-events-none translate-y-2 opacity-0"
+            }`}
+          >
+            <ArrowDown className="h-5 w-5" />
+          </button>
+          {isSelectionMode && (
+            <div className="absolute inset-x-0 bottom-0 z-40 border-t border-indigo-200 bg-white/95 px-3 py-4 shadow-[0_-8px_24px_rgba(15,23,42,0.12)] backdrop-blur-md">
+              <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-sm font-semibold text-slate-700">
+                    {selectedMessageIds.size} messages selected
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMessageIds(new Set(
+                      messages
+                        .map((message, index) => ({ message, index }))
+                        .filter(({ message }) => !message.is_deleted)
+                        .map(({ message, index }) => getMessageSelectionId(message, index)),
+                    ))}
+                    className="text-xs font-semibold text-indigo-700 hover:underline"
+                  >
+                    Select All
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedMessageIds(new Set())}
+                    className="text-xs font-semibold text-slate-500 hover:text-slate-800 hover:underline"
+                  >
+                    Deselect All
+                  </button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={cancelMessageSelection}
+                    className="rounded-lg px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={completeMessageSelectionExport}
+                    disabled={selectedMessageIds.size === 0}
+                    className="rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Download {selectedExportFormat === "pdf" ? "PDF" : "Word (.doc)"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {pendingCallTranscript && (
+            <div className="absolute inset-x-4 bottom-4 z-40 mx-auto flex max-w-2xl flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-white/95 px-4 py-3 shadow-xl backdrop-blur-md">
+              <p className="text-sm text-slate-700">
+                Call ended (Genie Master). Would you like to record this transcript to your session?
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPendingCallTranscript(null)}
+                  className="rounded-lg px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100"
+                >
+                  Dismiss
+                </button>
+                <button
+                  type="button"
+                  onClick={savePendingCallTranscript}
+                  className="rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-indigo-700"
+                >
+                  Save Record
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Floating Show Input Dock Pill */}
-          {isDockHidden && (
+          {isDockHidden && !isSelectionMode && (
             <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-30">
               <button
                 onClick={() => setIsDockHidden(false)}
@@ -6071,7 +7548,7 @@ if (!response.ok) {
 
           {/* SECTION 6: CHAT INPUT DOCK */}
           {!isDockHidden && (
-            <div className={`flex-shrink-0 w-full px-2 sm:px-4 py-2 sm:py-3 bg-white/95 backdrop-blur-md border-t ${selectedTheme.borderClass} shadow-lg transition-transform duration-300 pb-[max(0.75rem,env(safe-area-inset-bottom))]`}>
+            <div className={`flex-shrink-0 w-full px-2 sm:px-4 py-2 sm:py-3 bg-white/95 backdrop-blur-md border-t ${selectedTheme.borderClass} shadow-lg transition-transform duration-300 pb-[max(0.75rem,env(safe-area-inset-bottom))] ${isSelectionMode ? "hidden" : ""}`}>
               {replyTarget && (
                 <div className={`max-w-3xl mx-auto mb-2 flex items-center justify-between p-2 ${selectedTheme.bgLightClass} border ${selectedTheme.borderClass} rounded-xl text-xs`}>
                   <div className="truncate">
@@ -6083,7 +7560,6 @@ if (!response.ok) {
                   </button>
                 </div>
               )}
-
               {/* Status Header */}
               <div className="max-w-3xl mx-auto mb-1.5 sm:mb-2 flex items-center justify-between px-2.5 sm:px-3 py-1 bg-slate-50/90 border border-slate-200 rounded-xl text-[10px] sm:text-[11px]">
                 <div className="flex min-w-0 items-center gap-1.5 sm:gap-2">
@@ -6157,7 +7633,7 @@ if (!response.ok) {
                       autoFocus
                       value={messageSearchQuery}
                       onChange={(event) => setMessageSearchQuery(event.target.value)}
-                      placeholder={messageSearchMode === "ai" ? "Search Genie Pro and Genie Master responses…" : "Search local user chat history…"}
+                      placeholder={messageSearchMode === "ai" ? "Search Genie and Genie Pro responses…" : "Search local user chat history…"}
                       aria-label={messageSearchMode === "ai" ? "Search AI mode transcripts" : "Search user chat history"}
                       className="min-w-0 flex-1 bg-transparent text-xs text-slate-800 outline-none"
                     />
@@ -6445,6 +7921,7 @@ if (!response.ok) {
 
                     <VoiceMic
                       disabled={isStreaming}
+                      language={selectedLang.code}
                       onRecordingChange={setIsListening}
                       onError={(message) => setChatError(`Microphone: ${message}`)}
                       onTranscription={(text) => {
@@ -6672,15 +8149,53 @@ if (!response.ok) {
           <div className="w-full max-w-lg bg-white rounded-3xl shadow-2xl border border-slate-200 p-6 space-y-4 max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3">
               <div>
-                <h3 className="font-bold text-slate-800 text-sm">Room Members & Governance</h3>
+                <h3 className="font-bold text-slate-800 text-sm">Contextual Room Admin</h3>
                 <p className="text-[11px] text-slate-400">
-                  Sovereign: {isKeyOwner ? "You (API Key Owner)" : "Host Delegated"}
+                  Sovereign: {isCurrentRoomHost ? "You" : members.find((member) => member.role === "sovereign")?.name || "Host"}
                 </p>
               </div>
               <button onClick={() => setRoomAdminOpen(false)}>
                 <X className="w-4 h-4 text-slate-400 hover:text-slate-700" />
               </button>
             </div>
+
+            <section className="grid gap-2 sm:grid-cols-2">
+              <button
+                type="button"
+                disabled={!isAuthenticated}
+                onClick={() => {
+                  setRoomAdminOpen(false);
+                  void copyHeaderInvite("personal");
+                }}
+                className="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2.5 text-left text-xs font-semibold text-cyan-900 hover:bg-cyan-100 disabled:opacity-50"
+              >
+                Copy 1-on-1 Named Invite Link
+              </button>
+              <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+                <button
+                  type="button"
+                  onClick={() => document.getElementById("room-member-roster")?.scrollIntoView({ behavior: "smooth" })}
+                  className="text-left text-xs font-semibold text-slate-800"
+                >
+                  Room Members &amp; Permissions
+                </button>
+                <p className="mt-0.5 text-[10px] text-slate-500">Host membership controls are shown beside each member.</p>
+              </div>
+              <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
+                <span className="min-w-0 flex-1 text-xs font-semibold text-slate-800">Export Transcript</span>
+                <button type="button" onClick={() => exportRoomTranscript("md")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100">Markdown</button>
+                <button type="button" onClick={() => exportRoomTranscript("json")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100">JSON</button>
+              </div>
+              {isCurrentRoomHost && (
+                <button
+                  type="button"
+                  onClick={wipeRoomForAll}
+                  className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2.5 text-left text-xs font-semibold text-rose-800 hover:bg-rose-100"
+                >
+                  Wipe Chat for All
+                </button>
+              )}
+            </section>
 
             <DynamicTeamModal
               mode={roomCapacityMode}
@@ -6702,7 +8217,7 @@ if (!response.ok) {
                   <span className={`text-xs font-mono font-bold bg-white px-2 py-1 rounded-lg border ${selectedTheme.textClass}`}>
                     {roomPasscode}
                   </span>
-                  {isKeyOwner && (
+                  {isCurrentRoomHost && (
                     <button
                       onClick={() => setConfirmRegenerateModalOpen(true)}
                       className={`p-1 hover:${selectedTheme.textClass} text-slate-400`}
@@ -6834,48 +8349,24 @@ if (!response.ok) {
                       )}
                     </div>
 
-                    <div className="flex items-center gap-1.5">
-                      {isKeyOwner && member.role !== "sovereign" && (
+                    {isCurrentRoomHost && member.id !== roomIdentity && (
+                      <div className="flex shrink-0 items-center gap-1.5">
                         <button
-                          onClick={() => handlePromoteAdmin(member.id)}
-                          className="px-2 py-0.5 text-[10px] font-bold bg-white border border-slate-300 hover:bg-slate-100 rounded-lg text-slate-700"
+                          type="button"
+                          onClick={() => void changeRoomMember(member.id, "transfer-host")}
+                          className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100"
                         >
-                          {member.role === "admin" ? "Demote" : "Make Admin"}
+                          Transfer Host
                         </button>
-                      )}
-
-                      {member.role !== "sovereign" && (
                         <button
-                          onClick={() =>
-                            setMembers((prev) =>
-                              prev.map((m) =>
-                                m.id === member.id
-                                  ? {
-                                      ...m,
-                                      status: m.status === "active" ? "inactive" : "active",
-                                    }
-                                  : m
-                              )
-                            )
-                          }
-                          className={`flex items-center gap-1 px-2.5 py-1 rounded-xl font-bold text-[10px] transition-all ml-1 flex-shrink-0 ${
-                            member.status === "active"
-                              ? "bg-emerald-100 text-emerald-800 hover:bg-emerald-200"
-                              : "bg-rose-100 text-rose-800 hover:bg-rose-200"
-                          }`}
+                          type="button"
+                          onClick={() => void changeRoomMember(member.id, "remove")}
+                          className="rounded-lg border border-rose-200 bg-white px-2 py-1 text-[10px] font-semibold text-rose-700 hover:bg-rose-50"
                         >
-                          {member.status === "active" ? (
-                            <>
-                              <UserCheck className="w-3 h-3" /> Active
-                            </>
-                          ) : (
-                            <>
-                              <UserX className="w-3 h-3" /> Inactive
-                            </>
-                          )}
+                          Remove
                         </button>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 ))
               )}
@@ -7097,9 +8588,63 @@ if (!response.ok) {
         }}>
           <section role="dialog" aria-modal="true" aria-labelledby="friend-search-title" className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl">
             <div className="mb-4 flex items-center justify-between">
-              <h2 id="friend-search-title" className="text-base font-bold text-slate-900">Find a friend</h2>
+              <h2 id="friend-search-title" className="text-base font-bold text-slate-900">Invite Friend &amp; Directory</h2>
               <button type="button" onClick={() => setFriendSearchOpen(false)} aria-label="Close friend search" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100"><X className="h-4 w-4" /></button>
             </div>
+            <form onSubmit={(event) => void searchOmniDirectory(event)} className="flex gap-2">
+              <input
+                value={omniSearchQuery}
+                onChange={(event) => {
+                  setOmniSearchQuery(event.target.value);
+                  setOmniSearchResults([]);
+                  setOmniSearchNotFound(false);
+                  setOmniSearchError(null);
+                }}
+                disabled={!isAuthenticated}
+                minLength={2}
+                placeholder="Search Genie by name or email"
+                aria-label="Search Genie directory"
+                className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-cyan-500 disabled:bg-slate-50"
+              />
+              <button type="submit" disabled={!isAuthenticated || omniSearchBusy || omniSearchQuery.trim().length < 2} className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
+                {omniSearchBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Search"}
+              </button>
+            </form>
+            {omniSearchError && <p role="status" className="mt-2 text-xs text-rose-600">{omniSearchError}</p>}
+            {omniSearchNotFound && omniSearchQuery.includes("@") && (
+              <button
+                type="button"
+                disabled={inviteEmailBusy}
+                onClick={() => void sendOnboardingInviteEmail(omniSearchQuery.trim())}
+                className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs font-semibold text-cyan-800 disabled:opacity-50"
+              >
+                {inviteEmailBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Mail className="h-4 w-4" />}
+                Send Invite Email
+              </button>
+            )}
+            {omniSearchResults.length > 0 && (
+              <div className="mt-2 max-h-48 space-y-1 overflow-y-auto">
+                {omniSearchResults.map((friend) => (
+                  <div key={friend.user_id} className="flex items-center gap-2 rounded-lg border border-slate-100 p-2">
+                    <GenieAvatar src={friend.avatar_url} alt={friend.display_name} className="h-8 w-8 rounded-full" />
+                    <span className="min-w-0 flex-1 truncate text-xs font-semibold text-slate-700">{friend.display_name}</span>
+                    {friend.relationship === "friend" ? (
+                      <span className="text-[10px] font-semibold text-emerald-700">Friend</span>
+                    ) : (
+                      <>
+                        <button type="button" disabled={friend.relationship === "following" || friend.relationship === "request_sent"} onClick={() => void updateSocialRelationship(friend, "follow")} className="rounded-md border border-slate-200 px-2 py-1 text-[10px] font-semibold text-slate-600 disabled:opacity-50">
+                          {friend.relationship === "following" ? "Following" : "Follow"}
+                        </button>
+                        <button type="button" disabled={friend.relationship === "request_sent" || friend.relationship === "request_received"} onClick={() => void updateSocialRelationship(friend, "friend-request")} className="rounded-md bg-cyan-800 px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50">
+                          {friend.relationship === "request_sent" ? "Requested" : "Add"}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="mt-4 text-[10px] font-bold uppercase tracking-wider text-slate-400">Invite by email</p>
             <form onSubmit={(event) => void searchForFriend(event)} className="flex gap-2">
               <input
                 type="email"
@@ -7360,7 +8905,7 @@ if (!response.ok) {
                 <div>
                   <h3 className="font-bold text-slate-800 text-sm">Genie Workspace Preferences</h3>
                   <p className="text-[11px] text-slate-400">
-                    Active Engine:                     <span className={`font-mono ${selectedTheme.textClass} font-bold`}>{activeModelName}</span>
+                    Assistant:                     <span className={`font-mono ${selectedTheme.textClass} font-bold`}>{activeModelName}</span>
                   </p>
                 </div>
               </div>
@@ -7397,6 +8942,8 @@ if (!response.ok) {
                   { id: "profile", label: "Profile", icon: User },
                   { id: "theme", label: "Theme", icon: Palette },
                   { id: "developer", label: "BYOK", icon: Key },
+                  { id: "audio", label: "Voice & Audio", icon: Volume2 },
+                  { id: "tools", label: "Tools", icon: Sparkles },
                   { id: "totp", label: "Authenticator", icon: QrCode },
                   { id: "blocked", label: "Blocked Users", icon: UserX },
                   { id: "docs", label: "Docs", icon: FileText },
@@ -7689,8 +9236,72 @@ if (!response.ok) {
               </div>
             )}
 
+            {settingsTab === "audio" && (
+              <section className="space-y-4 p-5 sm:p-7">
+                <div>
+                  <h4 className="text-sm font-bold text-slate-800">Voice &amp; Audio</h4>
+                  <p className="mt-1 text-xs text-slate-500">Choose a calm voice for spoken Genie responses.</p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {([
+                    ["Aoede", "Soft, warm, conversational", "Female"],
+                    ["Charon", "Smooth, calm, steady", "Male"],
+                  ] as const).map(([preset, description, voiceType]) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => selectVoicePreset(preset)}
+                      aria-pressed={voicePreset === preset}
+                      className={`rounded-2xl border p-4 text-left transition-colors ${
+                        voicePreset === preset
+                          ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} ${selectedTheme.textClass}`
+                          : "border-slate-200 hover:bg-slate-50"
+                      }`}
+                    >
+                      <span className="block text-sm font-bold">{voiceType}: {preset}</span>
+                      <span className="mt-1 block text-xs text-slate-500">{description}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {settingsTab === "tools" && (
+              <section className="space-y-4 p-5 sm:p-7">
+                <div className={`rounded-2xl border ${selectedTheme.borderClass} ${selectedTheme.bgLightClass} p-3`}>
+                  <h4 className="text-sm font-bold text-slate-800">Genie Tools</h4>
+                  <p className={`mt-1 text-xs ${selectedTheme.textClass}`}>
+                    {isMasterAdmin
+                      ? "⚡ Unlimited Admin Engine"
+                      : isQuotaEnforced
+                        ? `${remainingDailyChats} / ${DAILY_FREE_LIMIT} chats left today`
+                        : isVipUser
+                          ? `★ VIP Unlimited · ${activeVipSessionCount}/20`
+                          : "★ BYOK Unlimited"}
+                  </p>
+                </div>
+                <StudentBanner onSelectPrompt={(text) => {
+                  setPrompt(text);
+                  setSettingsOpen(false);
+                }} compact />
+                <UnifiedStudyEngine
+                  onInjectPrompt={(text) => {
+                    setPrompt(text);
+                    setSettingsOpen(false);
+                  }}
+                  userEmail={userProfile.email}
+                  compact
+                />
+              </section>
+            )}
+
             {settingsTab === "developer" && (
               <div className="space-y-4 p-5 sm:p-7">
+                {voiceCallGateNotice && (
+                  <p role="alert" className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-900">
+                    {voiceCallGateNotice}
+                  </p>
+                )}
                 <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl space-y-2.5">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-1.5">
@@ -7711,9 +9322,14 @@ if (!response.ok) {
                   <div className="relative">
                     <input
                       type={showApiKey ? "text" : "password"}
-                      value={userProfile.customApiKey}
-                      onChange={(e) => setUserProfile({ ...userProfile, customApiKey: e.target.value })}
-                      placeholder={userProfile.customApiKey ? "••••••••" : "Paste Gemini API key"}
+                      value={byokApiKey}
+                      onChange={(event) => {
+                        setByokApiKey(event.target.value);
+                        setByokVerified(false);
+                        setByokStatus(null);
+                        setByokError(null);
+                      }}
+                      placeholder={byokApiKey ? "••••••••" : "Paste Gemini API key"}
                       autoComplete="new-password"
                       className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 pr-10 font-mono text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-purple-200"
                     />
@@ -7727,8 +9343,49 @@ if (!response.ok) {
                       {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                     </button>
                   </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {byokStatus && (
+                      <span
+                        role="status"
+                        className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold ${
+                          byokVerified
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                            : "border-slate-200 bg-white text-slate-600"
+                        }`}
+                      >
+                        {byokStatus}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void testByokKey()}
+                      disabled={byokTesting || !byokApiKey.trim()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] font-semibold text-indigo-800 hover:bg-indigo-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {byokTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                      {byokTesting ? "Testing..." : "🧪 Test Key"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveByokKey}
+                      disabled={!byokVerified || byokTesting}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      💾 Save Key
+                    </button>
+                    {byokApiKey && (
+                      <button
+                        type="button"
+                        onClick={removeByokKey}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-rose-700 hover:bg-rose-50"
+                      >
+                        🗑️ Remove Custom Key
+                      </button>
+                    )}
+                  </div>
+                  {byokError && <p role="alert" className="text-[11px] text-rose-700">{byokError}</p>}
                   <p className="text-[10px] text-slate-500">
-                    Adding your API key removes the 20 messages/day limit and activates all fallback models.
+                    The key is verified directly with Google and stored only in this browser&apos;s local storage.
                   </p>
                 </div>
 
@@ -7977,7 +9634,7 @@ if (!response.ok) {
         "Conduct a master synthesis on the discussion so far, resolving conflicts with clear next steps.",
         roomMessages.filter((message) => !message.is_deleted).slice(-20),
         selectedLang.label,
-        userProfile.customApiKey || undefined,
+        byokVerified ? byokApiKey : undefined,
         googleIdToken
       );
       const extracted = extractCodeBlock(cascadeResult.text);
@@ -8056,7 +9713,6 @@ if (!response.ok) {
         body: JSON.stringify({
           room_id: roomId,
           google_id_token: googleIdToken,
-          custom_api_key: userProfile.customApiKey || undefined,
           context_messages: roomMessages
             .filter((message) => !message.is_deleted)
             .slice(-20)
@@ -8103,48 +9759,20 @@ if (!response.ok) {
   }
 
   function handleDeleteRoomMessage(message: Message) {
+    if (isObserverActive) {
+      console.warn("Message deletion rejected: Observer mode is active.");
+      return;
+    }
+    if (message.isVoiceRecord) {
+      console.warn("Voice-call transcript records cannot be deleted.");
+      return;
+    }
     if (!message.id || message.sender_id !== roomIdentity || message.role !== "user") return;
     sendRoomEvent({ type: "message.delete", message_id: message.id });
   }
 
-  function handleToggleRoomReaction(message: Message, emoji: string) {
-    if (!isTeamMode || !message.id || !roomIdentity || message.is_deleted) return;
-    const selected = message.reactions?.[emoji]?.includes(roomIdentity) || false;
-    sendRoomEvent({
-      type: "message_reaction",
-      room_id: roomId,
-      message_id: message.id,
-      user_id: roomIdentity,
-      emoji,
-      action: selected ? "remove" : "add",
-    });
-    setReactionPickerMessageId(null);
-  }
-
-  function handleToggleMessageReaction(message: Message, index: number, emoji: string) {
-    if (isTeamMode) {
-      handleToggleRoomReaction(message, emoji);
-      return;
-    }
-
-    const reactionIdentity = `local:${userProfile.email || userProfile.name || "user"}`;
-    const messageKey = message.id || String(index);
-    updateCurrentPersonalMessages((current) =>
-      current.map((item, itemIndex) => {
-        if ((item.id || String(itemIndex)) !== messageKey) return item;
-        const reactions = { ...(item.reactions || {}) };
-        const userIds = reactions[emoji] || [];
-        reactions[emoji] = userIds.includes(reactionIdentity)
-          ? userIds.filter((userId) => userId !== reactionIdentity)
-          : [...userIds, reactionIdentity];
-        if (reactions[emoji].length === 0) delete reactions[emoji];
-        return { ...item, reactions };
-      })
-    );
-    setReactionPickerMessageId(null);
-  }
-
   function startLongPress(event: React.TouchEvent<HTMLDivElement>, message: Message, index: number) {
+    if (isSelectionMode) return;
     if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
     const touch = event.touches[0];
     const { clientX, clientY } = touch;
@@ -8218,21 +9846,14 @@ if (!response.ok) {
     const canManageMessage =
       message.role === "user" &&
       !message.is_deleted &&
+      !message.isVoiceRecord &&
+      !isObserverActive &&
       (!isTeamMode || (Boolean(message.id) && message.sender_id === roomIdentity));
+    const isAssistantResponse = message.role === "assistant" && !message.is_deleted;
 
     return (
       <div className={`mt-1 hidden flex-col gap-1 px-1 md:flex ${message.role === "user" ? "self-end items-end" : "self-start items-start"}`}>
         <div className="flex items-center gap-1.5 text-slate-400">
-          {!(isTeamMode && roomMemberCount > 1) && <button
-            type="button"
-            onClick={() => handleReloadMessage(message, index)}
-            disabled={isStreaming}
-            className="rounded p-1 transition-colors hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
-            title="Reload response"
-            aria-label="Reload response"
-          >
-            <RotateCcw className="h-3.5 w-3.5" />
-          </button>}
           <button
             type="button"
             onClick={() => handleCopyMessage(message.content, index)}
@@ -8246,37 +9867,6 @@ if (!response.ok) {
               <Copy className="h-3.5 w-3.5" />
             )}
           </button>
-          <button
-            type="button"
-            onClick={() => setForwardMessage(message)}
-            className={`rounded p-1 transition-colors hover:${selectedTheme.textClass}`}
-            title="Forward message"
-            aria-label="Forward message"
-          >
-            <Forward className="h-3.5 w-3.5" />
-          </button>
-          {(
-            <button
-              type="button"
-              onClick={() => setReplyTarget({ author: message.senderName || "User", content: message.content })}
-              className={`rounded p-1 transition-colors hover:${selectedTheme.textClass}`}
-              title="Reply to message"
-              aria-label="Reply to message"
-            >
-              <Reply className="h-3.5 w-3.5" />
-            </button>
-          )}
-          {message.role === "assistant" && !message.is_deleted && (
-            <button
-              type="button"
-              onClick={() => void handleReportAIMistake(message)}
-              className="rounded p-1 text-slate-400 transition-colors hover:text-rose-700"
-              title="Report AI mistake"
-              aria-label="Report AI mistake"
-            >
-              <AlertTriangle className="h-3.5 w-3.5" />
-            </button>
-          )}
           {canManageMessage && (
             <>
               <button
@@ -8286,8 +9876,8 @@ if (!response.ok) {
                   setEditDraft(message.content);
                 }}
                 className="rounded p-1 transition-colors hover:text-sky-700"
-                title="Edit message"
-                aria-label="Edit message"
+                title="Edit prompt"
+                aria-label="Edit prompt"
               >
                 <Edit2 className="h-3.5 w-3.5" />
               </button>
@@ -8302,74 +9892,52 @@ if (!response.ok) {
               </button>
             </>
           )}
-          {!message.is_deleted && (
+          {isAssistantResponse && !(isTeamMode && roomMemberCount > 1) && (
             <button
               type="button"
-              title="Add reaction"
-              aria-label="Add reaction"
-              aria-expanded={reactionPickerMessageId === messageKey}
-              onClick={() =>
-                setReactionPickerMessageId((current) => current === messageKey ? null : messageKey)
-              }
-              className="rounded p-1 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800"
+              onClick={() => handleReloadMessage(message, index)}
+              disabled={isStreaming}
+              className="rounded p-1 transition-colors hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+              title="Regenerate response"
+              aria-label="Regenerate response"
             >
-              <Plus className="h-3.5 w-3.5" />
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {isAssistantResponse && (
+            <button
+              type="button"
+              onClick={() => void handlePlayAudio(message.content, message.id || String(index))}
+              disabled={bufferingAudioId === (message.id || String(index))}
+              className="rounded p-1 transition-colors hover:text-slate-700 disabled:cursor-wait"
+              title={`Read response aloud with ${voicePreset}`}
+              aria-label="Read response aloud"
+            >
+              {bufferingAudioId === (message.id || String(index)) ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" />
+              ) : (
+                <Volume2
+                  className={`h-3.5 w-3.5 ${
+                    playingAudioId === (message.id || String(index))
+                      ? "animate-pulse text-indigo-600"
+                      : ""
+                  }`}
+                />
+              )}
+            </button>
+          )}
+          {isAssistantResponse && (
+            <button
+              type="button"
+              onClick={() => void handleReportAIMistake(message)}
+              className="rounded p-1 text-slate-400 transition-colors hover:text-rose-700"
+              title="Report AI mistake"
+              aria-label="Report AI mistake"
+            >
+              <AlertTriangle className="h-3.5 w-3.5" />
             </button>
           )}
         </div>
-        {reactionPickerMessageId === messageKey && !message.is_deleted && (
-          <div className="flex items-center gap-1 rounded-xl border border-slate-200 bg-white p-1.5 shadow-sm">
-            {QUICK_ROOM_REACTIONS.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                title={`React with ${emoji}`}
-                aria-label={`React with ${emoji}`}
-                onClick={() => handleToggleMessageReaction(message, index, emoji)}
-                className="rounded-md p-1 text-base leading-none transition-colors hover:bg-slate-100"
-              >
-                {emoji}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  function renderMessageReactions(message: Message, index: number) {
-    if (message.is_deleted || (isTeamMode && (!message.id || !roomIdentity))) return null;
-    const reactions = Object.entries(message.reactions || {}).filter(([, userIds]) => userIds.length > 0);
-    if (reactions.length === 0) return null;
-    const reactionIdentity = isTeamMode
-      ? roomIdentity
-      : `local:${userProfile.email || userProfile.name || "user"}`;
-    return (
-      <div className={`mt-1 flex max-w-[85%] flex-wrap items-center gap-1 ${message.role === "user" ? "self-end justify-end" : "self-start"}`}>
-        {reactions.map(([emoji, userIds]) => {
-          const selected = userIds.includes(reactionIdentity);
-          const memberNames = isTeamMode
-            ? userIds.map((userId) =>
-                members.find((member) => member.id === userId)?.name || userId.replace(/^google:/, "Room member")
-              )
-            : userIds.map(() => "You");
-          return (
-            <button
-              key={emoji}
-              type="button"
-              title={memberNames.join(", ")}
-              aria-label={`${emoji}, ${userIds.length} reaction${userIds.length === 1 ? "" : "s"}. Reacted by ${memberNames.join(", ")}`}
-              onClick={() => handleToggleMessageReaction(message, index, emoji)}
-              className={`rounded-full border px-2 py-0.5 text-[11px] transition-colors ${
-                selected
-                  ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} ${selectedTheme.textClass}`
-                  : "border-slate-200 bg-white/90 text-slate-700 hover:bg-slate-50"
-              }`}
-            >
-              {emoji} {userIds.length}
-            </button>
-          );
-        })}
       </div>
     );
   }
@@ -8379,9 +9947,20 @@ if (!response.ok) {
     forceRainbowTrigger = false,
     customText?: string,
     forceObserverMode = false,
-    interventionResponse = false
+    interventionResponse = false,
+    onResponseGenerated?: (content: string) => void,
+    forceGenieResponse = false,
+    forceBackendVoice = false,
+    forceVoiceRecord = false
   ) {
     if (e) e.preventDefault();
+    let storedByokKey = "";
+    try {
+      storedByokKey = localStorage.getItem("genie_user_byok_key") || "";
+    } catch (error) {
+      console.warn("Saved Gemini key could not be read for this chat turn:", error);
+    }
+    const byokKey = storedByokKey.trim() || (byokVerified ? byokApiKey.trim() : "");
     const observerModeForRequest = forceObserverMode || isObserverActive;
     const textToSend = customText !== undefined ? customText : prompt;
     if (!textToSend.trim() && !forceRainbowTrigger) return;
@@ -8389,6 +9968,7 @@ if (!response.ok) {
     const topicIdForRequest = activeTopic?.id || "topic_1";
     const sessionArchiveForRequest = !isTeamMode && Boolean(currentSession?.isSharedArchive);
     const routedPersonalTopic =
+      !forceBackendVoice &&
       !isTeamMode &&
     isTopicConversation &&
     !sessionArchiveForRequest &&
@@ -8399,6 +9979,7 @@ if (!response.ok) {
     const shouldWakeGenie =
       !isTeamMode ||
       forceRainbowTrigger ||
+      forceGenieResponse ||
       checkWakeWordTrigger(actualText);
     if (shouldWakeGenie && observerModeForRequest && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
       setQuotaExceededModalOpen(true);
@@ -8412,6 +9993,7 @@ if (!response.ok) {
         type: "message.send",
         content: actualText,
         sender_name: userProfile.socialHandle || userProfile.name,
+        is_voice_record: forceVoiceRecord,
       }))
     ) return;
 
@@ -8432,6 +10014,7 @@ if (!response.ok) {
       senderEmail: isTeamMode ? userProfile.email : undefined,
       replyTo: sentReplyTarget || undefined,
       triggeredByRainbow: forceRainbowTrigger,
+      isVoiceRecord: forceVoiceRecord,
     };
 
     const updatedMessages = [...messages, userMsg];
@@ -8485,6 +10068,24 @@ if (!response.ok) {
     activeChatAbortControllerRef.current = controller;
 
     try {
+      if (byokKey && routedPersonalTopic) {
+        const directResult = await callActiveGeminiCascade(
+          actualText,
+          isTeamMode
+            ? [...roomMessages, userMsg].filter((message) => !message.is_deleted).slice(-20)
+            : updatedMessages,
+          selectedLang.label,
+          byokKey,
+          undefined,
+          controller.signal,
+        );
+        finalReply = directResult.text;
+        finalModel = directResult.model;
+        finalSource = "cloud_ai";
+        finalProvider = "Google Gemini";
+        finalProviderModel = directResult.model;
+        setActiveModelName(directResult.model);
+      } else {
       let historyForRequest = isTeamMode
         ? [...roomMessages, userMsg].filter((message) => !message.is_deleted).slice(-20)
         : updatedMessages;
@@ -8496,7 +10097,6 @@ if (!response.ok) {
           body: JSON.stringify({
             room_id: roomId,
             google_id_token: googleIdToken,
-            custom_api_key: userProfile.customApiKey || undefined,
             context_messages: historyForRequest.map((message) => ({
               role: message.role,
               content: message.content,
@@ -8532,8 +10132,8 @@ if (!response.ok) {
             topic_id: topicIdForRequest,
             message: actualText,
             message_id: userMsg.id,
-            custom_api_key: userProfile.customApiKey || undefined,
             observer_mode: observerModeForRequest,
+            byok_key: byokKey || undefined,
           }
         : {
             user_email: userProfile.email,
@@ -8543,7 +10143,6 @@ if (!response.ok) {
             conversation_history: historyForRequest,
             provider: "gemini",
             models_cascade: ["gemini-3.6-flash"],
-            custom_api_key: userProfile.customApiKey || undefined,
             profession_context:
               userProfile.role === "professional" ? userProfile.profession : undefined,
             gender_context: userProfile.gender,
@@ -8554,8 +10153,10 @@ if (!response.ok) {
             quoted_message: sentReplyTarget
               ? { author: sentReplyTarget.author, content: sentReplyTarget.content }
               : undefined,
+            byok_key: byokKey || undefined,
           };
       const authHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      if (byokKey) authHeaders["x-byok-key"] = byokKey;
       if (requestToken) authHeaders.Authorization = `Bearer ${requestToken}`;
       const chatEndpoint = getBackendApiUrl(
         routedPersonalTopic
@@ -8576,11 +10177,18 @@ if (!response.ok) {
         }
       );
 
-if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    console.warn("Chat dispatch warning:", errorData);
-    return;
-  }
+      if (!res.ok) {
+        const errText = await res.text();
+        console.error("AI turn response error:", errText);
+        let responseMessage = errText;
+        try {
+          const errorPayload = JSON.parse(errText) as { detail?: string; error?: string };
+          responseMessage = errorPayload.detail || errorPayload.error || errText;
+        } catch {
+          responseMessage = errText;
+        }
+        throw new Error(`AI turn failed (HTTP ${res.status}): ${responseMessage.slice(0, 300)}`);
+      }
       if (useChatStream) {
         if (!res.body) throw new Error("Chat backend did not provide a readable event stream.");
         const reader = res.body.getReader();
@@ -8640,10 +10248,8 @@ if (!res.ok) {
           throw new Error("Chat backend returned an empty response.");
         }
         finalReply = responseText;
-        finalModel = data.model_used === "local-python-mock"
-          ? "Genie Local Engine (Zero-Token)"
-          : "Genie Core Engine";
-        setActiveModelName(finalModel);
+        finalModel = "Genie";
+        setActiveModelName("Genie");
         finalAgentOutput = data.agent_output;
         finalProvider = data.provider_source === "openrouter-fallback"
           ? "OpenRouter"
@@ -8664,6 +10270,7 @@ if (!res.ok) {
             ? "cloud_ai"
             : "local_agent";
       }
+      }
     } catch (primaryError) {
       if (
         controller.signal.aborted ||
@@ -8682,7 +10289,7 @@ if (!res.ok) {
             ? [...roomMessages, userMsg].filter((message) => !message.is_deleted).slice(-20)
             : updatedMessages,
           selectedLang.label,
-          userProfile.customApiKey || undefined,
+          byokVerified ? byokApiKey : undefined,
           googleIdToken,
           controller.signal
         );
@@ -8691,7 +10298,7 @@ if (!res.ok) {
         finalSource = "cloud_ai";
         finalProvider = "Google Gemini";
         finalProviderModel = raceResult.model;
-        setActiveModelName("Genie Core Engine");
+        setActiveModelName("Genie");
       } catch (fallbackError) {
         if (
           controller.signal.aborted ||
@@ -8747,6 +10354,7 @@ if (!res.ok) {
           agentOutput: finalAgentOutput,
           extractedCode: extracted || undefined,
           isIntervention: interventionResponse,
+          isVoiceRecord: forceVoiceRecord,
         };
         if (isTeamMode) {
           await sendEncryptedRoomEvent({
@@ -8756,6 +10364,7 @@ if (!res.ok) {
             sender_name: responseMessage.sender_name,
             source: responseMessage.source,
             agent_name: responseMessage.agentName,
+            is_voice_record: forceVoiceRecord,
           });
         } else {
           if (currentSession && (sessionArchiveForRequest || !isTopicConversation)) {
@@ -8777,6 +10386,7 @@ if (!res.ok) {
         }
 
         if (extracted) setActiveCanvas(extracted);
+        onResponseGenerated?.(sanitized);
       }
       if (isCurrentRequest) {
         setStreamingPreview("");

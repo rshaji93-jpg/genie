@@ -68,12 +68,73 @@ interface BackendChatResponse {
 async function responseError(response: Response): Promise<string> {
   let detail = "";
   try {
-    const data = (await response.json()) as BackendChatResponse;
-    detail = data.detail || data.error || "";
+    const data = (await response.json()) as {
+      detail?: string;
+      error?: string | { message?: string };
+    };
+    detail = data.detail || (typeof data.error === "string" ? data.error : data.error?.message) || "";
   } catch {
     detail = "";
   }
   return detail || `HTTP ${response.status} ${response.statusText}`.trim();
+}
+
+async function callGeminiWithBrowserKey(
+  prompt: string,
+  history: Message[],
+  language: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<{ text: string; model: string }> {
+  const modelsResponse = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`,
+    { signal },
+  );
+  if (!modelsResponse.ok) {
+    throw new Error(`Gemini key request failed: ${await responseError(modelsResponse)}`);
+  }
+  const modelsData = (await modelsResponse.json()) as {
+    models?: { name?: string; supportedGenerationMethods?: string[] }[];
+  };
+  const availableModels = (modelsData.models || [])
+    .filter((model) => model.name && model.supportedGenerationMethods?.includes("generateContent"))
+    .map((model) => model.name!.replace(/^models\//, ""));
+  const model = availableModels.find((name) => name.includes("flash")) || availableModels[0];
+  if (!model) throw new Error("The Gemini API key has no models available for text generation.");
+
+  const contents = [
+    ...history.slice(-6).map((message) => ({
+      role: message.role === "assistant" ? "model" : "user",
+      parts: [{ text: message.content }],
+    })),
+    { role: "user", parts: [{ text: prompt }] },
+  ];
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal,
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: `Respond in the language requested by the user. Selected interface language: ${language || "English"}.` }],
+        },
+        contents,
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`Gemini generation failed: ${await responseError(response)}`);
+  }
+  const data = (await response.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  const text = data.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text || "")
+    .join("")
+    .trim();
+  if (!text) throw new Error("Gemini returned an empty response.");
+  return { text, model };
 }
 
 export async function callActiveGeminiCascade(
@@ -90,7 +151,28 @@ export async function callActiveGeminiCascade(
     senderName: msg.senderName,
     senderEmail: msg.senderEmail,
   }));
-  const cleanProvidedKey = providedKey?.trim() || undefined;
+  let storedBrowserKey = "";
+  if (typeof window !== "undefined") {
+    try {
+      storedBrowserKey = window.localStorage.getItem("genie_user_byok_key") || "";
+    } catch (error) {
+      console.warn("Saved Gemini key could not be read from this browser:", error);
+    }
+  }
+  const cleanProvidedKey =
+    providedKey?.trim() ||
+    storedBrowserKey.trim() ||
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY?.trim() ||
+    undefined;
+  if (cleanProvidedKey) {
+    return callGeminiWithBrowserKey(
+      userPrompt,
+      history || [],
+      selectedLangLabel,
+      cleanProvidedKey,
+      signal,
+    );
+  }
   const backendUrl = getBackendApiUrl("/api/chat");
   let backendFailure: string;
 
@@ -102,7 +184,6 @@ export async function callActiveGeminiCascade(
       body: JSON.stringify({
         prompt: userPrompt,
         conversation_history: conversationHistory,
-        custom_api_key: cleanProvidedKey,
         google_id_token: googleIdToken,
         models_cascade: GEMINI_MODELS,
         space_mode: "personal",
@@ -135,7 +216,6 @@ export async function callActiveGeminiCascade(
         prompt: userPrompt,
         history: conversationHistory,
         languageLabel: selectedLangLabel || "English",
-        customApiKey: cleanProvidedKey,
       }),
     });
 

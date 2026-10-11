@@ -2,6 +2,7 @@
 
 import { Mic, MicOff } from "lucide-react";
 import { PointerEvent, useEffect, useRef, useState } from "react";
+import { INDIAN_DIALECT_MAP } from "./genie/voiceAudio";
 
 interface SpeechRecognitionResultItem {
   isFinal: boolean;
@@ -48,11 +49,12 @@ interface VoiceMicProps {
 
 export default function VoiceMic({
   disabled = false,
-  language = "en-US",
+  language = "en-IN",
   onRecordingChange,
   onError,
   onTranscription,
 }: VoiceMicProps) {
+  const languageCode = INDIAN_DIALECT_MAP[language] || "en-IN";
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState("");
   const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
@@ -63,6 +65,10 @@ export default function VoiceMic({
   const suppressTouchClickRef = useRef(false);
   const touchHoldRef = useRef(false);
   const touchModeRef = useRef(false);
+
+  useEffect(() => {
+    if (recognitionRef.current) recognitionRef.current.lang = languageCode;
+  }, [languageCode]);
 
   useEffect(
     () => () => {
@@ -88,8 +94,8 @@ export default function VoiceMic({
       try {
         const recognition = new SpeechRecognition();
         recognition.continuous = false;
-        recognition.interimResults = false;
-        recognition.lang = language;
+        recognition.interimResults = true;
+        recognition.lang = languageCode;
         recognition.onresult = (event) => {
           const transcript = Array.from(
             { length: event.results.length - event.resultIndex },
@@ -102,13 +108,18 @@ export default function VoiceMic({
           if (transcript) onTranscription(transcript);
         };
         recognition.onerror = (event) => {
-          if (event.error === "aborted" || event.error === "no-speech") return;
-          const message =
-            event.error === "not-allowed" || event.error === "service-not-allowed"
-              ? "Microphone permission was denied. Allow microphone access and try again."
-              : "Speech recognition failed. Please try again.";
-          setError(message);
-          onError?.(message);
+          if (event.error !== "aborted") {
+            const message =
+              event.error === "not-allowed" || event.error === "service-not-allowed"
+                ? "Microphone permission was denied. Allow microphone access and try again."
+                : event.error === "no-speech"
+                  ? "No speech was detected. Try speaking again."
+                  : "Speech recognition failed. Please try again.";
+            setError(message);
+            onError?.(message);
+          }
+          setIsRecording(false);
+          onRecordingChange?.(false);
         };
         recognition.onend = () => {
           if (recognitionRef.current !== recognition) return;

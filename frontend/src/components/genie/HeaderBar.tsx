@@ -7,6 +7,8 @@ import {
   Building2,
   ChevronDown,
   Info,
+  Lock,
+  PhoneCall,
   Settings,
   User,
   Users,
@@ -34,6 +36,9 @@ interface HeaderBarProps {
   accentTextClass: string;
   activeClass: string;
   onOpenRoom: () => void;
+  onStartVoiceCall: () => void;
+  isObserverOn: boolean;
+  canAccessVoiceCall: boolean;
   onOpenSettings: () => void;
   isAuthenticated: boolean;
   isRoomHost: boolean;
@@ -61,6 +66,9 @@ export default function HeaderBar({
   accentTextClass,
   activeClass,
   onOpenRoom,
+  onStartVoiceCall,
+  isObserverOn,
+  canAccessVoiceCall,
   onOpenSettings,
   isAuthenticated,
   isRoomHost,
@@ -162,6 +170,26 @@ export default function HeaderBar({
       </div>
 
       <div className="flex shrink-0 flex-nowrap items-center gap-1.5 sm:gap-2">
+        {isObserverOn && (
+          <button
+            type="button"
+            onClick={onStartVoiceCall}
+            className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium shadow-sm transition-all ${
+              canAccessVoiceCall
+                ? "bg-violet-600 text-white hover:bg-violet-700"
+                : "border border-slate-300 bg-slate-100 text-slate-500 hover:bg-slate-200"
+            }`}
+            title={canAccessVoiceCall ? "Start Live Voice Call" : "Live Voice Calls require a Gemini API key"}
+            aria-label="Call Genie"
+          >
+            {canAccessVoiceCall ? (
+              <PhoneCall className="h-3.5 w-3.5" />
+            ) : (
+              <Lock className="h-3.5 w-3.5" />
+            )}
+            Call Genie
+          </button>
+        )}
         <span className={`hidden rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-3 py-1 text-xs font-bold sm:flex sm:items-center sm:gap-1`}>
           {isCorporateDomain && <Building2 className={`h-3.5 w-3.5 ${accentTextClass}`} />}
           <span className="bg-gradient-to-r from-violet-400 via-pink-400 to-amber-300 bg-clip-text text-transparent">
@@ -171,10 +199,10 @@ export default function HeaderBar({
         <div className="relative flex items-center">
           <button
             type="button"
-            onClick={onOpenSettings}
+            onClick={isTeamMode ? onOpenRoom : onOpenSettings}
             className={`rounded-l-full border ${accentBorderClass} ${chromeSurfaceClass} p-1.5 ${chromeMutedTextClass} transition-colors hover:bg-slate-100 sm:p-2`}
-            title="Workspace Preferences"
-            aria-label="Workspace Preferences"
+            title={isTeamMode ? "Room Admin" : "Workspace Preferences"}
+            aria-label={isTeamMode ? "Room Admin" : "Workspace Preferences"}
           >
             <Settings className="h-4 w-4" />
           </button>

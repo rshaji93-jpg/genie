@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import uuid
+import httpx
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,12 +28,14 @@ from typing import List, Optional, Dict, Any, Set
 from urllib.parse import urlsplit
 from fastapi import Cookie, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import dotenv_values, load_dotenv
 from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import id_token as google_id_token
+from gtts import gTTS
+from gtts.tts import gTTSError
 from cryptography.fernet import Fernet, InvalidToken
 import pyotp
 try:
@@ -60,6 +63,16 @@ load_dotenv(BACKEND_DIR.parent / ".env", override=False)
 app = FastAPI(title="Personal AI Genie API", version="4.8.0")
 logger = logging.getLogger(__name__)
 
+
+@app.exception_handler(Exception)
+async def handle_unexpected_api_error(_request: Request, error: Exception):
+    logger.error("Unhandled API error: %s", type(error).__name__)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error."},
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -68,7 +81,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "rshaji93@gmail.com").strip().lower()
+GEMINI_MASTER_KEY = os.getenv("GEMINI_MASTER_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_KEY = (OPENROUTER_API_KEY or "").strip()
 FRONTEND_ENV = dotenv_values(PROJECT_ROOT / "frontend" / ".env.local")
 FRONTEND_GOOGLE_CLIENT_ID = str(
     FRONTEND_ENV.get("NEXT_PUBLIC_GOOGLE_CLIENT_ID") or ""
@@ -337,6 +353,16 @@ def initialize_archive_store():
                     passcode_salt TEXT NOT NULL DEFAULT '',
                     passcode_hash TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS removed_room_members (
+                    room_id TEXT NOT NULL,
+                    member_id TEXT NOT NULL,
+                    removed_at TEXT NOT NULL,
+                    PRIMARY KEY (room_id, member_id)
                 )
                 """
             )
@@ -636,6 +662,7 @@ class ChatRequest(BaseModel):
     space_mode: Optional[str] = "personal"
     conversation_history: Optional[List[ChatMessage]] = []
     custom_api_key: Optional[str] = None
+    byok_key: Optional[str] = None
     language_code: Optional[str] = "en-IN"
     is_team_chat: Optional[bool] = False
     is_observer_active: Optional[bool] = False
@@ -643,6 +670,22 @@ class ChatRequest(BaseModel):
     engine: str = "cloud_ai"
     agent_target: str = "manager"
     models_cascade: Optional[List[str]] = None
+
+
+class TextToSpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+    lang: str = Field(min_length=2, max_length=8)
+
+
+class DirectVoiceTurnRequest(BaseModel):
+    system_text: str = Field(min_length=1, max_length=2000)
+    contents: List[Dict[str, Any]] = Field(min_length=1, max_length=20)
+    transcript: str = Field(min_length=1, max_length=5000)
+    dialect: str = Field(min_length=2, max_length=64)
+    voice_name: str = Field(pattern="^(Aoede|Charon)$")
+    user_email: Optional[str] = None
+    google_id_token: Optional[str] = None
+    user_byok_key: Optional[str] = None
 
 
 class TopicChannelRequest(BaseModel):
@@ -795,6 +838,7 @@ class RoomManager:
         self.connections: Dict[str, Set[WebSocket]] = {}
         self.identities: Dict[WebSocket, RoomConnection] = {}
         self.messages: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self.voice_calls: Dict[str, Dict[str, Any]] = {}
         self.lock = asyncio.Lock()
 
     def _active_users(self, room_id: str) -> List[Dict[str, str]]:
@@ -817,18 +861,22 @@ class RoomManager:
     def _room_members(self, room_id: str) -> List[Dict[str, Any]]:
         with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
             row = connection.execute(
-                "SELECT members_json FROM sovereign_rooms WHERE room_id = ?",
+                "SELECT host_id, members_json FROM sovereign_rooms WHERE room_id = ?",
                 (room_id,),
             ).fetchone()
         if not row:
             return self._active_users(room_id)
         active = {member["id"]: member for member in self._active_users(room_id)}
         try:
-            stored_members = json.loads(row[0])
+            stored_members = json.loads(row[1])
         except (ValueError, TypeError):
             return self._active_users(room_id)
         return [
-            {**member, "status": "active" if member["id"] in active else "inactive"}
+            {
+                **member,
+                "status": "active" if member["id"] in active else "inactive",
+                "role": "sovereign" if member["id"] == row[0] else "member",
+            }
             for member in stored_members
         ]
 
@@ -841,9 +889,13 @@ class RoomManager:
     ):
         now = datetime.now(timezone.utc).isoformat()
         with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
-            if room_id.startswith(("share_", "invite_")):
-                connection.execute("BEGIN IMMEDIATE")
+            connection.execute("BEGIN IMMEDIATE")
             with connection:
+                if connection.execute(
+                    "SELECT 1 FROM removed_room_members WHERE room_id = ? AND member_id = ?",
+                    (room_id, connection_info.client_id),
+                ).fetchone():
+                    raise HTTPException(status_code=403, detail="The room host removed your membership.")
                 if connection.execute(
                     "SELECT 1 FROM ended_rooms WHERE room_id = ?", (room_id,)
                 ).fetchone():
@@ -972,6 +1024,7 @@ class RoomManager:
                         await websocket.close(code=1008, reason="This direct room is unavailable because of a block.")
                 if not self.connections.get(room_id):
                     self.connections.pop(room_id, None)
+                    self.voice_calls.pop(room_id, None)
                 await self._presence(room_id)
 
     async def connect(self, room_id: str, connection: RoomConnection):
@@ -1047,12 +1100,27 @@ class RoomManager:
             self.identities.pop(websocket, None)
             if not self.connections.get(room_id):
                 self.connections.pop(room_id, None)
+                self.voice_calls.pop(room_id, None)
+            await self._presence(room_id)
+
+    async def remove_member(self, room_id: str, member_id: str):
+        async with self.lock:
+            for websocket in list(self.connections.get(room_id, set())):
+                connection = self.identities.get(websocket)
+                if connection and connection.client_id == member_id:
+                    self.connections[room_id].discard(websocket)
+                    self.identities.pop(websocket, None)
+                    await websocket.close(code=1008, reason="The room host removed your membership.")
+            if not self.connections.get(room_id):
+                self.connections.pop(room_id, None)
+                self.voice_calls.pop(room_id, None)
             await self._presence(room_id)
 
     async def close_room(self, room_id: str):
         async with self.lock:
             room_connections = list(self.connections.pop(room_id, set()))
             self.messages.pop(room_id, None)
+            self.voice_calls.pop(room_id, None)
             for websocket in room_connections:
                 self.identities.pop(websocket, None)
                 await websocket.close(code=1000, reason="The room host ended this session.")
@@ -1064,7 +1132,87 @@ class RoomManager:
                 return
             event_type = event.get("type")
             messages = self.messages.setdefault(room_id, {})
-            if event_type == "message.send":
+            if event_type == "voice_session.start":
+                call_id = str(event.get("call_id") or "")
+                if not call_id or len(call_id) > 80:
+                    await websocket.send_json({"type": "error", "detail": "A valid voice session ID is required."})
+                    return
+                call = {
+                    "call_id": call_id,
+                    "started_by": connection.client_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "responders": set(),
+                }
+                self.voice_calls[room_id] = call
+                participants = self._active_users(room_id)
+                for peer in list(self.connections.get(room_id, set())):
+                    await peer.send_json({
+                        "type": "voice_session.started",
+                        "call_id": call_id,
+                        "started_by": connection.client_id,
+                        "started_at": call["started_at"],
+                        "participants": participants,
+                    })
+            elif event_type == "voice_session.turn":
+                call_id = str(event.get("call_id") or "")
+                call = self.voice_calls.get(room_id)
+                turn_id = str(event.get("turn_id") or "")
+                role = event.get("role")
+                encrypted_payloads = event.get("encrypted_payloads")
+                allowed_recipients = {member["id"] for member in self._room_members(room_id)}
+                active_recipients = {member["id"] for member in self._active_users(room_id)}
+                if (
+                    not call
+                    or call.get("call_id") != call_id
+                    or not turn_id
+                    or len(turn_id) > 80
+                    or role not in ("user", "assistant")
+                    or (role == "assistant" and connection.client_id not in call["responders"])
+                    or not isinstance(encrypted_payloads, dict)
+                    or not encrypted_payloads
+                    or not active_recipients.issubset(encrypted_payloads)
+                    or not set(encrypted_payloads).issubset(allowed_recipients)
+                    or not all(is_encrypted_message_envelope(payload) for payload in encrypted_payloads.values())
+                ):
+                    await websocket.send_json({"type": "error", "detail": "Voice turn is invalid or not encrypted for active room members."})
+                    return
+                speaker = {
+                    "id": connection.client_id if role == "user" else "genie-master",
+                    "name": connection.display_name if role == "user" else "Genie Master",
+                    "avatar_url": connection.avatar_url if role == "user" else None,
+                    "role": role,
+                }
+                if role == "user":
+                    call["responders"].add(connection.client_id)
+                for peer in list(self.connections.get(room_id, set())):
+                    recipient = self.identities.get(peer)
+                    if recipient is None or recipient.client_id not in encrypted_payloads:
+                        continue
+                    await peer.send_json({
+                        "type": "voice_session.turn",
+                        "call_id": call_id,
+                        "turn_id": turn_id,
+                        "speaker": speaker,
+                        "timestamp": str(event.get("timestamp") or datetime.now(timezone.utc).isoformat())[:80],
+                        "encrypted_payloads": encrypted_payloads,
+                        "sender_id": connection.client_id,
+                        "sender_public_key": connection.public_key,
+                    })
+            elif event_type == "voice_session.end":
+                call_id = str(event.get("call_id") or "")
+                call = self.voice_calls.get(room_id)
+                if not call or call.get("call_id") != call_id:
+                    await websocket.send_json({"type": "error", "detail": "Voice session was not found."})
+                    return
+                self.voice_calls.pop(room_id, None)
+                for peer in list(self.connections.get(room_id, set())):
+                    await peer.send_json({
+                        "type": "voice_session.ended",
+                        "call_id": call_id,
+                    })
+                if not self.connections.get(room_id):
+                    self.voice_calls.pop(room_id, None)
+            elif event_type == "message.send":
                 if room_id.startswith("direct:") and any(
                     are_users_blocked(connection.client_id, member["id"])
                     for member in self._room_members(room_id)
@@ -1120,6 +1268,7 @@ class RoomManager:
                     "read_by": [],
                     "reactions": {},
                     "role": "assistant" if event.get("sender_type") == "assistant" else "user",
+                    "is_voice_record": event.get("is_voice_record") is True,
                 }
                 source = event.get("source")
                 if source in (
@@ -1134,6 +1283,9 @@ class RoomManager:
                     message["agent_name"] = event["agent_name"][:80]
                 if isinstance(event.get("agent_output"), dict):
                     message["agent_output"] = event["agent_output"]
+                if event.get("is_voice_session_summary") is True:
+                    message["is_voice_session_summary"] = True
+                    message["call_id"] = str(event.get("call_id") or "")[:80]
                 eligible_recipients = []
                 for peer in list(self.connections.get(room_id, set())):
                     recipient = self.identities.get(peer)
@@ -1169,11 +1321,40 @@ class RoomManager:
                                 "message_id": message_id,
                                 "user_ids": message["delivered_to"],
                             })
+            elif event_type == "room.wipe":
+                self.voice_calls.pop(room_id, None)
+                with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as database:
+                    row = database.execute(
+                        "SELECT host_id FROM sovereign_rooms WHERE room_id = ?",
+                        (room_id,),
+                    ).fetchone()
+                if not row or row[0] != connection.client_id:
+                    await websocket.send_json({"type": "error", "detail": "Only the room host can wipe this chat."})
+                    return
+                for message in messages.values():
+                    message["deleted"] = True
+                    message["is_deleted"] = True
+                    message["encrypted_payloads"] = {}
+                    self.persist_encrypted_message(room_id, message)
+                    for peer in list(self.connections.get(room_id, set())):
+                        recipient = self.identities.get(peer)
+                        if recipient:
+                            await peer.send_json({
+                                "type": "message",
+                                "action": "delete",
+                                "message": self._message_for_recipient(message, recipient.client_id),
+                            })
             elif event_type in ("message.edit", "message.delete"):
                 message_id = str(event.get("message_id") or "")
                 message = messages.get(message_id)
                 if message is None or message["user_id"] != connection.client_id:
                     await websocket.send_json({"type": "error", "detail": "Message not found or not editable."})
+                    return
+                if event_type == "message.delete" and message.get("is_voice_record"):
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "Voice-call transcript records cannot be deleted.",
+                    })
                     return
                 if event_type == "message.edit":
                     encrypted_payloads = event.get("encrypted_payloads")
@@ -1421,6 +1602,16 @@ class RoomPasscodeUpdateRequest(BaseModel):
     passcode: str = Field(min_length=6, max_length=64)
 
 
+class RoomMemberActionRequest(BaseModel):
+    google_id_token: str
+    member_id: str = Field(min_length=1, max_length=256)
+
+
+class RoomOwnershipTransferRequest(BaseModel):
+    google_id_token: str
+    new_host_id: str = Field(min_length=1, max_length=256)
+
+
 def get_online_user_ids() -> Set[str]:
     return {
         info.client_id.removeprefix("google:")
@@ -1463,6 +1654,11 @@ def authorize_room_member(
 ):
     client_id = f"google:{identity['sub']}"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        if connection.execute(
+            "SELECT 1 FROM removed_room_members WHERE room_id = ? AND member_id = ?",
+            (room_id, client_id),
+        ).fetchone():
+            raise HTTPException(status_code=403, detail="The room host removed your membership.")
         if room_id.startswith(("share_", "invite_")):
             connection.execute("BEGIN IMMEDIATE")
         if connection.execute(
@@ -1558,6 +1754,67 @@ async def update_room_passcode(req: RoomPasscodeUpdateRequest):
                 ),
             )
     return {"status": "success"}
+
+
+@app.post("/api/rooms/{room_id}/members/remove")
+async def remove_room_member(room_id: str, req: RoomMemberActionRequest):
+    identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    client_id = f"google:{identity['sub']}"
+    if req.member_id == client_id:
+        raise HTTPException(status_code=400, detail="The room host cannot remove themself.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            row = connection.execute(
+                "SELECT host_id, members_json FROM sovereign_rooms WHERE room_id = ?",
+                (room_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Room does not exist.")
+            if row[0] != client_id:
+                raise HTTPException(status_code=403, detail="Only the room host can remove members.")
+            members = json.loads(row[1])
+            if not any(member.get("id") == req.member_id for member in members):
+                raise HTTPException(status_code=404, detail="Room member was not found.")
+            connection.execute(
+                "UPDATE sovereign_rooms SET members_json = ?, updated_at = ? WHERE room_id = ?",
+                (json.dumps([member for member in members if member.get("id") != req.member_id]), now, room_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO removed_room_members(room_id, member_id, removed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(room_id, member_id) DO UPDATE SET removed_at = excluded.removed_at
+                """,
+                (room_id, req.member_id, now),
+            )
+    await room_manager.remove_member(room_id, req.member_id)
+    return {"status": "removed"}
+
+
+@app.post("/api/rooms/{room_id}/transfer-host")
+async def transfer_room_host(room_id: str, req: RoomOwnershipTransferRequest):
+    identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    client_id = f"google:{identity['sub']}"
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            row = connection.execute(
+                "SELECT host_id, members_json FROM sovereign_rooms WHERE room_id = ?",
+                (room_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Room does not exist.")
+            if row[0] != client_id:
+                raise HTTPException(status_code=403, detail="Only the room host can transfer ownership.")
+            if not any(member.get("id") == req.new_host_id for member in json.loads(row[1])):
+                raise HTTPException(status_code=404, detail="The new host must be a room member.")
+            connection.execute(
+                "UPDATE sovereign_rooms SET host_id = ?, updated_at = ? WHERE room_id = ?",
+                (req.new_host_id, now, room_id),
+            )
+    await room_manager._presence(room_id)
+    return {"status": "transferred"}
 
 
 @app.delete("/api/rooms/{room_id}")
@@ -4182,7 +4439,11 @@ async def stream_chat(
     req: ChatRequest,
     request: Request,
     authorization: Optional[str] = Header(default=None),
+    x_byok_key: Optional[str] = Header(default=None),
 ):
+    req.custom_api_key = (
+        req.custom_api_key or req.byok_key or x_byok_key or ""
+    ).strip() or None
     if req.is_team_chat:
         raise HTTPException(status_code=400, detail="Team messages cannot use the AI streaming endpoint.")
     prompt = (req.prompt or req.message or "").strip()
@@ -4293,6 +4554,407 @@ async def transcribe_voice(file: UploadFile = File(...)):
     return {"text": text.strip()}
 
 
+VOICE_CONFIG = {
+    "ta": {"language_code": "ta-IN", "name": "ta-IN-Standard-A"},
+    "hi": {"language_code": "hi-IN", "name": "hi-IN-Neural2-A"},
+    "ml": {"language_code": "ml-IN", "name": "ml-IN-Standard-A"},
+    "te": {"language_code": "te-IN", "name": "te-IN-Standard-A"},
+    "kn": {"language_code": "kn-IN", "name": "kn-IN-Standard-A"},
+    "bn": {"language_code": "bn-IN", "name": "bn-IN-Standard-A"},
+    "mr": {"language_code": "mr-IN", "name": "mr-IN-Standard-A"},
+    "gu": {"language_code": "gu-IN", "name": "gu-IN-Standard-A"},
+    "pa": {"language_code": "pa-IN", "name": "pa-IN-Standard-A"},
+    "or": {"language_code": "or-IN", "name": "or-IN-Standard-A"},
+    "ur": {"language_code": "ur-IN", "name": "ur-IN-Standard-A"},
+    "as": {"language_code": "as-IN", "name": "as-IN-Standard-A"},
+    "sa": {"language_code": "sa-IN", "name": "sa-IN-Standard-A"},
+    "en": {"language_code": "en-IN", "name": "en-IN-Journey-D"},
+}
+
+
+@app.post("/api/tts/speak")
+async def speak_text(req: TextToSpeechRequest):
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text to synthesize cannot be blank.")
+    if len(text) > 5000:
+        raise HTTPException(status_code=413, detail="Text to synthesize must be 5,000 characters or fewer.")
+    voice = VOICE_CONFIG.get(req.lang.strip().lower().split("-")[0])
+    if not voice:
+        raise HTTPException(status_code=400, detail="The requested language is not supported for speech synthesis.")
+
+    api_key = (
+        os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GEMINI_API_KEY")
+        or ""
+    ).strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Regional speech synthesis is not configured.")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://texttospeech.googleapis.com/v1/text:synthesize",
+                params={"key": api_key},
+                json={
+                    "input": {"text": text},
+                    "voice": {
+                        "languageCode": voice["language_code"],
+                        "name": voice["name"],
+                    },
+                    "audioConfig": {
+                        "audioEncoding": "MP3",
+                        "speakingRate": 0.95,
+                        "pitch": 0.0,
+                    },
+                },
+            )
+    except httpx.TimeoutException as error:
+        logger.warning("Google Cloud Text-to-Speech request timed out.")
+        raise HTTPException(status_code=504, detail="The speech synthesis provider timed out.") from error
+    except httpx.RequestError as error:
+        logger.warning("Google Cloud Text-to-Speech request failed: %s", type(error).__name__)
+        raise HTTPException(status_code=502, detail="The speech synthesis provider could not be reached.") from error
+
+    if not response.is_success:
+        try:
+            provider_error = response.json().get("error", {})
+            provider_message = provider_error.get("message", "")
+        except (ValueError, AttributeError):
+            provider_message = ""
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Speech synthesis quota has been exceeded.")
+        if response.status_code in (400, 403):
+            logger.warning("Google Cloud Text-to-Speech rejected the request (HTTP %s).", response.status_code)
+            raise HTTPException(
+                status_code=502,
+                detail=provider_message or "The speech synthesis provider rejected the request.",
+            )
+        logger.warning("Google Cloud Text-to-Speech returned HTTP %s.", response.status_code)
+        raise HTTPException(status_code=502, detail="The speech synthesis provider could not complete the request.")
+
+    try:
+        audio_content = response.json().get("audioContent")
+        if not isinstance(audio_content, str) or not audio_content:
+            raise ValueError("Missing audio content.")
+        audio_bytes = base64.b64decode(audio_content, validate=True)
+    except (ValueError, binascii.Error, AttributeError) as error:
+        logger.warning("Google Cloud Text-to-Speech returned invalid audio data.")
+        raise HTTPException(status_code=502, detail="The speech synthesis provider returned invalid audio data.") from error
+
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
+def sanitize_voice_text(text: str) -> str:
+    text = re.sub(r"\$\$.*?\$\$|\$[^$]*\$", " ", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\w)(\*{1,2}|_{1,2})(?=\S)|(?<=\S)(\*{1,2}|_{1,2})(?!\w)", "", text)
+    spoken_symbols = {
+        "≤": " less than or equal to ",
+        "≥": " greater than or equal to ",
+        "<": " less than ",
+        ">": " greater than ",
+        "≠": " not equal to ",
+        "≈": " approximately ",
+        "×": " times ",
+        "÷": " divided by ",
+        "→": " leads to ",
+        "←": " comes from ",
+        "±": " plus or minus ",
+        "=": " equals ",
+        "+": " plus ",
+        "−": " minus ",
+        "/": " divided by ",
+        "^": " to the power of ",
+    }
+    text = re.sub(r"(?m)^\s*>+\s?", "", text)
+    text = re.sub(r"(?<=\w)\s*\*\s*(?=\w)", " times ", text)
+    text = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", text)
+    text = re.sub(
+        r"[≤≥≠≈×÷→←±=+−/^]",
+        lambda match: spoken_symbols[match.group(0)],
+        text,
+    )
+    text = re.sub(r"[<>]", lambda match: spoken_symbols[match.group(0)], text)
+    text = re.sub(r"[#*_~`|]", " ", text)
+    text = re.sub(r"\\[a-zA-Z]+", " ", text)
+    text = re.sub(r"[{}\[\]]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+VOICE_SYSTEM_INSTRUCTION = (
+    "You are Genie Master in a live spoken voice call. "
+    "Respond strictly and fluently in the requested language. "
+    "State only the direct core logic in 2 to 3 natural sentences. "
+    "Do not use markdown headers, bullet points, tables, asterisks, math formulas, or URLs."
+)
+
+TTS_LANG_MAP = {
+    "தமிழ்": "ta",
+    "Tamil": "ta",
+    "മലയാളം": "ml",
+    "Malayalam": "ml",
+    "తెలుగు": "te",
+    "Telugu": "te",
+    "ಕನ್ನಡ": "kn",
+    "Kannada": "kn",
+    "हिन्दी": "hi",
+    "Hindi": "hi",
+    "বাংলা": "bn",
+    "Bengali": "bn",
+    "मराठी": "mr",
+    "Marathi": "mr",
+    "ગુજરાતી": "gu",
+    "Gujarati": "gu",
+    "ਪੰਜਾਬੀ": "pa",
+    "Punjabi": "pa",
+    "اردو": "ur",
+    "Urdu": "ur",
+    "EN (India)": "en",
+    "English": "en",
+    "ta-IN": "ta",
+    "ml-IN": "ml",
+    "te-IN": "te",
+    "kn-IN": "kn",
+    "hi-IN": "hi",
+    "bn-IN": "bn",
+    "mr-IN": "mr",
+    "gu-IN": "gu",
+    "pa-IN": "pa",
+    "ur-IN": "ur",
+    "en-IN": "en",
+}
+
+GOOGLE_TTS_ONLY_DIALECTS = {
+    "ଓଡ଼ିଆ": "or-IN",
+    "Odia": "or-IN",
+    "or-IN": "or-IN",
+    "অসমীয়া": "as-IN",
+    "Assamese": "as-IN",
+    "as-IN": "as-IN",
+    "संस्कृतम्": "sa-IN",
+    "Sanskrit": "sa-IN",
+    "sa-IN": "sa-IN",
+}
+
+
+def synthesize_voice_audio(text: str, tts_lang: str) -> str:
+    audio_fp = io.BytesIO()
+    gTTS(text=text, lang=tts_lang, slow=False).write_to_fp(audio_fp)
+    audio_fp.seek(0)
+    return base64.b64encode(audio_fp.read()).decode("utf-8")
+
+
+@app.post("/api/voice/direct-turn")
+async def direct_voice_turn(
+    req: DirectVoiceTurnRequest,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    bearer_token = (
+        authorization.removeprefix("Bearer ").strip()
+        if authorization and authorization.startswith("Bearer ")
+        else ""
+    )
+    session_tokens = [
+        (request.cookies.get(cookie_name) or "").strip()
+        for cookie_name in ("genie_session", "session", "auth_token", "access_token")
+    ]
+    candidate_tokens = dict.fromkeys(
+        token
+        for token in (bearer_token, *session_tokens, (req.google_id_token or "").strip())
+        if token
+    )
+    identity = None
+    for identity_token in candidate_tokens:
+        identity_authorization = f"Bearer {identity_token}"
+        candidate_identity = (
+            local_developer_identity(request, identity_authorization)
+            if identity_token == "dev-token-local-bypass"
+            else get_verified_archive_identity(identity_authorization)
+        )
+        if candidate_identity:
+            identity = candidate_identity
+            break
+    is_master_admin = (
+        bool(identity)
+        and identity.get("email", "").strip().lower() == ADMIN_EMAIL
+    )
+
+    # A user_email supplied by the client is not proof of identity; the admin path
+    # is available only when the session token/cookie verifies to the owner.
+    user_byok_key = (req.user_byok_key or "").strip()
+    if not is_master_admin and not user_byok_key:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "BYOK_REQUIRED"},
+        )
+
+    api_key = (GEMINI_MASTER_KEY or "").strip() if is_master_admin else user_byok_key
+    openrouter_key = (OPENROUTER_API_KEY or "").strip() if is_master_admin else ""
+    if not api_key and not openrouter_key:
+        raise HTTPException(status_code=503, detail="Direct voice generation is not configured.")
+
+    transcript = req.transcript.strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="A live speech transcript is required.")
+    voice_contents = [dict(item) for item in req.contents]
+    last_item = voice_contents[-1] if voice_contents else None
+    last_parts = last_item.get("parts") if isinstance(last_item, dict) else None
+    last_user_text = " ".join(
+        part["text"].strip()
+        for part in (last_parts or [])
+        if isinstance(part, dict)
+        and isinstance(part.get("text"), str)
+        and part["text"].strip()
+    ) if isinstance(last_item, dict) and last_item.get("role") == "user" else ""
+    if last_user_text != transcript:
+        voice_contents.append({"role": "user", "parts": [{"text": transcript}]})
+    system_instruction = (
+        f"{VOICE_SYSTEM_INSTRUCTION} Dialect: {req.dialect.strip()}."
+        f"\n\n{req.system_text}".strip()
+    )
+    generated_text = ""
+    result: Dict[str, Any] = {"candidates": [{"content": {"parts": []}}]}
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            if api_key:
+                try:
+                    response = await client.post(
+                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                        params={"key": api_key},
+                        json={
+                            "systemInstruction": {"parts": [{"text": system_instruction}]},
+                            "contents": voice_contents,
+                        },
+                    )
+                    if response.status_code != 200:
+                        raise RuntimeError(
+                            f"Gemini voice request failed (HTTP {response.status_code}): {response.text}"
+                        )
+                    result = response.json()
+                    candidates = result.get("candidates") or []
+                    content = candidates[0].get("content") if candidates else None
+                    parts = content.get("parts") if isinstance(content, dict) else None
+                    generated_text = " ".join(
+                        part["text"].strip()
+                        for part in (parts or [])
+                        if isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and part["text"].strip()
+                    )
+                    if generated_text:
+                        candidates = result.get("candidates") or [{"content": {"parts": []}}]
+                        if not isinstance(candidates[0].get("content"), dict):
+                            candidates[0]["content"] = {"parts": []}
+                        content = candidates[0]["content"]
+                        if not isinstance(content.get("parts"), list):
+                            content["parts"] = []
+                        if not any(
+                            isinstance(part, dict) and part.get("text", "").strip()
+                            for part in content["parts"]
+                        ):
+                            content["parts"].append({"text": generated_text})
+                        result["candidates"] = candidates
+                except (httpx.TimeoutException, httpx.RequestError, RuntimeError, ValueError, TypeError) as e:
+                    print(f"[GEMINI CALL ERROR]: {e}", flush=True)
+                    if not openrouter_key:
+                        if isinstance(e, httpx.TimeoutException):
+                            raise HTTPException(status_code=504, detail="Direct voice generation timed out.") from e
+                        raise HTTPException(status_code=502, detail="Direct voice generation is temporarily unavailable.") from e
+
+            if not generated_text and openrouter_key:
+                messages = [{"role": "system", "content": system_instruction}]
+                for item in voice_contents:
+                    role = "assistant" if item.get("role") in {"model", "assistant"} else "user"
+                    parts = item.get("parts") or []
+                    text = " ".join(
+                        part["text"].strip()
+                        for part in parts
+                        if isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and part["text"].strip()
+                    )
+                    if text:
+                        messages.append({"role": role, "content": text})
+                openrouter_response = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {openrouter_key}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://genie.local",
+                        "X-Title": "Personal AI Genie",
+                    },
+                    json={
+                        "model": OPENROUTER_FREE_MODELS[0],
+                        "messages": messages,
+                        "temperature": 0.7,
+                    },
+                )
+                if openrouter_response.status_code != 200:
+                    raise RuntimeError(
+                        f"OpenRouter voice fallback failed (HTTP {openrouter_response.status_code}): "
+                        f"{openrouter_response.text}"
+                    )
+                openrouter_data = openrouter_response.json()
+                choices = openrouter_data.get("choices") or []
+                message = choices[0].get("message") if choices else None
+                content = message.get("content") if isinstance(message, dict) else ""
+                generated_text = content.strip() if isinstance(content, str) else ""
+                if not generated_text:
+                    raise RuntimeError("OpenRouter returned an empty voice transcript.")
+                result = {
+                    "candidates": [{
+                        "content": {"parts": [{"text": scrub_sensitive_tokens(generated_text)}]}
+                    }]
+                }
+            if not generated_text:
+                raise RuntimeError("Voice provider returned an empty transcript.")
+            for candidate in result.get("candidates") or []:
+                content = candidate.get("content")
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts") or []:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        part["text"] = sanitize_voice_text(part["text"])
+            generated_text = sanitize_voice_text(generated_text)
+            try:
+                dialect = req.dialect.strip()
+                cloud_language = GOOGLE_TTS_ONLY_DIALECTS.get(dialect)
+                if cloud_language:
+                    server_audio = await speak_text(
+                        TextToSpeechRequest(text=generated_text, lang=cloud_language)
+                    )
+                    audio_base64 = base64.b64encode(server_audio.body).decode("utf-8")
+                else:
+                    tts_lang = TTS_LANG_MAP.get(dialect, "en")
+                    audio_base64 = await asyncio.to_thread(
+                        synthesize_voice_audio,
+                        generated_text,
+                        tts_lang,
+                    )
+            except gTTSError as error:
+                logger.error("gTTS voice synthesis failed for dialect %r: %s", req.dialect, error)
+                raise HTTPException(
+                    status_code=502,
+                    detail="The speech synthesis provider could not complete the request.",
+                ) from error
+            return JSONResponse(
+                content={
+                    **result,
+                    "text": generated_text,
+                    "audio": audio_base64,
+                }
+            )
+    except (httpx.TimeoutException, httpx.RequestError, RuntimeError, ValueError, TypeError) as e:
+        print(f"[GEMINI CALL ERROR]: {e}", flush=True)
+        if isinstance(e, httpx.TimeoutException):
+            raise HTTPException(status_code=504, detail="Direct voice generation timed out.") from e
+        if isinstance(e, httpx.RequestError):
+            raise HTTPException(status_code=502, detail="Direct voice generation is temporarily unavailable.") from e
+        if isinstance(e, (ValueError, TypeError)):
+            raise HTTPException(status_code=502, detail="Direct voice provider returned invalid data.") from e
+        raise HTTPException(status_code=502, detail="Direct voice generation failed.") from e
+
+
 @app.post("/chat", include_in_schema=False)
 @app.post("/api/py/chat", include_in_schema=False)
 @app.post("/api/chat")
@@ -4301,7 +4963,11 @@ async def handle_chat(
     req: ChatRequest,
     request: Request,
     authorization: Optional[str] = Header(default=None),
+    x_byok_key: Optional[str] = Header(default=None),
 ):
+    req.custom_api_key = (
+        req.custom_api_key or req.byok_key or x_byok_key or ""
+    ).strip() or None
     if req.is_team_chat:
         raise HTTPException(
             status_code=400,
