@@ -98,7 +98,11 @@ async def handle_unexpected_api_error(_request: Request, error: Exception):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://personalaigenie.pages.dev",
+        "https://*.pages.dev",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
