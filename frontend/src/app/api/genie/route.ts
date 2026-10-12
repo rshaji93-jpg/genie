@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-
+export const runtime = 'edge';
 interface ChatMessage {
   role: string;
   content: string;
