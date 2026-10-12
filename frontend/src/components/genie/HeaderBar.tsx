@@ -9,13 +9,40 @@ import {
   Info,
   Lock,
   PhoneCall,
+  Download,
+  Activity,
   Settings,
   User,
   Users,
   Users2,
+  Zap,
+  X,
 } from "lucide-react";
 
 type SpaceMode = "personal" | "workspace";
+
+interface HeaderMember {
+  id: string;
+  name: string;
+  role: string;
+  isOriginAdmin?: boolean;
+  avatarUrl?: string;
+  status: "active" | "inactive" | "different_room";
+}
+
+interface AdminTelemetry {
+  total_registered_users: { total: number; personal: number; workspace: number };
+  active_connections_count: number;
+  live_active_users: Array<{
+    id: string;
+    name: string;
+    email: string;
+    avatar_url: string;
+    room_id: string;
+    focused: boolean;
+    status: "active" | "inactive" | "different_room";
+  }>;
+}
 
 interface HeaderBarProps {
   spaceMode: SpaceMode;
@@ -25,7 +52,11 @@ interface HeaderBarProps {
   isCorporateDomain: boolean;
   workspaceName: string;
   profileGender?: string;
+  corporateAvatarUrl?: string;
+  corporateDisplayName?: string;
+  corporateTenantId?: string;
   activeMemberCount: number;
+  members: HeaderMember[];
   capacityLabel: string;
   chromeClass: string;
   chromeSurfaceClass: string;
@@ -42,9 +73,17 @@ interface HeaderBarProps {
   onOpenSettings: () => void;
   isAuthenticated: boolean;
   isRoomHost: boolean;
+  canInviteMembers: boolean;
+  canExport: boolean;
+  exportDisabledReason: string;
+  onExport: (format: "markdown" | "json") => void;
+  onPurgeContext: () => void;
   onCopyInvite: (mode: SpaceMode) => void;
   onLeaveRoom: () => void;
   onEndRoom: () => void;
+  isSuperAdmin: boolean;
+  adminTelemetry: AdminTelemetry | null;
+  adminTelemetryError: string;
 }
 
 export default function HeaderBar({
@@ -55,7 +94,11 @@ export default function HeaderBar({
   isCorporateDomain,
   workspaceName,
   profileGender,
+  corporateAvatarUrl,
+  corporateDisplayName,
+  corporateTenantId,
   activeMemberCount,
+  members,
   capacityLabel,
   chromeClass,
   chromeSurfaceClass,
@@ -72,25 +115,55 @@ export default function HeaderBar({
   onOpenSettings,
   isAuthenticated,
   isRoomHost,
+  canInviteMembers,
+  canExport,
+  exportDisabledReason,
+  onExport,
+  onPurgeContext,
   onCopyInvite,
   onLeaveRoom,
   onEndRoom,
+  isSuperAdmin,
+  adminTelemetry,
+  adminTelemetryError,
 }: HeaderBarProps) {
   const [teamGuideOpen, setTeamGuideOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [telemetryOpen, setTelemetryOpen] = useState(false);
+  const presenceCount = isTeamMode ? Math.max(1, activeMemberCount) : 1;
+  const presenceDots = {
+    active: members.filter((member) => member.status === "active").length,
+    differentRoom: members.filter((member) => member.status === "different_room").length,
+    inactive: members.filter((member) => member.status === "inactive").length,
+  };
 
   return (
+    <>
     <header className={`z-10 flex flex-shrink-0 items-center justify-between gap-2 border-b ${chromeBorderClass} ${chromeClass} px-3 py-2.5 ${chromeTextClass} shadow-lg sm:px-6 sm:py-3`}>
       <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-x-auto overscroll-x-contain pl-10 sm:gap-3 lg:pl-0">
         <span className="inline-flex shrink-0 items-center gap-1.5" aria-label="Personal AI Genie">
-          <GenieBrandAvatar gender={profileGender} className="h-6 w-6 rounded-lg sm:h-7 sm:w-7" label="Personal AI Genie" />
+          <GenieBrandAvatar
+            gender={profileGender}
+            mode={isCorporateDomain && spaceMode === "workspace" ? "workspace" : "personal"}
+            corporatePhotoUrl={corporateAvatarUrl}
+            corporateName={corporateDisplayName}
+            tenantId={corporateTenantId}
+            className="h-6 w-6 rounded-lg sm:h-7 sm:w-7"
+            label="Personal AI Genie"
+          />
           <span className="hidden bg-gradient-to-r from-violet-500 via-pink-500 to-amber-500 bg-clip-text text-sm font-extrabold tracking-tight text-transparent sm:inline">
             Personal AI Genie
           </span>
         </span>
 
-        <div className={`flex shrink-0 items-center rounded-full border ${accentBorderClass} ${chromeSurfaceClass} p-0.5`}>
-          <button
+        {isCorporateDomain ? (
+          <span className={`shrink-0 rounded-full border ${accentBorderClass} ${chromeSurfaceClass} px-3 py-1.5 text-[11px] font-bold ${accentTextClass}`}>
+            <Briefcase className="mr-1 inline h-3.5 w-3.5" /> Workspace
+          </span>
+        ) : (
+          <div className={`flex shrink-0 items-center rounded-full border ${accentBorderClass} ${chromeSurfaceClass} p-0.5`}>
+            <button
             type="button"
             onClick={() => onSpaceModeChange("personal")}
             aria-pressed={spaceMode === "personal"}
@@ -102,8 +175,8 @@ export default function HeaderBar({
           >
             <User className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             Personal
-          </button>
-          <button
+            </button>
+            <button
             type="button"
             onClick={() => onSpaceModeChange("workspace")}
             aria-pressed={spaceMode === "workspace"}
@@ -115,8 +188,9 @@ export default function HeaderBar({
           >
             <Briefcase className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             Workspace
-          </button>
-        </div>
+            </button>
+          </div>
+        )}
 
         <div
           className="relative shrink-0"
@@ -139,7 +213,9 @@ export default function HeaderBar({
             ) : (
               <Users className="h-3 w-3 sm:h-3.5 sm:w-3.5" aria-hidden="true" />
             )}
-            {isTeamMode ? "Team Active" : "Team Sync"}
+            {isCorporateDomain
+              ? isTeamMode ? "Workspace Active" : "Workspace Room"
+              : isTeamMode ? "Team Active" : "Team Sync"}
           </button>
 
           {teamGuideOpen && (
@@ -161,7 +237,7 @@ export default function HeaderBar({
         {isTeamMode && (
           <button
             type="button"
-            onClick={onOpenRoom}
+            onClick={spaceMode === "personal" ? onOpenRoom : () => setSessionMenuOpen((open) => !open)}
             className={`shrink-0 rounded-full border ${accentBorderClass} ${chromeSurfaceClass} px-2 py-1 text-[10px] font-semibold ${accentTextClass} transition-colors hover:bg-slate-100 sm:px-2.5 sm:text-[11px]`}
           >
             Roster ({activeMemberCount}/{capacityLabel})
@@ -196,6 +272,67 @@ export default function HeaderBar({
             {workspaceName}
           </span>
         </span>
+        <div className="relative">
+          <button
+            type="button"
+            onClick={onOpenRoom}
+            aria-label={spaceMode === "personal" ? `Personal room presence: ${presenceCount} of 5` : "Workspace member presence"}
+            aria-expanded={sessionMenuOpen}
+            className={`flex items-center gap-1 rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-2.5 py-1.5 text-[11px] font-semibold ${chromeMutedTextClass}`}
+          >
+            <Users className="h-3.5 w-3.5" />
+            {spaceMode === "personal" ? `${presenceCount}/5 ▾` : `${activeMemberCount} members ▾`}
+            {isTeamMode && (
+              <span className="ml-1 flex items-center gap-0.5" aria-label="Room presence status">
+                {presenceDots.active > 0 && <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" title={`${presenceDots.active} active in this room`} />}
+                {presenceDots.inactive > 0 && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title={`${presenceDots.inactive} offline or idle`} />}
+                {presenceDots.differentRoom > 0 && <span className="h-1.5 w-1.5 rounded-full bg-rose-500" title={`${presenceDots.differentRoom} active in another room`} />}
+              </span>
+            )}
+          </button>
+        </div>
+        {isSuperAdmin && (
+          <button
+            type="button"
+            onClick={() => setTelemetryOpen(true)}
+            className={`flex items-center gap-1 rounded-full border ${accentBorderClass} ${chromeSurfaceClass} px-2.5 py-1.5 text-[11px] font-bold ${accentTextClass}`}
+            aria-label="Open live platform telemetry"
+          >
+            <Zap className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Telemetry</span>
+          </button>
+        )}
+        <div className="relative">
+          <button
+            type="button"
+            disabled={!canExport}
+            onClick={() => setExportMenuOpen((open) => !open)}
+            title={!canExport ? exportDisabledReason : "Export chat"}
+            aria-label="Export chat"
+            aria-expanded={exportMenuOpen}
+            className={`flex items-center gap-1 rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-2.5 py-1.5 text-[11px] font-semibold ${chromeMutedTextClass} disabled:cursor-not-allowed disabled:opacity-50`}
+          >
+            <Download className="h-3.5 w-3.5" />
+            Export <ChevronDown className="h-3 w-3" />
+          </button>
+          {exportMenuOpen && canExport && (
+            <div className={`absolute right-0 top-full z-50 mt-2 w-40 rounded-xl border ${chromeBorderClass} ${chromeSurfaceClass} p-1.5 ${chromeTextClass} shadow-xl`}>
+              {(["markdown", "json"] as const).map((format) => (
+                <button
+                  key={format}
+                  type="button"
+                  onClick={() => {
+                    onExport(format);
+                    setExportMenuOpen(false);
+                  }}
+                  className="w-full rounded-lg px-2.5 py-2 text-left text-xs font-medium capitalize hover:bg-slate-100"
+                >
+                  {format === "markdown" ? "Markdown (.md)" : "JSON (.json)"}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         <div className="relative flex items-center">
           <button
             type="button"
@@ -218,19 +355,43 @@ export default function HeaderBar({
           {sessionMenuOpen && (
             <div className={`absolute right-0 top-full z-50 mt-2 w-64 rounded-2xl border ${chromeBorderClass} ${chromeSurfaceClass} p-2 ${chromeTextClass} shadow-2xl`}>
               <p className={`px-2 py-1 text-[10px] font-bold uppercase tracking-wide ${chromeMutedTextClass}`}>
-                {spaceMode === "personal" ? "Personal · 1 guest peer" : "Workspace · up to 5 members"}
+                {isCorporateDomain ? "Organization directory · verified SSO tenant" : spaceMode === "personal" ? "Personal Room · up to 5 people" : "Workspace · member roles"}
               </p>
-              {isAuthenticated && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onCopyInvite(spaceMode);
-                    setSessionMenuOpen(false);
-                  }}
-                  className="w-full rounded-xl px-2.5 py-2 text-left text-xs font-semibold hover:bg-slate-100"
-                >
-                  {spaceMode === "personal" ? "Copy private 1-on-1 link" : "Create / copy team invite"}
-                </button>
+              {spaceMode === "workspace" && members.map((member) => (
+                <div key={member.id} className="flex items-center justify-between gap-2 px-2 py-1.5 text-[11px]">
+                  <span className="truncate">{member.name}</span>
+                  <span className="shrink-0 rounded-full bg-slate-100 px-2 py-0.5 text-[9px] font-bold">
+                    {member.isOriginAdmin
+                      ? "Origin Admin"
+                      : member.role === "delegated_admin" || member.role === "admin"
+                        ? "Delegated Admin"
+                        : member.role === "guest"
+                          ? "Guest"
+                          : "Member"}
+                  </span>
+                </div>
+              ))}
+              {isAuthenticated && !canInviteMembers ? (
+                <p className="px-2.5 py-2 text-xs font-semibold text-slate-500">
+                  Only the Room Owner or Workspace Origin Admin can invite members.
+                </p>
+              ) : isAuthenticated && (
+                spaceMode === "personal" && presenceCount >= 5 ? (
+                  <p className="px-2.5 py-2 text-xs font-semibold text-rose-600">Personal Room Full (Max 5)</p>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onCopyInvite(spaceMode);
+                      setSessionMenuOpen(false);
+                    }}
+                    className="w-full rounded-xl px-2.5 py-2 text-left text-xs font-semibold hover:bg-slate-100"
+                  >
+                    {isCorporateDomain
+                      ? "Create / copy tenant workspace invite"
+                      : spaceMode === "personal" ? "+ Add another user" : "Create / copy workspace invite"}
+                  </button>
+                )
               )}
               {isTeamMode && (
                 <>
@@ -264,10 +425,83 @@ export default function HeaderBar({
                   )}
                 </>
               )}
+              <button
+                type="button"
+                onClick={() => {
+                  onPurgeContext();
+                  setSessionMenuOpen(false);
+                }}
+                className="w-full rounded-xl px-2.5 py-2 text-left text-xs font-semibold text-rose-700 hover:bg-rose-50"
+              >
+                Purge Context
+              </button>
             </div>
           )}
         </div>
       </div>
     </header>
+    {isSuperAdmin && telemetryOpen && (
+      <div className="fixed inset-0 z-[120] bg-slate-950/50 sm:flex sm:justify-end" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setTelemetryOpen(false);
+      }}>
+        <section
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="admin-telemetry-title"
+          className="absolute inset-x-0 bottom-0 max-h-[92dvh] overflow-y-auto rounded-t-3xl bg-slate-950 p-5 text-slate-100 shadow-2xl sm:relative sm:inset-auto sm:h-full sm:max-h-none sm:w-[min(100vw,28rem)] sm:rounded-none sm:border-l sm:border-cyan-950"
+        >
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-400">Restricted · live registry</p>
+              <h2 id="admin-telemetry-title" className="mt-1 flex items-center gap-2 text-lg font-extrabold">
+                <Activity className="h-5 w-5 text-cyan-400" /> Platform Telemetry
+              </h2>
+            </div>
+            <button type="button" onClick={() => setTelemetryOpen(false)} aria-label="Close telemetry" className="rounded-full p-2 text-slate-400 hover:bg-slate-800 hover:text-white">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+          {adminTelemetryError ? (
+            <p role="status" className="mt-5 rounded-xl border border-rose-900 bg-rose-950/60 p-3 text-sm text-rose-200">{adminTelemetryError}</p>
+          ) : !adminTelemetry ? (
+            <p role="status" className="mt-5 animate-pulse text-sm text-slate-400">Loading live registry…</p>
+          ) : (
+            <>
+              <div className="mt-5 grid grid-cols-2 gap-2">
+                {[
+                  ["Registered users", adminTelemetry.total_registered_users.total],
+                  ["Active WebSockets", adminTelemetry.active_connections_count],
+                  ["Personal accounts", adminTelemetry.total_registered_users.personal],
+                  ["Workspace accounts", adminTelemetry.total_registered_users.workspace],
+                ].map(([label, value]) => (
+                  <div key={label} className="rounded-2xl border border-slate-800 bg-slate-900 p-3">
+                    <p className="text-[10px] uppercase tracking-wide text-slate-400">{label}</p>
+                    <p className="mt-1 text-2xl font-bold text-cyan-300">{value}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-6">
+                <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-300">Live user presence</h3>
+                <div className="space-y-2">
+                  {adminTelemetry.live_active_users.map((user) => (
+                    <div key={`${user.id}:${user.room_id}`} className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
+                      <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${user.status === "active" ? "bg-emerald-400" : user.status === "different_room" ? "bg-rose-400" : "bg-amber-400"}`} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-semibold">{user.name || user.email}</p>
+                        <p className="truncate text-[10px] text-slate-400">{user.email} · {user.room_id}</p>
+                      </div>
+                      <span className="shrink-0 text-[9px] uppercase text-slate-500">{user.status.replace("_", " ")}</span>
+                    </div>
+                  ))}
+                  {!adminTelemetry.live_active_users.length && <p className="rounded-xl border border-dashed border-slate-800 p-4 text-center text-xs text-slate-500">No active room connections.</p>}
+                </div>
+              </div>
+              <p className="mt-5 text-[10px] text-slate-500">Refreshes automatically every 10 seconds. Room content is not included.</p>
+            </>
+          )}
+        </section>
+      </div>
+    )}
+    </>
   );
 }

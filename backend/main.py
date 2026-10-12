@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
 from urllib.parse import urlsplit
-from fastapi import Cookie, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -45,11 +45,33 @@ except ImportError:
 
 try:
     from .knowledge_registry import get_platform_system_manifest
-    from .security import sanitize_ai_output
+    from .security import (
+        message_is_after_join,
+        may_export_room,
+        may_view_pre_join_history,
+        require_personal_scope,
+        require_workspace_scope,
+        SUPER_ADMIN_IDENTIFIER,
+        verify_super_admin,
+        scrub_sensitive_tokens as scrub_tokens,
+        sanitize_ai_output,
+        verified_workspace_tenant,
+    )
     from .gemini_pool import gemini_pool
 except ImportError:
     from knowledge_registry import get_platform_system_manifest
-    from security import sanitize_ai_output
+    from security import (
+        message_is_after_join,
+        may_export_room,
+        may_view_pre_join_history,
+        require_personal_scope,
+        require_workspace_scope,
+        SUPER_ADMIN_IDENTIFIER,
+        verify_super_admin,
+        scrub_sensitive_tokens as scrub_tokens,
+        sanitize_ai_output,
+        verified_workspace_tenant,
+    )
     from gemini_pool import gemini_pool
 
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -59,6 +81,7 @@ if str(PROJECT_ROOT) not in sys.path:
 load_dotenv(BACKEND_DIR / ".env", override=False)
 load_dotenv(BACKEND_DIR.parent / ".env.local", override=False)
 load_dotenv(BACKEND_DIR.parent / ".env", override=False)
+SUPER_ADMIN_IDENTIFIER = os.getenv("SUPER_ADMIN_EMAIL", "admin@genie.local").strip().lower()
 
 app = FastAPI(title="Personal AI Genie API", version="4.8.0")
 logger = logging.getLogger(__name__)
@@ -352,9 +375,31 @@ def initialize_archive_store():
                     members_json TEXT NOT NULL,
                     passcode_salt TEXT NOT NULL DEFAULT '',
                     passcode_hash TEXT NOT NULL DEFAULT '',
+                    origin_host_id TEXT NOT NULL DEFAULT '',
+                    space_mode TEXT NOT NULL DEFAULT 'personal',
+                    history_visible_before_join INTEGER NOT NULL DEFAULT 0,
+                    allow_member_export INTEGER NOT NULL DEFAULT 0,
+                    tenant_id TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 )
                 """
+            )
+            room_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(sovereign_rooms)")
+            }
+            for column, declaration in (
+                ("origin_host_id", "TEXT NOT NULL DEFAULT ''"),
+                ("space_mode", "TEXT NOT NULL DEFAULT 'personal'"),
+                ("history_visible_before_join", "INTEGER NOT NULL DEFAULT 0"),
+                ("allow_member_export", "INTEGER NOT NULL DEFAULT 0"),
+                ("tenant_id", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in room_columns:
+                    connection.execute(
+                        f"ALTER TABLE sovereign_rooms ADD COLUMN {column} {declaration}"
+                    )
+            connection.execute(
+                "UPDATE sovereign_rooms SET origin_host_id = host_id WHERE origin_host_id = ''"
             )
             connection.execute(
                 """
@@ -374,6 +419,18 @@ def initialize_archive_store():
                     message_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (room_id, message_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS corporate_workspace_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    room_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -405,7 +462,8 @@ def initialize_archive_store():
                     is_creator INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    gender TEXT NOT NULL DEFAULT ''
+                    gender TEXT NOT NULL DEFAULT '',
+                    tenant_id TEXT NOT NULL DEFAULT ''
                 )
                 """
             )
@@ -423,6 +481,10 @@ def initialize_archive_store():
             if "privacy_accepted_at" not in registry_columns:
                 connection.execute(
                     "ALTER TABLE user_registry ADD COLUMN privacy_accepted_at TEXT NOT NULL DEFAULT ''"
+                )
+            if "tenant_id" not in registry_columns:
+                connection.execute(
+                    "ALTER TABLE user_registry ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''"
                 )
             connection.execute(
                 """
@@ -620,20 +682,7 @@ def are_users_blocked(first_user_id: str, second_user_id: str) -> bool:
 
 
 def scrub_sensitive_tokens(text: str) -> str:
-    patterns = (
-        r"AIza[0-9A-Za-z_-]{20,}",
-        r"sk-or-(?:v1-)?[0-9A-Za-z_-]{16,}",
-        r"\bsk-[0-9A-Za-z_-]{20,}",
-        r"\bgh[pousr]_[0-9A-Za-z]{20,}",
-        r"\bAKIA[0-9A-Z]{16}\b",
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-        r"\b(?:api[_-]?key|client[_-]?secret|secret|access[_-]?token|password)\s*[:=]\s*[\"']?[A-Za-z0-9._~+/-]{12,}",
-        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    )
-    scrubbed = text
-    for pattern in patterns:
-        scrubbed = re.sub(pattern, "[REDACTED]", scrubbed, flags=re.IGNORECASE)
-    return sanitize_ai_output(scrubbed)
+    return sanitize_ai_output(scrub_tokens(text))
 
 
 class ChatMessage(BaseModel):
@@ -660,6 +709,7 @@ class ChatRequest(BaseModel):
     prompt: Optional[str] = None
     message: Optional[str] = None
     space_mode: Optional[str] = "personal"
+    workspace_room_id: Optional[str] = None
     conversation_history: Optional[List[ChatMessage]] = []
     custom_api_key: Optional[str] = None
     byok_key: Optional[str] = None
@@ -686,6 +736,7 @@ class DirectVoiceTurnRequest(BaseModel):
     user_email: Optional[str] = None
     google_id_token: Optional[str] = None
     user_byok_key: Optional[str] = None
+    workspace_room_id: Optional[str] = None
 
 
 class TopicChannelRequest(BaseModel):
@@ -820,6 +871,7 @@ class RoomConnection:
         public_key: Optional[Dict[str, Any]] = None,
         room_title: str = "",
         requested_host_id: str = "",
+        tenant_id: str = "",
     ):
         self.websocket = websocket
         self.client_id = client_id
@@ -829,6 +881,9 @@ class RoomConnection:
         self.public_key = public_key or {}
         self.room_title = room_title
         self.requested_host_id = requested_host_id
+        self.tenant_id = tenant_id
+        self.focused = False
+        self.last_heartbeat = time.monotonic()
 
 
 class RoomManager:
@@ -854,14 +909,38 @@ class RoomManager:
                     "email": info.email,
                     "avatar_url": info.avatar_url,
                     "public_key": info.public_key,
-                    "status": "active",
+                    "status": self._presence_status(info.client_id, room_id),
                 }
         return list(active_by_id.values())
+
+    def _presence_status(self, client_id: str, room_id: Optional[str] = None) -> str:
+        now = time.monotonic()
+        connections = [
+            info for info in self.identities.values()
+            if info.client_id == client_id and now - info.last_heartbeat <= 300
+        ]
+        if any(
+            (room_id is None or info.websocket in self.connections.get(room_id, set()))
+            and info.focused
+            for info in connections
+        ):
+            return "active"
+        if any(
+            (room_id is None or info.websocket not in self.connections.get(room_id, set()))
+            and info.focused
+            for info in connections
+        ):
+            return "different_room"
+        return "inactive"
 
     def _room_members(self, room_id: str) -> List[Dict[str, Any]]:
         with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
             row = connection.execute(
-                "SELECT host_id, members_json FROM sovereign_rooms WHERE room_id = ?",
+                """
+                SELECT host_id, members_json, origin_host_id, space_mode,
+                       history_visible_before_join, allow_member_export, tenant_id
+                FROM sovereign_rooms WHERE room_id = ?
+                """,
                 (room_id,),
             ).fetchone()
         if not row:
@@ -871,11 +950,38 @@ class RoomManager:
             stored_members = json.loads(row[1])
         except (ValueError, TypeError):
             return self._active_users(room_id)
+        origin_host_id = row[2]
+        space_mode = row[3]
         return [
             {
                 **member,
-                "status": "active" if member["id"] in active else "inactive",
-                "role": "sovereign" if member["id"] == row[0] else "member",
+                "status": active.get(member["id"], {}).get(
+                    "status",
+                    self._presence_status(member["id"], room_id),
+                ),
+                "is_host": member["id"] == row[0],
+                "role": (
+                    "origin_admin"
+                    if member["id"] == origin_host_id
+                    else "delegated_admin"
+                    if member["id"] == row[0]
+                    else "guest"
+                    if space_mode == "personal"
+                    else "member"
+                ),
+                "is_origin_admin": member["id"] == origin_host_id,
+                "tenant_id": member.get("tenant_id") or row[6],
+                "can_view_history": (
+                    member["id"] == origin_host_id
+                    or bool(member.get("can_view_history", row[4]))
+                ),
+                "can_export": (
+                    member["id"] == origin_host_id
+                    or (
+                        space_mode == "workspace"
+                        and bool(member.get("can_export", row[5]))
+                    )
+                ),
             }
             for member in stored_members
         ]
@@ -905,10 +1011,24 @@ class RoomManager:
                     (json.dumps(connection_info.public_key), now, connection_info.client_id.removeprefix("google:")),
                 )
                 row = connection.execute(
-                    "SELECT title, host_id, members_json FROM sovereign_rooms WHERE room_id = ?",
+                    """
+                    SELECT title, host_id, members_json, origin_host_id, space_mode,
+                           history_visible_before_join, allow_member_export, tenant_id
+                    FROM sovereign_rooms WHERE room_id = ?
+                    """,
                     (room_id,),
                 ).fetchone()
                 members = json.loads(row[2]) if row else []
+                existing_member = next(
+                    (item for item in members if item.get("id") == connection_info.client_id),
+                    None,
+                )
+                host_id = row[1] if row else (
+                    requested_host_id
+                    if requested_host_id == connection_info.client_id
+                    else connection_info.client_id
+                )
+                origin_host_id = row[3] if row else host_id
                 member = {
                     "id": connection_info.client_id,
                     "user_id": connection_info.client_id,
@@ -917,18 +1037,42 @@ class RoomManager:
                     "email": connection_info.email,
                     "avatar_url": connection_info.avatar_url,
                     "public_key": connection_info.public_key,
+                    "joined_at": (
+                        existing_member.get("joined_at")
+                        if existing_member and existing_member.get("joined_at")
+                        else now
+                    ),
+                    "tenant_id": connection_info.tenant_id,
+                    "can_view_history": (
+                        True
+                        if connection_info.client_id == origin_host_id
+                        else (
+                            bool(existing_member.get("can_view_history"))
+                            if existing_member
+                            else bool(row and row[5])
+                        )
+                    ),
+                    "can_export": (
+                        True
+                        if connection_info.client_id == origin_host_id
+                        else (
+                            bool(existing_member.get("can_export"))
+                            if existing_member
+                            else bool(row and row[6])
+                        )
+                    ),
                 }
                 replaced = False
                 for index, existing in enumerate(members):
                     if existing.get("id") == connection_info.client_id:
-                        members[index] = member
+                        members[index] = {**existing, **member}
                         replaced = True
                         break
                 if not replaced:
-                    if room_id.startswith("share_") and len(members) >= 2:
+                    if room_id.startswith("share_") and len(members) >= 5:
                         raise HTTPException(
                             status_code=403,
-                            detail="This shared conversation already has two members.",
+                            detail="This personal room is full (maximum five members).",
                         )
                     if room_id.startswith("invite_") and len(members) >= 5:
                         raise HTTPException(
@@ -936,21 +1080,20 @@ class RoomManager:
                             detail="This workspace room is full (maximum five members).",
                         )
                     members.append(member)
-                host_id = row[1] if row else (
-                    requested_host_id
-                    if requested_host_id == connection_info.client_id
-                    else connection_info.client_id
-                )
                 title = row[0] if row else (room_title or room_id)
                 connection.execute(
                     """
-                    INSERT INTO sovereign_rooms(room_id, title, host_id, members_json, updated_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO sovereign_rooms
+                        (room_id, title, host_id, members_json, origin_host_id, tenant_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(room_id) DO UPDATE SET
                         members_json = excluded.members_json,
                         updated_at = excluded.updated_at
                     """,
-                    (room_id, title, host_id, json.dumps(members), now),
+                    (
+                        room_id, title, host_id, json.dumps(members), origin_host_id,
+                        row[7] if row else connection_info.tenant_id, now,
+                    ),
                 )
 
     def persist_encrypted_message(self, room_id: str, message: Dict[str, Any]):
@@ -984,6 +1127,30 @@ class RoomManager:
             ]
             await websocket.send_json({"type": "presence", "users": visible_users})
 
+    async def _broadcast_member_presence(self, client_id: str):
+        for room_id, connections in list(self.connections.items()):
+            if not connections:
+                continue
+            if any(member.get("id") == client_id for member in self._room_members(room_id)):
+                await self._presence(room_id)
+
+    def telemetry_presence(self) -> List[Dict[str, Any]]:
+        by_user: Dict[str, Dict[str, Any]] = {}
+        for info in self.identities.values():
+            previous = by_user.get(info.client_id)
+            candidate = {
+                "id": info.client_id,
+                "name": info.display_name,
+                "email": info.email,
+                "avatar_url": info.avatar_url,
+                "room_id": info.websocket.url.path.rsplit("/", 1)[-1],
+                "focused": info.focused,
+                "status": self._presence_status(info.client_id),
+            }
+            if previous is None or (candidate["focused"] and not previous["focused"]):
+                by_user[info.client_id] = candidate
+        return list(by_user.values())
+
     def _visible_message(self, message: Dict[str, Any], recipient_id: str) -> bool:
         sender_id = str(message.get("user_id") or message.get("sender_id") or "")
         has_envelope = (
@@ -1004,6 +1171,52 @@ class RoomManager:
             if any(not are_users_blocked(recipient_id, user_id) for user_id in user_ids)
         }
         return visible_message
+
+    def _history_visible_messages(
+        self,
+        room_id: str,
+        messages: List[Dict[str, Any]],
+        recipient_id: str,
+    ) -> List[Dict[str, Any]]:
+        if room_id.startswith("direct:"):
+            return messages
+        member = next(
+            (item for item in self._room_members(room_id) if item.get("id") == recipient_id),
+            None,
+        )
+        if not member:
+            return []
+        if may_view_pre_join_history(
+            is_origin_admin=bool(member.get("is_origin_admin")),
+            allow_history=bool(member.get("can_view_history")),
+        ):
+            return messages
+        joined_at = str(member.get("joined_at") or "")
+        return [
+            message for message in messages
+            if message_is_after_join(str(message.get("created_at") or ""), joined_at)
+        ]
+
+    def _room_configuration(self, room_id: str) -> Optional[Dict[str, Any]]:
+        with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+            row = connection.execute(
+                """
+                SELECT host_id, origin_host_id, space_mode, history_visible_before_join,
+                       allow_member_export, tenant_id
+                FROM sovereign_rooms WHERE room_id = ?
+                """,
+                (room_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "host_id": row[0],
+            "origin_host_id": row[1],
+            "space_mode": row[2],
+            "history_visible_before_join": bool(row[3]),
+            "allow_member_export": bool(row[4]),
+            "tenant_id": row[5],
+        }
 
     async def close_blocked_direct_rooms(self, blocker_id: str, blocked_id: str):
         pair = {f"google:{canonical_user_id(blocker_id)}", f"google:{canonical_user_id(blocked_id)}"}
@@ -1026,6 +1239,7 @@ class RoomManager:
                     self.connections.pop(room_id, None)
                     self.voice_calls.pop(room_id, None)
                 await self._presence(room_id)
+                await self._broadcast_member_presence(connection.client_id)
 
     async def connect(self, room_id: str, connection: RoomConnection):
         async with self.lock:
@@ -1054,10 +1268,22 @@ class RoomManager:
                 if not self.connections[room_id]:
                     self.connections.pop(room_id, None)
                 raise
+            visible_history = [
+                message
+                for message in self.messages[room_id].values()
+                if self._visible_message(message, connection.client_id)
+            ]
+            visible_history = self._history_visible_messages(
+                room_id,
+                visible_history,
+                connection.client_id,
+            )
+            visible_history_ids = {message["message_id"] for message in visible_history}
             for message in self.messages[room_id].values():
                 if (
                     message["user_id"] != connection.client_id
                     and self._visible_message(message, connection.client_id)
+                    and message["message_id"] in visible_history_ids
                 ):
                     delivered_to = message.setdefault("delivered_to", [])
                     if connection.client_id not in delivered_to:
@@ -1065,6 +1291,7 @@ class RoomManager:
                         self.persist_encrypted_message(room_id, message)
             await connection.websocket.send_json({
                 "type": "room_state",
+                "policy": self._room_configuration(room_id),
                 "members": [
                     member for member in self._room_members(room_id)
                     if member.get("id") == connection.client_id
@@ -1072,8 +1299,7 @@ class RoomManager:
                 ],
                 "messages": [
                     self._message_for_recipient(message, connection.client_id)
-                    for message in self.messages[room_id].values()
-                    if self._visible_message(message, connection.client_id)
+                    for message in visible_history
                 ],
             })
             await self._presence(room_id)
@@ -1096,12 +1322,15 @@ class RoomManager:
 
     async def disconnect(self, room_id: str, websocket: WebSocket):
         async with self.lock:
+            connection = self.identities.get(websocket)
             self.connections.get(room_id, set()).discard(websocket)
             self.identities.pop(websocket, None)
             if not self.connections.get(room_id):
                 self.connections.pop(room_id, None)
                 self.voice_calls.pop(room_id, None)
             await self._presence(room_id)
+            if connection:
+                await self._broadcast_member_presence(connection.client_id)
 
     async def remove_member(self, room_id: str, member_id: str):
         async with self.lock:
@@ -1115,15 +1344,23 @@ class RoomManager:
                 self.connections.pop(room_id, None)
                 self.voice_calls.pop(room_id, None)
             await self._presence(room_id)
+            await self._broadcast_member_presence(member_id)
 
     async def close_room(self, room_id: str):
         async with self.lock:
             room_connections = list(self.connections.pop(room_id, set()))
             self.messages.pop(room_id, None)
             self.voice_calls.pop(room_id, None)
+            departing_members = {
+                self.identities[websocket].client_id
+                for websocket in room_connections
+                if websocket in self.identities
+            }
             for websocket in room_connections:
                 self.identities.pop(websocket, None)
                 await websocket.close(code=1000, reason="The room host ended this session.")
+            for member_id in departing_members:
+                await self._broadcast_member_presence(member_id)
 
     async def handle_event(self, room_id: str, websocket: WebSocket, event: Dict[str, Any]):
         async with self.lock:
@@ -1131,6 +1368,48 @@ class RoomManager:
             if connection is None:
                 return
             event_type = event.get("type")
+            room_config = self._room_configuration(room_id)
+            if event_type == "room.heartbeat":
+                if event.get("room_id") != room_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "Presence heartbeat room does not match this connection.",
+                    })
+                    return
+                now = time.monotonic()
+                focused = bool(event.get("focused", False))
+                presence_changed = (
+                    connection.focused != focused
+                    or now - connection.last_heartbeat > 300
+                )
+                connection.focused = focused
+                connection.last_heartbeat = now
+                await self._presence(room_id)
+                if presence_changed:
+                    await self._broadcast_member_presence(connection.client_id)
+                return
+            if room_config and room_config.get("space_mode") == "workspace":
+                tenant_id = str(room_config.get("tenant_id") or "")
+                require_workspace_scope(
+                    {"tenant_id": connection.tenant_id},
+                    tenant_id,
+                )
+                with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as database:
+                    with database:
+                        database.execute(
+                            """
+                            INSERT INTO corporate_workspace_audit
+                                (tenant_id, room_id, actor_id, event_type, created_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                tenant_id,
+                                room_id,
+                                connection.client_id,
+                                str(event_type or "unknown")[:80],
+                                datetime.now(timezone.utc).isoformat(),
+                            ),
+                        )
             messages = self.messages.setdefault(room_id, {})
             if event_type == "voice_session.start":
                 call_id = str(event.get("call_id") or "")
@@ -1221,6 +1500,37 @@ class RoomManager:
                     await websocket.send_json({"type": "error", "detail": "Direct messages are unavailable because of a block."})
                     await websocket.close(code=1008, reason="Direct room is unavailable.")
                     return
+                is_voice_log = (
+                    event.get("is_voice_record") is True
+                    or event.get("is_voice_session_summary") is True
+                )
+                if is_voice_log:
+                    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as database:
+                        room_owner = database.execute(
+                            "SELECT host_id, origin_host_id, space_mode FROM sovereign_rooms WHERE room_id = ?",
+                            (room_id,),
+                        ).fetchone()
+                    allowed_owner_id = (
+                        room_owner[0]
+                        if room_owner and room_owner[2] == "personal"
+                        else room_owner[1]
+                        if room_owner
+                        else None
+                    )
+                    if not allowed_owner_id or connection.client_id != allowed_owner_id:
+                        await websocket.send_json({
+                            "type": "error",
+                            "detail": "Only the Room Owner or Workspace Origin Admin can save voice-call logs.",
+                        })
+                        return
+                if event.get("is_history_replay") is True:
+                    room_config = self._room_configuration(room_id)
+                    if not room_config or not room_config.get("history_visible_before_join"):
+                        await websocket.send_json({
+                            "type": "error",
+                            "detail": "Past chat history sharing is disabled by the room owner.",
+                        })
+                        return
                 encrypted_payloads = event.get("encrypted_payloads")
                 if (
                     not isinstance(encrypted_payloads, dict)
@@ -1478,6 +1788,33 @@ class RoomManager:
 room_manager = RoomManager()
 
 
+@app.get("/api/admin/telemetry")
+async def get_admin_telemetry(
+    admin_identity: Dict[str, Any] = Depends(verify_super_admin),
+):
+    del admin_identity
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        registered_users = connection.execute(
+            """
+            SELECT
+                COUNT(*),
+                SUM(CASE WHEN tenant_id = '' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN tenant_id != '' THEN 1 ELSE 0 END)
+            FROM user_registry
+            """
+        ).fetchone()
+    presence = room_manager.telemetry_presence()
+    return {
+        "total_registered_users": {
+            "total": int(registered_users[0] or 0),
+            "personal": int(registered_users[1] or 0),
+            "workspace": int(registered_users[2] or 0),
+        },
+        "active_connections_count": len(room_manager.identities),
+        "live_active_users": presence,
+    }
+
+
 def verified_identity_from_token(
     token: Optional[str],
     request: Optional[Request] = None,
@@ -1508,6 +1845,113 @@ def verified_identity_from_token(
                 detail="Use your email and Authenticator code to sign in.",
             )
     return identity
+
+
+@app.middleware("http")
+async def enforce_personal_api_scope(request: Request, call_next):
+    path = request.url.path
+    scoped_path = (
+        "/api/personal/" in path
+        or "/social/" in path
+        or "/api/archive/" in path
+    )
+    if not scoped_path:
+        return await call_next(request)
+
+    authorization = request.headers.get("authorization", "")
+    token = authorization.removeprefix("Bearer ").strip() if authorization.startswith("Bearer ") else ""
+    if not token and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        body = await request.body()
+        async def receive_body():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request._receive = receive_body
+        try:
+            payload = json.loads(body) if body else {}
+            token = str(payload.get("google_id_token") or "") if isinstance(payload, dict) else ""
+        except (ValueError, UnicodeDecodeError):
+            token = ""
+    if token:
+        try:
+            identity = await asyncio.to_thread(verified_identity_from_token, token, request)
+        except HTTPException:
+            return await call_next(request)
+        if verified_workspace_tenant(identity):
+            return JSONResponse(status_code=403, content={"detail": "SCOPE_MISMATCH"})
+    return await call_next(request)
+
+
+@app.get("/api/auth/session-scope")
+async def get_verified_session_scope(
+    authorization: Optional[str] = Header(default=None),
+):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
+    identity = await asyncio.to_thread(
+        verified_identity_from_token,
+        authorization.removeprefix("Bearer ").strip(),
+    )
+    return {
+        "scope": "workspace" if verified_workspace_tenant(identity) else "personal",
+        "tenant_id": verified_workspace_tenant(identity),
+        "display_name": identity.get("name", ""),
+        "email": identity["email"],
+        "corporate_avatar_url": identity.get("picture", ""),
+        "is_super_admin": identity["email"].strip().lower() == SUPER_ADMIN_IDENTIFIER,
+    }
+
+
+def audit_workspace_action(identity: Dict[str, str], event_type: str, room_id: str = "workspace-chat"):
+    tenant_id = require_workspace_scope(identity, verified_workspace_tenant(identity))
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO corporate_workspace_audit
+                    (tenant_id, room_id, actor_id, event_type, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    tenant_id,
+                    room_id[:128],
+                    str(identity["sub"]),
+                    event_type[:80],
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+
+def require_room_scope(room_id: str, identity: Dict[str, str]) -> Dict[str, Any]:
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        row = connection.execute(
+            "SELECT space_mode, tenant_id FROM sovereign_rooms WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Room does not exist.")
+    if row[0] == "workspace":
+        require_workspace_scope(identity, row[1])
+    else:
+        require_personal_scope(identity)
+    return {"space_mode": row[0], "tenant_id": row[1]}
+
+
+def require_workspace_room_member(room_id: str, identity: Dict[str, str]) -> str:
+    configuration = require_room_scope(room_id, identity)
+    if configuration["space_mode"] != "workspace":
+        raise HTTPException(status_code=403, detail="SCOPE_MISMATCH")
+    member_id = f"google:{identity['sub']}"
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        row = connection.execute(
+            "SELECT members_json FROM sovereign_rooms WHERE room_id = ?",
+            (room_id,),
+        ).fetchone()
+    if not row or not any(
+        member.get("id") == member_id
+        and (member.get("tenant_id") or configuration["tenant_id"]) == configuration["tenant_id"]
+        for member in json.loads(row[0])
+    ):
+        raise HTTPException(status_code=403, detail="SCOPE_MISMATCH")
+    return str(configuration["tenant_id"])
 
 
 class SocialDiscoveryRequest(BaseModel):
@@ -1602,6 +2046,22 @@ class RoomPasscodeUpdateRequest(BaseModel):
     passcode: str = Field(min_length=6, max_length=64)
 
 
+class RoomConfigurationRequest(BaseModel):
+    google_id_token: str
+    room_id: str = Field(min_length=6, max_length=128)
+    title: str = Field(min_length=1, max_length=200)
+    passcode: str = Field(min_length=6, max_length=64)
+    space_mode: str = Field(pattern="^(personal|workspace)$")
+    history_visible_before_join: bool = False
+    allow_member_export: bool = False
+    public_key: Dict[str, Any]
+
+
+class RoomExportAuthorizationRequest(BaseModel):
+    google_id_token: str
+    include_voice_logs: bool = False
+
+
 class RoomMemberActionRequest(BaseModel):
     google_id_token: str
     member_id: str = Field(min_length=1, max_length=256)
@@ -1667,12 +2127,14 @@ def authorize_room_member(
             raise HTTPException(status_code=410, detail="This room session has ended.")
         row = connection.execute(
             """
-            SELECT title, host_id, members_json, passcode_salt, passcode_hash
+            SELECT title, host_id, members_json, passcode_salt, passcode_hash,
+                   space_mode, tenant_id
             FROM sovereign_rooms WHERE room_id = ?
             """,
             (room_id,),
         ).fetchone()
         if room_id.startswith("direct:"):
+            require_personal_scope(identity)
             members = json.loads(row[2]) if row else []
             if not any(member.get("id") == client_id for member in members):
                 raise HTTPException(status_code=403, detail="Direct room membership is required.")
@@ -1680,6 +2142,9 @@ def authorize_room_member(
 
         normalized_passcode = normalize_room_passcode(passcode)
         if not row:
+            if room_id.startswith("invite_"):
+                require_workspace_scope(identity, None)
+            require_personal_scope(identity)
             if len(normalized_passcode) < 6:
                 raise HTTPException(status_code=403, detail="A valid room passcode is required to create this room.")
             salt = os.urandom(16)
@@ -1711,11 +2176,15 @@ def authorize_room_member(
                 )
             return
 
+        if row[5] == "workspace":
+            require_workspace_scope(identity, row[6])
+        else:
+            require_personal_scope(identity)
         members = json.loads(row[2])
         if any(member.get("id") == client_id for member in members):
             return
-        if room_id.startswith("share_") and len(members) >= 2:
-            raise HTTPException(status_code=403, detail="This shared conversation already has two members.")
+        if room_id.startswith("share_") and len(members) >= 5:
+            raise HTTPException(status_code=403, detail="This personal room is full (maximum five members).")
         if room_id.startswith("invite_") and len(members) >= 5:
             raise HTTPException(status_code=403, detail="This workspace room is full (maximum five members).")
         if not row[3] or not row[4] or len(normalized_passcode) < 6:
@@ -1729,9 +2198,162 @@ def authorize_room_member(
             raise HTTPException(status_code=403, detail="Room membership or passcode verification failed.")
 
 
+def configure_invite_room(req: RoomConfigurationRequest, identity: Dict[str, str]):
+    prefix = "share_" if req.space_mode == "personal" else "invite_"
+    if not req.room_id.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Room ID does not match the selected mode.")
+    tenant_id = verified_workspace_tenant(identity) or ""
+    if req.space_mode == "workspace":
+        require_workspace_scope(identity, tenant_id)
+    else:
+        require_personal_scope(identity)
+    public_key = req.public_key
+    if (
+        public_key.get("kty") != "EC"
+        or public_key.get("crv") != "P-256"
+        or not isinstance(public_key.get("x"), str)
+        or not isinstance(public_key.get("y"), str)
+        or len(public_key["x"]) > 128
+        or len(public_key["y"]) > 128
+    ):
+        raise HTTPException(status_code=400, detail="A valid room encryption key is required.")
+
+    owner_id = f"google:{identity['sub']}"
+    now = datetime.now(timezone.utc).isoformat()
+    salt = os.urandom(16)
+    member = {
+        "id": owner_id,
+        "user_id": owner_id,
+        "name": identity.get("name") or identity["email"],
+        "display_name": identity.get("name") or identity["email"],
+        "email": identity["email"],
+        "avatar_url": "",
+        "public_key": public_key,
+        "joined_at": now,
+        "can_export": True,
+        "can_view_history": True,
+        "tenant_id": tenant_id,
+    }
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        with connection:
+            existing = connection.execute(
+                "SELECT host_id, origin_host_id, members_json, space_mode, tenant_id FROM sovereign_rooms WHERE room_id = ?",
+                (req.room_id,),
+            ).fetchone()
+            if existing:
+                if req.space_mode == "workspace":
+                    require_workspace_scope(identity, existing[4])
+                else:
+                    require_personal_scope(identity)
+                policy_owner_id = existing[0] if existing[3] == "personal" else existing[1]
+                if req.space_mode != existing[3]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="An existing room cannot change its mode.",
+                    )
+                if policy_owner_id != owner_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Only the room owner or Workspace Origin Admin can change invite permissions.",
+                    )
+                members = json.loads(existing[2])
+                if not any(item.get("id") == owner_id for item in members):
+                    raise HTTPException(status_code=403, detail="Room owner membership is invalid.")
+                connection.execute(
+                    """
+                    UPDATE sovereign_rooms
+                    SET title = ?, space_mode = ?, history_visible_before_join = ?,
+                        allow_member_export = ?, tenant_id = ?, updated_at = ?
+                    WHERE room_id = ?
+                    """,
+                    (
+                        req.title,
+                        req.space_mode,
+                        int(req.history_visible_before_join),
+                        int(req.allow_member_export),
+                        tenant_id,
+                        now,
+                        req.room_id,
+                    ),
+                )
+                return
+            connection.execute(
+                """
+                INSERT INTO sovereign_rooms
+                    (room_id, title, host_id, members_json, passcode_salt, passcode_hash,
+                     origin_host_id, space_mode, history_visible_before_join,
+                     allow_member_export, tenant_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    req.room_id,
+                    req.title,
+                    owner_id,
+                    json.dumps([member]),
+                    salt.hex(),
+                    hash_room_passcode(req.passcode, salt),
+                    owner_id,
+                    req.space_mode,
+                    int(req.history_visible_before_join),
+                    int(req.allow_member_export),
+                    tenant_id,
+                    now,
+                ),
+            )
+
+
+@app.post("/api/rooms/configure")
+async def configure_room(req: RoomConfigurationRequest):
+    identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    await asyncio.to_thread(configure_invite_room, req, identity)
+    return {"status": "configured", "room_id": req.room_id}
+
+
+@app.post("/api/rooms/{room_id}/authorize-export")
+async def authorize_room_export(room_id: str, req: RoomExportAuthorizationRequest):
+    identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    await asyncio.to_thread(require_room_scope, room_id, identity)
+    member_id = f"google:{identity['sub']}"
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        row = connection.execute(
+            """
+            SELECT host_id, origin_host_id, space_mode, allow_member_export, members_json
+            FROM sovereign_rooms WHERE room_id = ?
+            """,
+            (room_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Room does not exist.")
+    members = json.loads(row[4])
+    member = next((item for item in members if item.get("id") == member_id), None)
+    room_owner_id = row[0] if row[2] == "personal" else row[1]
+    allowed = may_export_room(
+        space_mode=row[2],
+        is_origin_admin=member_id == room_owner_id,
+        is_member=member is not None,
+        member_export_enabled=bool(member.get("can_export", row[3])) if member else False,
+    )
+    voice_logs_allowed = member_id == room_owner_id
+    if req.include_voice_logs and not voice_logs_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the room owner may export voice-call logs.",
+        )
+    if not allowed:
+        detail = (
+            "Export disabled in multi-user Personal Mode."
+            if row[2] == "personal"
+            else "Export disabled by Workspace Administrator."
+        )
+        raise HTTPException(status_code=403, detail=detail)
+    return {"authorized": True}
+
+
 @app.post("/api/rooms/passcode")
 async def update_room_passcode(req: RoomPasscodeUpdateRequest):
     identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    await asyncio.to_thread(require_room_scope, req.room_id, identity)
     client_id = f"google:{identity['sub']}"
     salt = os.urandom(16)
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
@@ -1759,6 +2381,7 @@ async def update_room_passcode(req: RoomPasscodeUpdateRequest):
 @app.post("/api/rooms/{room_id}/members/remove")
 async def remove_room_member(room_id: str, req: RoomMemberActionRequest):
     identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    await asyncio.to_thread(require_room_scope, room_id, identity)
     client_id = f"google:{identity['sub']}"
     if req.member_id == client_id:
         raise HTTPException(status_code=400, detail="The room host cannot remove themself.")
@@ -1795,6 +2418,7 @@ async def remove_room_member(room_id: str, req: RoomMemberActionRequest):
 @app.post("/api/rooms/{room_id}/transfer-host")
 async def transfer_room_host(room_id: str, req: RoomOwnershipTransferRequest):
     identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+    await asyncio.to_thread(require_room_scope, room_id, identity)
     client_id = f"google:{identity['sub']}"
     now = datetime.now(timezone.utc).isoformat()
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
@@ -1824,6 +2448,7 @@ async def end_sovereign_room(room_id: str, authorization: Optional[str] = Header
     identity = await asyncio.to_thread(
         verified_identity_from_token, authorization.removeprefix("Bearer ").strip()
     )
+    await asyncio.to_thread(require_room_scope, room_id, identity)
     client_id = f"google:{identity['sub']}"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
         with connection:
@@ -2383,7 +3008,8 @@ async def verify_totp(req: TotpVerifyRequest, request: Request):
             SELECT credentials.user_id, credentials.secret, credentials.failed_attempts,
                    credentials.locked_until, registry.display_name, registry.mobile_number,
                    registry.recovery_email, registry.avatar_url, registry.gender,
-                   registry.allow_room_invites, registry.is_creator, credentials.last_counter
+                   registry.allow_room_invites, registry.is_creator, credentials.last_counter,
+                   registry.tenant_id
             FROM totp_credentials credentials
             JOIN user_registry registry ON registry.user_id = credentials.user_id
             WHERE credentials.email = ? COLLATE NOCASE
@@ -2414,6 +3040,7 @@ async def verify_totp(req: TotpVerifyRequest, request: Request):
         "email": email,
         "name": row[4],
         "picture": "",
+        "tenant_id": row[12],
     }
     return {
         "verified": True,
@@ -2682,8 +3309,9 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                 """
                 INSERT INTO user_registry
                     (user_id, email, display_name, avatar_url, mobile_number, recovery_email,
-                     terms_accepted_at, allow_room_invites, is_creator, created_at, updated_at, privacy_accepted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'mutual_friends', ?, ?, ?, ?)
+                     terms_accepted_at, allow_room_invites, is_creator, created_at, updated_at,
+                     privacy_accepted_at, tenant_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'mutual_friends', ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     email = excluded.email,
                     display_name = excluded.display_name,
@@ -2698,7 +3326,11 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                         WHEN user_registry.privacy_accepted_at = '' THEN excluded.privacy_accepted_at
                         ELSE user_registry.privacy_accepted_at
                     END,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    tenant_id = CASE
+                        WHEN excluded.tenant_id != '' THEN excluded.tenant_id
+                        ELSE user_registry.tenant_id
+                    END
                 """,
                 (
                     identity["sub"],
@@ -2712,6 +3344,7 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                     now,
                     now,
                     now,
+                    verified_workspace_tenant(identity) or "",
                 ),
             )
             connection.execute(
@@ -3653,7 +4286,7 @@ async def get_user_rooms(
     member_id = f"google:{identity['sub']}"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
         rows = connection.execute(
-            "SELECT room_id, title, host_id, members_json, updated_at FROM sovereign_rooms ORDER BY updated_at DESC"
+            "SELECT room_id, title, host_id, members_json, updated_at, space_mode, tenant_id FROM sovereign_rooms ORDER BY updated_at DESC"
         ).fetchall()
     online_users = get_online_user_ids()
     return {
@@ -3673,8 +4306,12 @@ async def get_user_rooms(
                 ],
                 "updated_at": updated_at,
             }
-            for room_id, title, host_id, members_json, updated_at in rows
+            for room_id, title, host_id, members_json, updated_at, space_mode, tenant_id in rows
             if any(member.get("id") == member_id for member in json.loads(members_json))
+            and (
+                (space_mode == "workspace" and verified_workspace_tenant(identity) == tenant_id)
+                or (space_mode != "workspace" and not verified_workspace_tenant(identity))
+            )
             and not (
                 room_id.startswith("direct:")
                 and any(
@@ -3704,6 +4341,7 @@ def create_internal_session_token(identity: Dict[str, str]) -> str:
         "email_verified": True,
         "name": identity.get("name", ""),
         "picture": identity.get("picture", ""),
+        "tenant_id": identity.get("tenant_id", ""),
         "iat": now,
         "exp": now + SESSION_TTL_SECONDS,
     }
@@ -3770,6 +4408,7 @@ def verify_internal_session_token(token: str) -> Optional[Dict[str, str]]:
         "email": email.lower(),
         "name": str(claims.get("name") or ""),
         "picture": str(claims.get("picture") or ""),
+        "tenant_id": str(claims.get("tenant_id") or ""),
     }
 
 
@@ -3806,6 +4445,7 @@ def verify_google_id_token_claims(id_token: Optional[str]) -> Optional[Dict[str,
             "sub": "user-rshaji93",
             "email": "rshaji93@gmail.com",
             "name": "Shaji R",
+            "tenant_id": "",
             "role": "admin"
         }
     if not token or len(token) > 8192:
@@ -3851,6 +4491,7 @@ def verify_google_id_token_claims(id_token: Optional[str]) -> Optional[Dict[str,
             "sub": str(claims["sub"]),
             "name": str(claims.get("name") or ""),
             "picture": str(claims.get("picture") or ""),
+            "tenant_id": str(claims.get("hd") or "").strip().lower(),
         }
     except (GoogleAuthError, requests.RequestException, ValueError, TypeError) as error:
         logger.warning(
@@ -4446,7 +5087,7 @@ async def stream_chat(
     ).strip() or None
     if req.is_team_chat:
         raise HTTPException(status_code=400, detail="Team messages cannot use the AI streaming endpoint.")
-    prompt = (req.prompt or req.message or "").strip()
+    prompt = scrub_sensitive_tokens((req.prompt or req.message or "").strip())
     if not prompt:
         raise HTTPException(status_code=400, detail="Enter a message to chat.")
     req.prompt = prompt
@@ -4470,15 +5111,22 @@ async def stream_chat(
     if dev_token_requested and not dev_identity:
         raise HTTPException(status_code=401, detail="The developer session is only available in local development.")
 
-    verified_email = (
-        dev_identity["email"]
-        if dev_identity
-        else verify_google_id_token(req.google_id_token)
-        if req.google_id_token
-        else None
-    )
-    if req.google_id_token and not dev_identity and not verified_email:
-        raise HTTPException(status_code=401, detail="Google ID token verification failed.")
+    identity_token = (req.google_id_token or "").strip() or bearer_token
+    if dev_identity:
+        identity: Dict[str, str] = {**dev_identity, "tenant_id": ""}
+    else:
+        identity = await asyncio.to_thread(
+            verified_identity_from_token,
+            identity_token,
+            request,
+        )
+    verified_email = identity["email"]
+    if verified_workspace_tenant(identity):
+        room_id = str(req.workspace_room_id or "")
+        require_workspace_room_member(room_id, identity)
+        audit_workspace_action(identity, "chat.stream.request", room_id)
+    else:
+        require_personal_scope(identity)
     if not (req.observer_mode if req.observer_mode is not None else req.engine == "cloud_ai"):
         raise HTTPException(status_code=400, detail="Streaming cascade is available only in Observer mode.")
     mock_reply = (
@@ -4774,10 +5422,18 @@ async def direct_voice_turn(
         if candidate_identity:
             identity = candidate_identity
             break
+    if not identity:
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
     is_master_admin = (
-        bool(identity)
-        and identity.get("email", "").strip().lower() == ADMIN_EMAIL
+        identity.get("email", "").strip().lower() == ADMIN_EMAIL
     )
+
+    if verified_workspace_tenant(identity):
+        room_id = str(req.workspace_room_id or "")
+        require_workspace_room_member(room_id, identity)
+        audit_workspace_action(identity, "voice.turn.request", room_id)
+    else:
+        require_personal_scope(identity)
 
     # A user_email supplied by the client is not proof of identity; the admin path
     # is available only when the session token/cookie verifies to the owner.
@@ -4975,30 +5631,44 @@ async def handle_chat(
         )
     history = req.conversation_history or []
     bearer_token = (authorization or "").replace("Bearer ", "").strip()
+    identity_token = (req.google_id_token or "").strip() or bearer_token
     dev_identity = None
-    if not authorization or bearer_token == "dev-token-local-bypass":
+    if identity_token == "dev-token-local-bypass":
         dev_identity = {
             "sub": "dev-admin",
             "email": "dev@local.test",
             "name": "Dev Admin",
+            "tenant_id": "",
             "role": "admin",
         }
-        verified_email = dev_identity["email"]
+        identity = dev_identity
     else:
-        identity_token = (req.google_id_token or "").strip() or bearer_token
-        verified_email = verify_google_id_token(identity_token)
-        if not verified_email:
+        try:
+            identity = await asyncio.to_thread(
+                verified_identity_from_token,
+                identity_token,
+                request,
+            )
+        except HTTPException:
             if is_local_development_request(request):
                 dev_identity = {
                     "sub": "dev-admin",
                     "email": "dev@local.test",
                     "name": "Dev Admin",
+                    "tenant_id": "",
                     "role": "admin",
                 }
-                verified_email = dev_identity["email"]
+                identity = dev_identity
             else:
-                raise HTTPException(status_code=401, detail="Google ID token verification failed.")
-    prompt = (req.prompt or "").strip() or (req.message or "").strip()
+                raise
+    verified_email = identity["email"]
+    if verified_workspace_tenant(identity):
+        room_id = str(req.workspace_room_id or "")
+        require_workspace_room_member(room_id, identity)
+        audit_workspace_action(identity, "chat.request", room_id)
+    else:
+        require_personal_scope(identity)
+    prompt = scrub_sensitive_tokens((req.prompt or "").strip() or (req.message or "").strip())
     if not prompt:
         raise HTTPException(status_code=400, detail="Enter a message to chat.")
     req.prompt = prompt
@@ -5874,6 +6544,7 @@ async def send_invites(payload: Dict[str, Any]):
         verified_identity_from_token,
         str(payload.get("google_id_token") or ""),
     )
+    require_personal_scope(identity)
     room_id = str(payload.get("room_id") or "")
     required_attendees = payload.get("required_attendees") or []
     optional_attendees = payload.get("optional_attendees") or []
@@ -5971,7 +6642,9 @@ async def room_websocket(websocket: WebSocket, room_id: str):
             public_key,
             str(join_event.get("room_title") or room_id)[:200],
             str(join_event.get("host_id") or ""),
+            verified_workspace_tenant(identity) or "",
         )
+        connection.focused = bool(join_event.get("focused", False))
         try:
             await room_manager.connect(room_id, connection)
         except HTTPException as error:

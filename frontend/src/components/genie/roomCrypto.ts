@@ -197,11 +197,17 @@ export async function decryptRoomMessage(
   if (!envelope || envelope.v !== 1) {
     throw new Error("This room message was not encrypted for this device identity.");
   }
-  const key = await derivePeerKey(identity.privateKey, senderPublicKey, ownId, senderId);
-  const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: toArrayBuffer(fromBase64(envelope.iv)) },
-    key,
-    toArrayBuffer(fromBase64(envelope.ciphertext))
-  );
-  return decoder.decode(plaintext);
+
+  try {
+    const key = await derivePeerKey(identity.privateKey, senderPublicKey, ownId, senderId);
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: toArrayBuffer(fromBase64(envelope.iv)) },
+      key,
+      toArrayBuffer(fromBase64(envelope.ciphertext))
+    );
+    return decoder.decode(plaintext);
+  } catch (error) {
+    console.warn("Unable to decrypt room envelope (stale session key or mismatched peer identity):", error);
+    return "[Encrypted message unavailable due to key rotation or session reset]";
+  }
 }

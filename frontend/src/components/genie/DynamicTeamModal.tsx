@@ -6,8 +6,12 @@ export type RoomCapacityMode = "pair" | "squad" | "custom" | "unlimited";
 
 interface DynamicTeamModalProps {
   mode: RoomCapacityMode;
+  spaceMode: "personal" | "workspace";
   customCapacity: number;
   activeMembers: number;
+  historyVisibleBeforeJoin: boolean;
+  allowMemberExport: boolean;
+  canInviteMore: boolean;
   panelClass: string;
   borderClass: string;
   textClass: string;
@@ -15,6 +19,9 @@ interface DynamicTeamModalProps {
   surfaceClass: string;
   onModeChange: (mode: RoomCapacityMode) => void;
   onCustomCapacityChange: (capacity: number) => void;
+  onHistoryVisibilityChange: (allowed: boolean) => void;
+  onMemberExportChange: (allowed: boolean) => void;
+  onAddMember: () => void;
 }
 
 const CAPACITY_OPTIONS: {
@@ -30,8 +37,12 @@ const CAPACITY_OPTIONS: {
 
 export default function DynamicTeamModal({
   mode,
+  spaceMode,
   customCapacity,
   activeMembers,
+  historyVisibleBeforeJoin,
+  allowMemberExport,
+  canInviteMore,
   panelClass,
   borderClass,
   textClass,
@@ -39,6 +50,9 @@ export default function DynamicTeamModal({
   surfaceClass,
   onModeChange,
   onCustomCapacityChange,
+  onHistoryVisibilityChange,
+  onMemberExportChange,
+  onAddMember,
 }: DynamicTeamModalProps) {
   const capacity = mode === "pair" ? 2 : mode === "squad" ? 10 : mode === "custom" ? customCapacity : null;
   const capacityLabel = capacity === null ? "Unlimited" : capacity.toString();
@@ -93,6 +107,45 @@ export default function DynamicTeamModal({
             className={`w-24 rounded-lg border ${borderClass} ${surfaceClass} px-2 py-1 text-right text-xs text-slate-800 outline-none focus:ring-2 focus:ring-slate-200`}
           />
         </label>
+      )}
+
+      <div className="space-y-2 border-t border-slate-200 pt-2">
+        <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-700">
+          <input
+            type="checkbox"
+            checked={historyVisibleBeforeJoin}
+            onChange={(event) => onHistoryVisibilityChange(event.target.checked)}
+            className="mt-0.5 accent-indigo-600"
+          />
+          <span>Allow new user to view past chat history</span>
+        </label>
+        {spaceMode === "workspace" && (
+          <label className="flex items-start gap-2 text-[11px] leading-relaxed text-slate-700">
+            <input
+              type="checkbox"
+              checked={allowMemberExport}
+              onChange={(event) => onMemberExportChange(event.target.checked)}
+              className="mt-0.5 accent-indigo-600"
+            />
+            <span>Allow this member to export chat sessions</span>
+          </label>
+        )}
+        <p className={`text-[10px] ${mutedTextClass}`}>
+          These default-deny permissions apply to future invitees. Existing members keep their current access.
+        </p>
+      </div>
+      {canInviteMore ? (
+        <button
+          type="button"
+          onClick={onAddMember}
+          className={`w-full rounded-xl border ${borderClass} ${surfaceClass} px-3 py-2 text-left text-[11px] font-semibold ${textClass} hover:bg-slate-50`}
+        >
+          + Add another user
+        </button>
+      ) : (
+        <p className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] font-semibold text-rose-700">
+          {spaceMode === "personal" ? "Personal Room Full (Max 5)" : "Workspace Room Full (Max 5)"}
+        </p>
       )}
     </section>
   );

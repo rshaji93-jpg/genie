@@ -25,6 +25,17 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
+@keyframes genieSheetUp {
+  from {
+    opacity: 0;
+    transform: translateY(1.5rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .rainbow-read-ticks {
   background: linear-gradient(135deg, #ff007a, #9b00e8, #00d2ff, #00ff87);
   background-clip: text;
@@ -41,5 +52,26 @@ body {
   }
   to {
     filter: drop-shadow(0 0 5px #00e1ff);
+  }
+}
+
+@media print {
+  body.print-restricted * {
+    visibility: hidden !important;
+  }
+
+  body.print-restricted::before {
+    content: "Printing and exporting are restricted for this session";
+    position: fixed;
+    inset: 40% 8% auto;
+    z-index: 2147483647;
+    color: #0f172a;
+    font: 700 18pt/1.4 Arial, Helvetica, sans-serif;
+    text-align: center;
+    visibility: visible !important;
+  }
+
+  body.print-restricted #chat-transcript {
+    display: none !important;
   }
 }

@@ -1,21 +1,24 @@
 "use client";
 
-import React, { useState } from "react";
-import { X, Settings, User, Key, ExternalLink, GraduationCap, Briefcase, Check, Eye, EyeOff } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import { X, Settings, Key, ExternalLink, GraduationCap, Briefcase, Check, Eye, EyeOff, CircleHelp, ShieldCheck } from "lucide-react";
 import { Download, FileUp } from "lucide-react";
+
+interface SettingsUserProfile {
+  name: string;
+  email: string;
+  avatarUrl: string;
+  role: "student" | "professional";
+  ageGroup: string;
+  customApiKey: string;
+}
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  userProfile: {
-    name: string;
-    email: string;
-    avatarUrl: string;
-    role: "student" | "professional";
-    ageGroup: string;
-    customApiKey: string;
-  };
-  onSaveProfile: (profile: any) => void;
+  userProfile: SettingsUserProfile;
+  onSaveProfile: (profile: SettingsUserProfile) => void;
+  onAuthorizeBackupExport?: () => Promise<boolean>;
 }
 
 export default function SettingsModal({
@@ -23,22 +26,49 @@ export default function SettingsModal({
   onClose,
   userProfile,
   onSaveProfile,
+  onAuthorizeBackupExport,
 }: SettingsModalProps) {
   const [role, setRole] = useState<"student" | "professional">(userProfile.role);
   const [ageGroup, setAgeGroup] = useState(userProfile.ageGroup);
   const [apiKey, setApiKey] = useState(userProfile.customApiKey);
   const [showApiKey, setShowApiKey] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
+  const [byokHelpOpen, setByokHelpOpen] = useState(false);
+  const [byokStorageError, setByokStorageError] = useState<string | null>(null);
+  const [backupExportError, setBackupExportError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const timer = window.setTimeout(() => {
+      try {
+        setApiKey(localStorage.getItem("genie_user_byok_key") || "");
+        setByokStorageError(null);
+      } catch (error) {
+        console.error("The device BYOK key could not be read:", error);
+        setByokStorageError("Browser storage is unavailable. Your API key cannot be saved on this device.");
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    try {
+      if (apiKey.trim()) localStorage.setItem("genie_user_byok_key", apiKey.trim());
+      else localStorage.removeItem("genie_user_byok_key");
+      setByokStorageError(null);
+    } catch (error) {
+      console.error("The BYOK key could not be saved to this device:", error);
+      setByokStorageError("The API key could not be saved in browser storage.");
+      return;
+    }
     onSaveProfile({
       ...userProfile,
       role,
       ageGroup,
-      customApiKey: apiKey,
+      customApiKey: "",
     });
     setSavedSuccess(true);
     setTimeout(() => {
@@ -104,17 +134,27 @@ export default function SettingsModal({
           <div className="flex gap-2 pt-1">
             <button
               type="button"
-              onClick={() => {
-                const stored = localStorage.getItem("genie_chat_sessions_v2") || localStorage.getItem("genie_chat_sessions");
-                const blob = new Blob([stored || "[]"], { type: "application/json" });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `Genie_Backup_${new Date().toISOString().slice(0, 10)}.json`;
-                a.click();
-                URL.revokeObjectURL(url);
+              disabled={!onAuthorizeBackupExport}
+              title={!onAuthorizeBackupExport ? "Export disabled by room policy" : "Export chat backup"}
+              onClick={async () => {
+                try {
+                  if (!onAuthorizeBackupExport) return;
+                  if (!(await onAuthorizeBackupExport())) return;
+                  const stored = localStorage.getItem("genie_chat_sessions_v2") || localStorage.getItem("genie_chat_sessions");
+                  const blob = new Blob([stored || "[]"], { type: "application/json" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `Genie_Backup_${new Date().toISOString().slice(0, 10)}.json`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  setBackupExportError(null);
+                } catch (error) {
+                  console.error("Backup export authorization failed:", error);
+                  setBackupExportError("Backup export failed or is not authorized for this room.");
+                }
               }}
-              className="flex-1 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5"
+              className="flex-1 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition-all flex items-center justify-center gap-1.5 disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Download className="w-3.5 h-3.5" />
               <span>Export Backup</span>
@@ -147,6 +187,7 @@ export default function SettingsModal({
               />
             </label>
           </div>
+          {backupExportError && <p role="alert" className="text-[10px] text-rose-700">{backupExportError}</p>}
         </div>
 
             {/* Persona Switch: Student vs Professional */}
@@ -203,16 +244,46 @@ export default function SettingsModal({
                   <Key className="w-4 h-4 text-amber-500" />
                   <span className="text-xs font-bold text-slate-800">Bring Your Own Key (BYOK)</span>
                 </div>
-                <a
-                  href="https://aistudio.google.com/app/apikey"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="flex items-center gap-1 text-[11px] font-semibold text-purple-700 hover:underline"
-                >
-                  <span>Get Gemini API Key</span>
-                  <ExternalLink className="w-3 h-3" />
-                </a>
+                <div className="flex items-center gap-1.5">
+                  <a
+                    href="https://aistudio.google.com/app/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center gap-1 text-[11px] font-semibold text-purple-700 hover:underline"
+                  >
+                    <span>Get Gemini API Key</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => setByokHelpOpen((open) => !open)}
+                    aria-label="BYOK and room privacy guidance"
+                    aria-expanded={byokHelpOpen}
+                    className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-purple-300 text-[11px] font-bold text-purple-700 hover:bg-purple-100"
+                  >
+                    <CircleHelp className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </div>
+
+              {byokHelpOpen && (
+                <aside className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-[10px] leading-relaxed text-slate-700" aria-label="BYOK privacy guidance">
+                  <h4 className="mb-1 font-bold text-slate-900">Personal Mode</h4>
+                  <ul className="list-disc space-y-1 pl-4">
+                    <li>Your key is stored in this browser and is not included in profile sync or Genie application logs. It is transmitted over HTTPS to Genie for request processing and forwarded to Google; Google bills usage and applies its quota/terms. Genie is not responsible for provider charges.</li>
+                    <li>Room owners control whether invitees see earlier history. Export is unavailable to invited guests in multi-user Personal Mode.</li>
+                    <li>Only the Room Owner may save a Personal Mode voice-call log.</li>
+                  </ul>
+                  <h4 className="mb-1 mt-2 font-bold text-slate-900">Workspace Mode</h4>
+                  <ul className="list-disc space-y-1 pl-4">
+                    <li>Server Genie uses platform-managed quota. BYOK requests use your organization&apos;s Google Cloud billing account; the key remains hidden from workspace members.</li>
+                    <li>Workspace Origin Admin provisions history and export permissions before inviting members. Voice logs are saved to the workspace; only its Origin Admin may export or share them.</li>
+                  </ul>
+                  <p className="mt-2 border-t border-indigo-200 pt-2">
+                    Local storage is device/browser scoped, not encrypted vault storage. Revoking a key here removes this browser copy; also revoke it in Google AI Studio to invalidate it.
+                  </p>
+                </aside>
+              )}
 
               <div className="relative">
                 <input
@@ -234,8 +305,26 @@ export default function SettingsModal({
                 </button>
               </div>
               <p className="text-[10px] text-slate-400 leading-normal">
-                Supplying your own API key removes all daily VIP caps and provides unlimited high-throughput streaming.
+                The key is saved only in this browser. Google usage is billed to your account and follows Google&apos;s quota and terms.
               </p>
+              {byokStorageError && <p role="alert" className="text-[10px] font-medium text-rose-600">{byokStorageError}</p>}
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    localStorage.removeItem("genie_user_byok_key");
+                    setApiKey("");
+                    setByokStorageError(null);
+                  } catch (error) {
+                    console.error("The BYOK key could not be revoked from this device:", error);
+                    setByokStorageError("The API key could not be removed from browser storage.");
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-rose-700 hover:bg-rose-50"
+              >
+                <ShieldCheck className="h-3.5 w-3.5" />
+                Revoke key on this device
+              </button>
             </div>
 
             {/* Modal Actions */}

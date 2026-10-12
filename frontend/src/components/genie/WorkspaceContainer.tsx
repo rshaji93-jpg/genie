@@ -106,6 +106,7 @@ import {
   UserPlus,
   Search,
   ImagePlus,
+  CircleHelp,
 } from "lucide-react";
 
 interface IndianLanguage {
@@ -287,13 +288,25 @@ const DEVELOPER_EMAIL = "ratnaraja007@gmail.com";
 const SUPPORT_DISPATCH_EMAIL = process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "support@genie.ai";
 const DAILY_FREE_LIMIT = 20;
 
+function scrubSensitiveClientTokens(text: string): string {
+  return text.replace(
+    /AIza[0-9A-Za-z_-]{20,}|sk-or-(?:v1-)?[0-9A-Za-z_-]{16,}|\bsk-[0-9A-Za-z_-]{20,}|\bgh[pousr]_[0-9A-Za-z]{20,}\b|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi,
+    "[PROTECTED_CREDENTIAL]",
+  );
+}
+
 interface RoomMember {
   id: string;
   name: string;
   email: string;
   avatarUrl?: string;
-  role: "sovereign" | "admin" | "developer" | "member";
-  status: "active" | "inactive";
+  role: "origin_admin" | "delegated_admin" | "sovereign" | "admin" | "developer" | "member" | "guest";
+  status: "active" | "inactive" | "different_room";
+  is_host?: boolean;
+  joined_at?: string;
+  can_export?: boolean;
+  can_view_history?: boolean;
+  is_origin_admin?: boolean;
   publicKey?: JsonWebKey;
   attendeeType?: "required" | "optional";
 }
@@ -388,8 +401,23 @@ interface ChatSession {
   topicId?: string;
   isSharedArchive?: boolean;
   isDeleted?: boolean;
+  isArchived?: boolean;
   deletedAt?: string;
   deletedBy?: string;
+}
+
+interface AdminTelemetry {
+  total_registered_users: { total: number; personal: number; workspace: number };
+  active_connections_count: number;
+  live_active_users: Array<{
+    id: string;
+    name: string;
+    email: string;
+    avatar_url: string;
+    room_id: string;
+    focused: boolean;
+    status: "active" | "inactive" | "different_room";
+  }>;
 }
 
 interface VoiceCallTurnResult {
@@ -515,8 +543,9 @@ interface RoomSocketEvent {
   status?: "delivered" | "read";
   message?: Message;
   messages?: Message[];
-  members?: Array<{ id?: string; user_id?: string; name?: string; display_name?: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "sovereign" | "admin" | "developer" | "member"; status?: "active" | "inactive" }>;
-  users?: Array<{ id?: string; user_id: string; display_name: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "sovereign" | "admin" | "developer" | "member"; status?: "active" | "inactive" }>;
+  members?: Array<{ id?: string; user_id?: string; name?: string; display_name?: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "origin_admin" | "delegated_admin" | "sovereign" | "admin" | "developer" | "member" | "guest"; status?: "active" | "inactive" | "different_room"; is_host?: boolean; joined_at?: string; can_export?: boolean; can_view_history?: boolean; is_origin_admin?: boolean }>;
+  users?: Array<{ id?: string; user_id: string; display_name: string; email?: string; avatar_url?: string; public_key?: JsonWebKey; role?: "origin_admin" | "delegated_admin" | "sovereign" | "admin" | "developer" | "member" | "guest"; status?: "active" | "inactive" | "different_room"; is_host?: boolean; joined_at?: string; can_export?: boolean; can_view_history?: boolean; is_origin_admin?: boolean }>;
+  policy?: { space_mode?: "personal" | "workspace"; history_visible_before_join?: boolean; allow_member_export?: boolean };
   message_id?: string;
   id?: string;
   member_id?: string;
@@ -1086,6 +1115,88 @@ function MainChatApp() {
     if (profileTotpToastTimerRef.current) clearTimeout(profileTotpToastTimerRef.current);
   }, []);
   const [googleIdToken, setGoogleIdToken] = useState("");
+  const [corporateTenantId, setCorporateTenantId] = useState("");
+  const [corporateAvatarUrl, setCorporateAvatarUrl] = useState("");
+  const [scopeVerifiedToken, setScopeVerifiedToken] = useState("");
+  const [isSuperAdminSession, setIsSuperAdminSession] = useState(false);
+  const [adminTelemetry, setAdminTelemetry] = useState<AdminTelemetry | null>(null);
+  const [adminTelemetryError, setAdminTelemetryError] = useState("");
+  const isSuperAdminVerified =
+    isAuthenticated && isSuperAdminSession && scopeVerifiedToken === googleIdToken;
+  useEffect(() => {
+    if (!googleIdToken) {
+      setCorporateTenantId("");
+      setCorporateAvatarUrl("");
+      setScopeVerifiedToken("");
+      return;
+    }
+    let active = true;
+    void fetch(getBackendApiUrl("/api/auth/session-scope"), {
+      cache: "no-store",
+      headers: { Authorization: `Bearer ${googleIdToken}` },
+    })
+      .then(async (response) => {
+        const result = (await response.json()) as {
+          scope?: "personal" | "workspace";
+          tenant_id?: string | null;
+          corporate_avatar_url?: string;
+          is_super_admin?: boolean;
+        };
+        if (!response.ok) {
+          throw new Error(`Session scope could not be verified (HTTP ${response.status}).`);
+        }
+        if (!active) return;
+        const tenantId = result.scope === "workspace" ? result.tenant_id || "" : "";
+        setCorporateTenantId(tenantId);
+        setCorporateAvatarUrl(tenantId ? result.corporate_avatar_url || "" : "");
+        setIsSuperAdminSession(result.is_super_admin === true);
+        setScopeVerifiedToken(googleIdToken);
+        if (tenantId) setSpaceMode("workspace");
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        console.error("Verified account scope could not be loaded:", error);
+        setCorporateTenantId("");
+        setCorporateAvatarUrl("");
+        setIsSuperAdminSession(false);
+        setAdminTelemetry(null);
+        setSecurityToast("Account scope could not be verified. Workspace actions are restricted until sign-in is refreshed.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [googleIdToken]);
+  useEffect(() => {
+    if (!isSuperAdminVerified || !googleIdToken) return;
+    let active = true;
+    let timer: number | undefined;
+    const refreshTelemetry = async () => {
+      try {
+        const response = await fetch(getBackendApiUrl("/api/admin/telemetry"), {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${googleIdToken}` },
+        });
+        if (!response.ok) {
+          throw new Error(`Telemetry unavailable (HTTP ${response.status}).`);
+        }
+        const result = (await response.json()) as AdminTelemetry;
+        if (!active) return;
+        setAdminTelemetry(result);
+        setAdminTelemetryError("");
+      } catch (error) {
+        if (!active) return;
+        console.error("Super-admin telemetry refresh failed:", error);
+        setAdminTelemetryError(error instanceof Error ? error.message : "Telemetry could not be loaded.");
+      } finally {
+        if (active) timer = window.setTimeout(() => void refreshTelemetry(), 10000);
+      }
+    };
+    void refreshTelemetry();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [isSuperAdminVerified, googleIdToken]);
   const [editProfileOpen, setEditProfileOpen] = useState(false);
   const [profileSaveBusy, setProfileSaveBusy] = useState(false);
   const [profileSaveError, setProfileSaveError] = useState<string | null>(null);
@@ -1094,6 +1205,7 @@ function MainChatApp() {
   const [byokTesting, setByokTesting] = useState(false);
   const [byokStatus, setByokStatus] = useState<string | null>(null);
   const [byokError, setByokError] = useState<string | null>(null);
+  const [byokHelpOpen, setByokHelpOpen] = useState(false);
   const [voicePreset, setVoicePreset] = useState<"Aoede" | "Charon">("Aoede");
   const [profileTotpSetup, setProfileTotpSetup] = useState<{ qr_code: string; secret: string } | null>(null);
   const [profileTotpCode, setProfileTotpCode] = useState("");
@@ -1112,6 +1224,8 @@ function MainChatApp() {
   const [guestId, setGuestId] = useState("");
 
   const [members, setMembers] = useState<RoomMember[]>([]);
+  const [historyVisibleBeforeJoin, setHistoryVisibleBeforeJoin] = useState(false);
+  const [allowMemberExport, setAllowMemberExport] = useState(false);
   const [roomCryptoIdentity, setRoomCryptoIdentity] = useState<RoomCryptoIdentity | null>(null);
   const [discoverableFriends, setDiscoverableFriends] = useState<DiscoverableFriend[]>([]);
   const [pendingFriendRequests, setPendingFriendRequests] = useState<PendingFriendRequest[]>([]);
@@ -1198,6 +1312,7 @@ function MainChatApp() {
 
   const [prompt, setPrompt] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
+  const [securityToast, setSecurityToast] = useState<string | null>(null);
   const suppressAuthWarning =
     (showDevAuthBypass || isAuthenticated) &&
     Boolean(chatError && /google sign-in could not be verified|google identity verification failed|ID token may be expired|platform engine failed.*google sign-in/i.test(chatError));
@@ -1240,6 +1355,8 @@ function MainChatApp() {
 
   const vipSessionIdRef = useRef<string | null>(null);
   const roomSocketRef = useRef<WebSocket | null>(null);
+  const roomHeartbeatRef = useRef<number | null>(null);
+  const presenceLastActivityRef = useRef(Date.now());
   const archivePromptedRef = useRef(false);
   const readReceiptIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1252,13 +1369,12 @@ function MainChatApp() {
   const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID?.trim() || "";
   const FACEBOOK_APP_ID = process.env.NEXT_PUBLIC_FACEBOOK_APP_ID?.trim() || "";
 
-  const isCorporateDomain =
-    Boolean(userProfile.email) &&
-    !userProfile.email.endsWith("@gmail.com") &&
-    !userProfile.email.endsWith("@yahoo.com") &&
-    !userProfile.email.endsWith("@outlook.com") &&
-    !userProfile.email.endsWith("@hotmail.com") &&
-    userProfile.email.includes("@");
+  const isCorporateDomain = Boolean(
+    googleIdToken && scopeVerifiedToken === googleIdToken && corporateTenantId,
+  );
+  const effectiveUserAvatar = isCorporateDomain
+    ? corporateAvatarUrl
+    : profileAvatar;
 
   const isDevUser = userProfile.email.toLowerCase() === DEVELOPER_EMAIL.toLowerCase();
   const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
@@ -1286,11 +1402,47 @@ function MainChatApp() {
 
   const isQuotaEnforced = !isMasterAdmin && !isVipUser && !byokVerified;
   const remainingDailyChats = isMasterAdmin ? 999999 : Math.max(0, DAILY_FREE_LIMIT - dailyUsageCount);
+  const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
   const activeRoomMemberCount = members.filter((member) => member.status === "active").length;
   const roomMemberCount = members.length;
   const isCurrentRoomHost = members.some(
-    (member) => member.id === roomIdentity && member.role === "sovereign",
+    (member) => member.id === roomIdentity && (member.is_host || member.role === "sovereign"),
   );
+  const isCurrentRoomOriginAdmin = members.some(
+    (member) => member.id === roomIdentity && member.is_origin_admin,
+  );
+  const canManageRoomPolicy = spaceMode === "personal"
+    ? isCurrentRoomHost
+    : isCurrentRoomOriginAdmin;
+  const currentRoomMember = members.find((member) => member.id === roomIdentity);
+  const canExportActiveChat = !isTeamMode
+    ? !isCorporateDomain
+    : spaceMode === "personal"
+    ? isCurrentRoomHost
+    : isCurrentRoomOriginAdmin || Boolean(currentRoomMember?.can_export);
+  const exportDisabledReason = spaceMode === "personal"
+    ? "Export disabled in multi-user Personal Mode"
+    : "Export disabled by Workspace Administrator";
+  useEffect(() => {
+    const printingRestricted = !canExportActiveChat;
+    document.body.classList.toggle("print-restricted", printingRestricted);
+    const handlePrintShortcut = (event: KeyboardEvent) => {
+      if (
+        printingRestricted &&
+        event.key.toLowerCase() === "p" &&
+        (event.ctrlKey || event.metaKey)
+      ) {
+        event.preventDefault();
+        setSecurityToast("Printing is disabled because you do not have export permission for this session.");
+        window.setTimeout(() => setSecurityToast(null), 4000);
+      }
+    };
+    window.addEventListener("keydown", handlePrintShortcut, true);
+    return () => {
+      document.body.classList.remove("print-restricted");
+      window.removeEventListener("keydown", handlePrintShortcut, true);
+    };
+  }, [canExportActiveChat]);
   const roomCapacityLimit =
     roomCapacityMode === "pair"
       ? 2
@@ -1319,7 +1471,6 @@ function MainChatApp() {
     : [];
   const chatSearchMatches = searchMatches.filter((message) => message.role === "user");
   const aiSearchMatches = searchMatches.filter((message) => message.role === "assistant");
-  const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
   const observerPreferenceOwner =
     userProfile.providerId || userProfile.email.toLowerCase() || guestId || "guest";
 
@@ -1347,6 +1498,10 @@ function MainChatApp() {
   }, [mounted, observerPreferenceOwner]);
 
   const updateCurrentPersonalMessages = (updateMessages: (current: Message[]) => Message[]) => {
+    if (!isTeamMode && currentSession?.isArchived) {
+      setSecurityToast("Archived sessions are read-only. Clone the transcript to continue editing.");
+      return;
+    }
     if (currentSession?.isSharedArchive) {
       setSessions((previous) =>
         previous.map((session) =>
@@ -1487,6 +1642,14 @@ function MainChatApp() {
     if (isTeamMode) {
       sendRoomEvent({ type: "voice_session.end", call_id: transcript.callId });
       setActiveRoomVoiceCallId("");
+      const canSaveRoomCallLog = spaceMode === "personal"
+        ? isCurrentRoomHost
+        : isCurrentRoomOriginAdmin;
+      if (!canSaveRoomCallLog) return;
+      if (spaceMode === "personal") {
+        setPendingCallTranscript(transcript);
+        return;
+      }
       const content = JSON.stringify(transcript);
       const sent = await sendEncryptedRoomEvent({
         type: "message.send",
@@ -1503,12 +1666,49 @@ function MainChatApp() {
       }
       return;
     }
+    if (spaceMode === "workspace") {
+      updateCurrentPersonalMessages((current) => [
+        ...current,
+        {
+          id: transcript.callId,
+          role: "assistant",
+          content: formatVoiceCallTranscript(transcript),
+          text: formatVoiceCallTranscript(transcript),
+          timestamp: new Date().toISOString(),
+          senderName: "Genie Master",
+          isCallRecord: true,
+          callTranscript: transcript,
+        },
+      ]);
+      return;
+    }
     setPendingCallTranscript(transcript);
   }
 
   function savePendingCallTranscript() {
-    if (!pendingCallTranscript) return;
+    const canSaveRoomCallLog = spaceMode === "personal"
+      ? isCurrentRoomHost
+      : isCurrentRoomOriginAdmin;
+    if (!pendingCallTranscript || (isTeamMode && !canSaveRoomCallLog)) return;
     const record = pendingCallTranscript;
+    if (isTeamMode) {
+      void sendEncryptedRoomEvent({
+        type: "message.send",
+        content: JSON.stringify(record),
+        sender_name: "Genie Master",
+        sender_type: "assistant",
+        is_voice_record: true,
+        is_voice_session_summary: true,
+        call_id: record.callId,
+      }).then((sent) => {
+        if (!sent) {
+          setChatError("The call log could not be saved to this room.");
+          return;
+        }
+        setPendingCallTranscript(null);
+      });
+      return;
+    }
     updateCurrentPersonalMessages((current) => [
       ...current,
       {
@@ -1523,6 +1723,118 @@ function MainChatApp() {
       },
     ]);
     setPendingCallTranscript(null);
+  }
+
+  function purgeLocalChatContext() {
+    const newSession: ChatSession = {
+      id: window.crypto.randomUUID(),
+      title: "New Session",
+      isPinned: false,
+      messages: [],
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      localStorage.removeItem("genie_chat_sessions_v2");
+      localStorage.removeItem("genie_chat_sessions");
+      if (topicsStorageOwner) localStorage.removeItem(`genie_topics_v1_${topicsStorageOwner}`);
+      setChatError(null);
+    } catch (error) {
+      console.error("Local chat context purge failed:", error);
+      setChatError("Some local chat history could not be removed from browser storage.");
+    }
+    setSessions([newSession]);
+    setCurrentSessionId(newSession.id);
+    setPersonalMessages([]);
+    setTopics((previous) => previous.map((topic) => ({ ...topic, messages: [], message_count: 0 })));
+    setArchivedRoomMessages({});
+    setPendingCallTranscript(null);
+    if (isTeamMode) setRoomMessages([]);
+  }
+
+  function archiveCurrentSession() {
+    if (!currentSession || currentSession.isArchived) return;
+    setSessions((previous) => previous.map((session) =>
+      session.id === currentSession.id ? { ...session, isArchived: true } : session
+    ));
+    setSecurityToast("Session moved to Archive and is now read-only.");
+  }
+
+  async function exportAndArchiveCurrentSession() {
+    if (!currentSession || currentSession.isArchived) return;
+    if (await exportCurrentSessionTranscript("markdown")) archiveCurrentSession();
+  }
+
+  function wipeClientCacheAndTokens() {
+    try {
+      const preservedTranscriptKeys = new Set(["genie_chat_sessions_v2", "genie_chat_sessions"]);
+      for (const key of Object.keys(localStorage)) {
+        if (!preservedTranscriptKeys.has(key) && (
+          key.startsWith("genie_") ||
+          key === "token" ||
+          key === "auth_token" ||
+          key === "access_token"
+        )) {
+          localStorage.removeItem(key);
+        }
+      }
+      for (const key of Object.keys(sessionStorage)) {
+        if (key.startsWith("genie_") || key === "token" || key === "auth_token" || key === "access_token") {
+          sessionStorage.removeItem(key);
+        }
+      }
+      setGoogleIdToken("");
+      setIsAuthenticated(false);
+      setSecurityToast("Genie cache and sign-in tokens cleared. Chat transcripts were preserved.");
+    } catch (error) {
+      console.error("Client cache and token wipe failed:", error);
+      setSecurityToast("Some browser state could not be cleared.");
+    }
+  }
+
+  function fullEphemeralReset() {
+    if (!window.confirm("This permanently clears Genie session traces and local conversations from this browser. Continue?")) return;
+    try {
+      for (const key of Object.keys(localStorage)) {
+        if (key.startsWith("genie_") || key === "token" || key === "auth_token" || key === "access_token") {
+          localStorage.removeItem(key);
+        }
+      }
+      for (const key of Object.keys(sessionStorage)) {
+        if (key.startsWith("genie_") || key === "token" || key === "auth_token" || key === "access_token") {
+          sessionStorage.removeItem(key);
+        }
+      }
+      setGoogleIdToken("");
+      setIsAuthenticated(false);
+      purgeLocalChatContext();
+      setSecurityToast("Local Genie session traces were cleared.");
+    } catch (error) {
+      console.error("Full ephemeral reset failed:", error);
+      setSecurityToast("The full local reset could not be completed.");
+    }
+  }
+
+  function duplicateCurrentTranscript(forkAtCurrentMessage: boolean) {
+    if (!currentSession) return;
+    const source = messages.filter((message) => !message.is_deleted);
+    const copiedMessages = (forkAtCurrentMessage ? source.slice(0, source.length) : source).map((message) => ({
+      ...message,
+      id: window.crypto.randomUUID(),
+    }));
+    const clone: ChatSession = {
+      id: window.crypto.randomUUID(),
+      title: `${forkAtCurrentMessage ? "Fork" : "Sandbox"} · ${currentSession.title}`.slice(0, 120),
+      isPinned: false,
+      messages: copiedMessages,
+      createdAt: new Date().toISOString(),
+    };
+    setSessions((previous) => [clone, ...previous]);
+    setCurrentSessionId(clone.id);
+    setIsTopicConversation(false);
+    setIsTeamMode(false);
+    setPersonalMessages(copiedMessages);
+    setPrompt("");
+    setSecurityToast(forkAtCurrentMessage ? "Session fork created." : "Full transcript cloned to a sandbox.");
   }
 
   async function encryptAndSendRoomEvent(
@@ -1557,10 +1869,21 @@ function MainChatApp() {
   async function publishPendingShareTranscript(roomMembers: RoomMember[]) {
     const transcript = shareTranscriptRef.current;
     if (
+      transcript &&
+      !historyVisibleBeforeJoin &&
+      (roomId.startsWith("share_") || roomId.startsWith("invite_")) &&
+      roomIdentity === shareTranscriptOwnerRef.current
+    ) {
+      shareTranscriptRef.current = null;
+      shareTranscriptSentRef.current = true;
+      return;
+    }
+    if (
       !transcript ||
       shareTranscriptSentRef.current ||
       (!roomId.startsWith("share_") && !roomId.startsWith("invite_")) ||
       roomIdentity !== shareTranscriptOwnerRef.current ||
+      !historyVisibleBeforeJoin ||
       roomMembers.filter((member) => member.status === "active").length < 2
     ) {
       return;
@@ -1574,6 +1897,11 @@ function MainChatApp() {
           content: message.content,
           sender_name: message.senderName || message.sender_name || userProfile.name,
           sender_type: message.role === "assistant" ? "assistant" : "user",
+          is_history_replay: true,
+          is_voice_record: Boolean(
+            message.isVoiceRecord || message.isVoiceSessionSummary || message.isCallRecord,
+          ),
+          is_voice_session_summary: Boolean(message.isVoiceSessionSummary),
         },
         roomMembers
       );
@@ -1977,7 +2305,7 @@ function MainChatApp() {
   }, [mounted, topics, topicsStorageOwner]);
 
   useEffect(() => {
-    if (!mounted || !isAuthenticated || !googleIdToken || !userProfile.providerId) return;
+    if (!mounted || isCorporateDomain || !isAuthenticated || !googleIdToken || !userProfile.providerId) return;
     let active = true;
     setIsTopicLoading(true);
     void fetch(
@@ -2009,7 +2337,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
     return () => {
       active = false;
     };
-  }, [mounted, isAuthenticated, googleIdToken, userProfile.providerId, API_BASE]);
+  }, [mounted, isCorporateDomain, isAuthenticated, googleIdToken, userProfile.providerId, API_BASE]);
 
   useEffect(() => {
     if (!mounted) return;
@@ -2180,6 +2508,10 @@ if (!response.ok || !Array.isArray(result.topics)) {
       archivedRoomKinds[roomId] === "social" ||
       (!isRoomUnlocked && !isKeyOwner)
     ) {
+      if (roomHeartbeatRef.current !== null) {
+        window.clearInterval(roomHeartbeatRef.current);
+        roomHeartbeatRef.current = null;
+      }
       roomSocketRef.current?.close();
       roomSocketRef.current = null;
       return;
@@ -2198,8 +2530,28 @@ if (!response.ok || !Array.isArray(result.topics)) {
     const socket = new WebSocket(socketUrl);
     roomSocketRef.current = socket;
     readReceiptIdsRef.current.clear();
+    presenceLastActivityRef.current = Date.now();
+    const markPresenceActivity = () => {
+      presenceLastActivityRef.current = Date.now();
+    };
+    const sendPresenceHeartbeat = () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({
+        type: "room.heartbeat",
+        room_id: roomId,
+        focused:
+          document.visibilityState === "visible" &&
+          document.hasFocus() &&
+          Date.now() - presenceLastActivityRef.current <= 5 * 60 * 1000,
+      }));
+    };
+    const refreshFocusedPresence = () => sendPresenceHeartbeat();
+    window.addEventListener("pointerdown", markPresenceActivity, { passive: true });
+    window.addEventListener("keydown", markPresenceActivity);
+    window.addEventListener("touchstart", markPresenceActivity, { passive: true });
 
     socket.addEventListener("open", () => {
+      const isFocused = document.visibilityState === "visible" && document.hasFocus();
       socket.send(
         JSON.stringify({
           type: "room.join",
@@ -2210,9 +2562,16 @@ if (!response.ok || !Array.isArray(result.topics)) {
           room_title: roomTitle,
           host_id: roomIdentity,
           room_passcode: enteredRoomPasscode.trim() || roomPasscode,
+          focused: isFocused,
         })
       );
+      sendPresenceHeartbeat();
+      if (roomHeartbeatRef.current !== null) window.clearInterval(roomHeartbeatRef.current);
+      roomHeartbeatRef.current = window.setInterval(sendPresenceHeartbeat, 20000);
     });
+    window.addEventListener("focus", refreshFocusedPresence);
+    window.addEventListener("blur", refreshFocusedPresence);
+    document.addEventListener("visibilitychange", refreshFocusedPresence);
 
     socket.addEventListener("message", (event) => {
       let update: RoomSocketEvent;
@@ -2275,6 +2634,11 @@ if (!response.ok || !Array.isArray(result.topics)) {
       }
 
       if (update.type === "room_state") {
+        if (update.policy) {
+          setSpaceMode(update.policy.space_mode || (roomId.startsWith("invite_") ? "workspace" : "personal"));
+          setHistoryVisibleBeforeJoin(Boolean(update.policy.history_visible_before_join));
+          setAllowMemberExport(Boolean(update.policy.allow_member_export));
+        }
         try {
           localStorage.setItem(
             `genie_room_passcode_${roomId}`,
@@ -2284,7 +2648,19 @@ if (!response.ok || !Array.isArray(result.topics)) {
           console.error("Could not persist the authorized room passcode:", error);
         }
         if (Array.isArray(update.messages)) {
-          const restoredMessages = archivedRoomMessages[roomId] || [];
+          const joinedMember = update.members?.find(
+            (member) => (member.id || member.user_id) === roomIdentity,
+          );
+          const mayReadPriorHistory =
+            Boolean(joinedMember?.is_origin_admin || joinedMember?.can_view_history);
+          const joinedAt = joinedMember?.joined_at || "";
+          const restoredMessages = (archivedRoomMessages[roomId] || []).filter((message) => {
+            if (mayReadPriorHistory) return true;
+            if (!message.timestamp || !joinedAt) return false;
+            const messageTime = Date.parse(message.timestamp);
+            const joinTime = Date.parse(joinedAt);
+            return Number.isFinite(messageTime) && Number.isFinite(joinTime) && messageTime >= joinTime;
+          });
           void Promise.all(update.messages.map(decodeRoomWireMessage))
             .then((decodedMessages) => {
               const combinedMessages = new Map(restoredMessages.map((message) => [message.id, message]));
@@ -2307,6 +2683,11 @@ if (!response.ok || !Array.isArray(result.topics)) {
               publicKey: member.public_key,
               role: member.role || "member",
               status: member.status || "active",
+              is_host: member.is_host,
+              joined_at: member.joined_at,
+              can_export: member.can_export,
+              can_view_history: member.can_view_history,
+              is_origin_admin: member.is_origin_admin,
             };
           }));
         }
@@ -2322,6 +2703,11 @@ if (!response.ok || !Array.isArray(result.topics)) {
           publicKey: member.public_key,
           role: member.role || "member",
           status: member.status || "active",
+          is_host: member.is_host,
+          joined_at: member.joined_at,
+          can_export: member.can_export,
+          can_view_history: member.can_view_history,
+          is_origin_admin: member.is_origin_admin,
         }));
         setMembers(nextMembers);
         void publishPendingShareTranscript(nextMembers);
@@ -2397,6 +2783,16 @@ if (!response.ok || !Array.isArray(result.topics)) {
     });
 
     return () => {
+      window.removeEventListener("focus", refreshFocusedPresence);
+      window.removeEventListener("blur", refreshFocusedPresence);
+      document.removeEventListener("visibilitychange", refreshFocusedPresence);
+      window.removeEventListener("pointerdown", markPresenceActivity);
+      window.removeEventListener("keydown", markPresenceActivity);
+      window.removeEventListener("touchstart", markPresenceActivity);
+      if (roomHeartbeatRef.current !== null) {
+        window.clearInterval(roomHeartbeatRef.current);
+        roomHeartbeatRef.current = null;
+      }
       socket.close();
       if (roomSocketRef.current === socket) roomSocketRef.current = null;
     };
@@ -2743,6 +3139,19 @@ if (!response.ok || !Array.isArray(result.topics)) {
    setIsFriendsLoading(true);
    setFriendsQueueError(null);
    try {
+     if (isCorporateDomain) {
+       setDiscoverableFriends([]);
+       setPendingFriendRequests([]);
+       const roomsResponse = await fetch(getBackendApiUrl("/api/rooms"), {
+         headers: { Authorization: `Bearer ${googleIdToken}` },
+       });
+       const roomResult = (await roomsResponse.json()) as { rooms?: SovereignRoomSummary[] } | SovereignRoomSummary[];
+       if (!roomsResponse.ok) {
+         throw new Error(`Tenant workspace directory could not be loaded (HTTP ${roomsResponse.status}).`);
+       }
+       setSovereignRooms(Array.isArray(roomResult) ? roomResult : roomResult.rooms || []);
+       return;
+     }
      const headers = { Authorization: `Bearer ${googleIdToken}` };
      const [friendsResponse, roomsResponse, requestsResponse] = await Promise.all([
        fetch(getBackendApiUrl("/api/social/friends"), { headers }),
@@ -2774,7 +3183,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
    } finally {
      setIsFriendsLoading(false);
    }
-  }, [googleIdToken]);
+  }, [googleIdToken, isCorporateDomain]);
 
   async function respondToFriendRequest(request: PendingFriendRequest, accepted: boolean) {
     if (!googleIdToken) return;
@@ -2844,6 +3253,12 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     }
     const inviteUrl = `${window.location.origin}/room/${roomId}`;
     try {
+      if (roomId.startsWith("share_") || roomId.startsWith("invite_")) {
+        await configureRoomInvitePermissions(
+          roomId,
+          roomId.startsWith("share_") ? "personal" : "workspace",
+        );
+      }
       const response = await fetch(getBackendApiUrl("/api/social/invites"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3171,6 +3586,11 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     const sharedRoomId = `share_${inviteSessionId}`;
     const inviteUrl = `${window.location.origin}/room/${sharedRoomId}`;
     try {
+      await configureRoomInvitePermissions(
+        sharedRoomId,
+        "personal",
+        `${session.title} · Shared Personal Room`,
+      );
       await navigator.clipboard.writeText(inviteUrl);
     } catch (error) {
       console.error("Shared room invite link could not be copied:", error);
@@ -3907,29 +4327,84 @@ if (!response.ok) {
     }
   }
 
+  async function configureRoomInvitePermissions(
+    targetRoomId: string,
+    mode: "personal" | "workspace",
+    title = roomTitle,
+  ) {
+    if (!googleIdToken || !roomCryptoIdentity || !targetRoomId.startsWith(mode === "personal" ? "share_" : "invite_")) {
+      return;
+    }
+    const response = await fetch(getBackendApiUrl("/api/rooms/configure"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        google_id_token: googleIdToken,
+        room_id: targetRoomId,
+        title: title || (mode === "personal" ? "Personal Room" : "Workspace"),
+        passcode: roomPasscode,
+        space_mode: mode,
+        history_visible_before_join: historyVisibleBeforeJoin,
+        allow_member_export: mode === "workspace" && allowMemberExport,
+        public_key: roomCryptoIdentity.publicKey,
+      }),
+    });
+    const result = (await response.json()) as { detail?: string };
+    if (!response.ok) {
+      throw new Error(result.detail || `Room permissions could not be saved (HTTP ${response.status}).`);
+    }
+  }
+
   async function copyHeaderInvite(mode: "personal" | "workspace") {
+    if (isCorporateDomain && mode !== "workspace") {
+      setSecurityToast("Corporate SSO accounts cannot create Personal rooms.");
+      return;
+    }
     if (!googleIdToken || !isAuthenticated || !roomCryptoIdentity) {
       setChatError("Sign in and wait for secure room setup before sharing a room.");
       return;
     }
-    const newRoomId = `${mode === "personal" ? "share_" : "invite_"}${window.crypto.randomUUID().replaceAll("-", "")}`;
-    const inviteUrl = `${window.location.origin}/room/${newRoomId}`;
+    const roomPrefix = mode === "personal" ? "share_" : "invite_";
+    const createNewRoom = !(
+      isTeamMode &&
+      roomId.startsWith(roomPrefix) &&
+      canManageRoomPolicy
+    );
+    const inviteRoomId = createNewRoom
+      ? `${roomPrefix}${window.crypto.randomUUID().replaceAll("-", "")}`
+      : roomId;
+    const inviteUrl = `${window.location.origin}/room/${inviteRoomId}`;
     try {
+      const inviteRoomTitle = createNewRoom
+        ? mode === "personal"
+          ? `${userProfile.name}'s Private Personal Room`
+          : "Workspace Session"
+        : roomTitle;
+      await configureRoomInvitePermissions(inviteRoomId, mode, inviteRoomTitle);
       await navigator.clipboard.writeText(inviteUrl);
+      if (!createNewRoom) {
+        setInviteCopied(true);
+        setTimeout(() => setInviteCopied(false), 2500);
+        setChatError(null);
+        return;
+      }
       shareTranscriptRef.current = messages.filter((message) => !message.is_deleted).map((message) => ({ ...message }));
       shareTranscriptOwnerRef.current = roomIdentity;
       shareTranscriptSentRef.current = false;
-      setRoomId(newRoomId);
-      setRoomTitle(mode === "personal" ? `${userProfile.name}'s Private 1-on-1 Session` : "Workspace Session");
+      setRoomId(inviteRoomId);
+      setRoomTitle(inviteRoomTitle);
       setRoomMessages([]);
       setMembers([]);
       setRoomPasscode("842-109");
       setEnteredRoomPasscode("842-109");
-      setRoomPasscodeRoomId(newRoomId);
+      setRoomPasscodeRoomId(inviteRoomId);
       setIsRoomUnlocked(true);
       setIsTeamMode(true);
       setSpaceMode(mode);
-      if (mode === "personal") setRoomCapacityMode("pair");
+      if (mode === "personal") {
+        setRoomCapacityMode("custom");
+        setCustomRoomCapacity(5);
+      }
       else {
         setRoomCapacityMode("custom");
         setCustomRoomCapacity(5);
@@ -3938,7 +4413,7 @@ if (!response.ok) {
       setChatError(null);
     } catch (error) {
       console.error("Room invite link could not be copied:", error);
-      setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
+      setChatError(error instanceof Error ? error.message : "The invite link could not be copied.");
     }
   }
 
@@ -3968,7 +4443,10 @@ if (!response.ok) {
       } else {
         setMembers((previous) => previous.map((member) => ({
           ...member,
-          role: member.id === memberId ? "sovereign" : "member",
+          is_host: member.id === memberId,
+          role: member.id === memberId
+            ? member.is_origin_admin ? "origin_admin" : "delegated_admin"
+            : member.is_origin_admin ? "origin_admin" : "member",
         })));
       }
       setChatError(null);
@@ -3978,8 +4456,54 @@ if (!response.ok) {
     }
   }
 
-  function exportRoomTranscript(format: "md" | "json") {
-    const transcript = messages.filter((message) => !message.is_deleted);
+  async function authorizeCurrentRoomExport(includeVoiceLogs = false): Promise<boolean> {
+    if (!isTeamMode) return true;
+    if (!googleIdToken) {
+      setChatError("Sign in is required to authorize a room export.");
+      return false;
+    }
+    try {
+      const response = await fetch(
+        getBackendApiUrl(`/api/rooms/${encodeURIComponent(roomId)}/authorize-export`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            google_id_token: googleIdToken,
+            include_voice_logs: includeVoiceLogs,
+          }),
+        },
+      );
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) {
+        setChatError(result.detail || `Room export is not authorized (HTTP ${response.status}).`);
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.error("Room export authorization failed:", error);
+      setChatError(error instanceof Error ? error.message : "Room export authorization failed.");
+      return false;
+    }
+  }
+
+  async function exportRoomTranscript(format: "md" | "json") {
+    const hasVoiceLogs = messages.some((message) =>
+      message.isVoiceRecord || message.isVoiceSessionSummary || message.isCallRecord,
+    );
+    const canExportVoiceLogs = spaceMode === "personal"
+      ? isCurrentRoomHost
+      : isCurrentRoomOriginAdmin;
+    if (!(await authorizeCurrentRoomExport(hasVoiceLogs && canExportVoiceLogs))) return;
+    const transcript = messages.filter((message) =>
+      !message.is_deleted &&
+      !(
+        hasVoiceLogs &&
+        spaceMode === "workspace" &&
+        !isCurrentRoomOriginAdmin &&
+        (message.isVoiceRecord || message.isVoiceSessionSummary || message.isCallRecord)
+      ),
+    );
     const content = format === "json"
       ? JSON.stringify({ room_id: roomId, room_title: roomTitle, exported_at: new Date().toISOString(), messages: transcript }, null, 2)
       : `# ${roomTitle}\n\n${transcript.map((message) => {
@@ -3998,8 +4522,9 @@ if (!response.ok) {
     URL.revokeObjectURL(url);
   }
 
-  function exportCurrentSessionTranscript(format: "markdown" | "json") {
-    if (!currentSession) return;
+  async function exportCurrentSessionTranscript(format: "markdown" | "json"): Promise<boolean> {
+    if (!(await authorizeCurrentRoomExport())) return false;
+    if (!currentSession) return false;
     const transcript = messages.filter((message) => !message.is_deleted);
     const content = format === "json"
       ? JSON.stringify({
@@ -4025,15 +4550,17 @@ if (!response.ok) {
     link.download = `${currentSession.title.replace(/[^\w-]+/g, "_") || "genie-session"}.${format === "markdown" ? "md" : "json"}`;
     link.click();
     URL.revokeObjectURL(url);
+    return true;
   }
 
-  function exportSessionDocument(
+  async function exportSessionDocument(
     format: "pdf" | "docx",
     selectedOnly: boolean,
     selectedIds: Set<string> = selectedMessageIds,
     sourceMessages: Message[] = messages,
     titleOverride?: string,
   ) {
+    if (!(await authorizeCurrentRoomExport())) return;
     if (!currentSession && !titleOverride) return;
     const title = titleOverride || currentSession?.title || "Genie Session";
     const exportTimestamp = new Date();
@@ -4108,10 +4635,15 @@ if (!response.ok) {
     setIsSelectionMode(true);
   }
 
-  function completeMessageSelectionExport() {
+  async function completeMessageSelectionExport() {
     if (selectedMessageIds.size === 0) return;
-    exportSessionDocument(selectedExportFormat, true, selectedMessageIds);
+    await exportSessionDocument(selectedExportFormat, true, selectedMessageIds);
     cancelMessageSelection();
+  }
+
+  async function exportActiveChat(format: "markdown" | "json") {
+    if (isTeamMode) await exportRoomTranscript(format === "markdown" ? "md" : "json");
+    else await exportCurrentSessionTranscript(format);
   }
 
   function wipeRoomForAll() {
@@ -4198,6 +4730,10 @@ if (!response.ok) {
   }
 
   const handleSpaceModeChange = (mode: "personal" | "workspace") => {
+    if (isCorporateDomain && mode !== "workspace") {
+      setSecurityToast("Corporate SSO accounts are restricted to their organization workspace.");
+      return;
+    }
     if (isTeamMode) {
       setArchivedRoomMessages((previous) => ({
         ...previous,
@@ -4210,6 +4746,13 @@ if (!response.ok) {
   };
 
   const handleToggleTeamMode = () => {
+    const isTenantWorkspaceRoom = sovereignRooms.some((room) => room.room_id === roomId);
+    if (isCorporateDomain) {
+      if (!isTeamMode || !isTenantWorkspaceRoom) {
+        setSecurityToast("Corporate SSO accounts must remain in a tenant-scoped Workspace room.");
+      }
+      return;
+    }
     if (isTeamMode) {
       setArchivedRoomMessages((previous) => ({
         ...previous,
@@ -4261,6 +4804,12 @@ if (!response.ok) {
     };
 
     try {
+      if (roomId.startsWith("invite_") || roomId.startsWith("share_")) {
+        await configureRoomInvitePermissions(
+          roomId,
+          roomId.startsWith("share_") ? "personal" : "workspace",
+        );
+      }
       const response = await fetch(getBackendApiUrl("/api/room/send-invites"), {
         method: "POST",
         credentials: "include",
@@ -4288,11 +4837,19 @@ if (!response.ok) {
     setTimeout(() => setInviteCopied(false), 2500);
   };
 
-  const copyRoomInvite = () => {
+  const copyRoomInvite = async () => {
     const shareUrl = `${window.location.origin}/?room=${roomId}`;
-    navigator.clipboard.writeText(shareUrl);
-    setInviteCopied(true);
-    setTimeout(() => setInviteCopied(false), 2500);
+    try {
+      if (roomId.startsWith("share_") || roomId.startsWith("invite_")) {
+        await configureRoomInvitePermissions(roomId, roomId.startsWith("share_") ? "personal" : "workspace");
+      }
+      await navigator.clipboard.writeText(shareUrl);
+      setInviteCopied(true);
+      setTimeout(() => setInviteCopied(false), 2500);
+    } catch (error) {
+      console.error("Room invite link could not be copied:", error);
+      setChatError(error instanceof Error ? error.message : "Room invite link could not be copied.");
+    }
   };
 
   const copyCanvasCode = () => {
@@ -4527,6 +5084,7 @@ if (!response.ok) {
             system_text: systemText,
             contents: requestContents,
             voice_name: voicePreset,
+            workspace_room_id: isCorporateDomain ? roomId : undefined,
           }),
         });
       } catch (error) {
@@ -6219,7 +6777,7 @@ if (!response.ok) {
             )}
           </div>
         )}
-        {socialInvites.length > 0 && (
+        {!isCorporateDomain && socialInvites.length > 0 && (
           <div className="fixed right-4 top-16 z-[65] w-[min(92vw,22rem)] space-y-2">
             {socialInvites.map((invite) => (
               <section key={invite.invite_id} className="rounded-2xl border border-cyan-200 bg-white p-4 shadow-xl">
@@ -6271,9 +6829,11 @@ if (!response.ok) {
               <button type="button" onClick={handleCreateNewChat} title="New chat" aria-label="New chat" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
                 <Plus className="h-5 w-5" />
               </button>
-              <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
-                <UserPlus className="h-5 w-5" />
-              </button>
+              {!isCorporateDomain && (
+                <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                  <UserPlus className="h-5 w-5" />
+                </button>
+              )}
               <button type="button" onClick={() => setTrashOpen((open) => !open)} title="Trash" aria-label="Trash" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
                 <Trash2 className="h-5 w-5" />
               </button>
@@ -6283,6 +6843,22 @@ if (!response.ok) {
             </nav>
           )}
 
+          {isCorporateDomain ? (
+            <section className={`${sidebarCollapsed ? "md:hidden" : ""} border-b border-slate-200/80 p-3`}>
+              <h2 className="mb-1 text-[10px] font-bold uppercase tracking-wider text-slate-500">Organization Workspace</h2>
+              <p className="text-[10px] leading-relaxed text-slate-600">
+                Membership and profile identity are verified by your organization&apos;s Google Workspace tenant. Personal friend graphs and peer invites are disabled.
+              </p>
+              <button
+                type="button"
+                onClick={() => void loadFriendsQueue()}
+                disabled={!isAuthenticated}
+                className="mt-2 w-full rounded-lg px-2 py-1.5 text-left text-[10px] font-semibold text-slate-600 hover:bg-white/70 disabled:opacity-50"
+              >
+                Refresh tenant workspaces
+              </button>
+            </section>
+          ) : (
           <section className={`${sidebarCollapsed ? "md:hidden" : ""} border-b border-slate-200/80 p-3`}>
             <div className="mb-2 flex items-center justify-between">
               <h2 className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Directory &amp; Friends</h2>
@@ -6329,6 +6905,7 @@ if (!response.ok) {
               Manage friends and shared rooms
             </button>
           </section>
+          )}
 
           <div className="hidden">
             <section className="rounded-xl border border-slate-200 bg-white/85 p-2.5">
@@ -6457,7 +7034,7 @@ if (!response.ok) {
           </div>
 
           <div className={`${sidebarCollapsed ? "md:hidden" : ""} flex-1 overflow-y-auto px-3 space-y-1`}>
-            {!isTeamMode && (
+            {!isCorporateDomain && !isTeamMode && (
               <section className="mb-3 rounded-xl border border-slate-200 bg-white/80 p-2.5">
                 <div className="mb-2 flex items-center justify-between gap-2 px-1">
                   <h2 className="text-[11px] font-bold uppercase tracking-wider text-slate-600">
@@ -6528,23 +7105,25 @@ if (!response.ok) {
                 {topicError && <p role="status" className="mt-2 text-[10px] text-rose-600">{topicError}</p>}
               </section>
             )}
-            <div className="flex items-center justify-between px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
-              <span>Personal Chats</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setFriendSearchOpen(true);
-                  setFriendSearchEmail("");
-                  setFriendSearchResult(null);
-                  setFriendSearchNotFound(false);
-                }}
-                title="Invite a friend"
-                aria-label="Invite a friend"
-                className="rounded-md p-1 text-slate-400 hover:bg-white hover:text-cyan-700"
-              >
-                <UserPlus className="h-3.5 w-3.5" />
-              </button>
-            </div>
+            {!isCorporateDomain && (
+              <div className="flex items-center justify-between px-3 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                <span>Personal Chats</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFriendSearchOpen(true);
+                    setFriendSearchEmail("");
+                    setFriendSearchResult(null);
+                    setFriendSearchNotFound(false);
+                  }}
+                  title="Invite a friend"
+                  aria-label="Invite a friend"
+                  className="rounded-md p-1 text-slate-400 hover:bg-white hover:text-cyan-700"
+                >
+                  <UserPlus className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
 
             <section className="mb-2">
               <button
@@ -6575,7 +7154,7 @@ if (!response.ok) {
                       </button>
                     );
                   })}
-                  {sessions.filter((session) => session.isSharedArchive && !session.isDeleted).map((session) => (
+                  {sessions.filter((session) => !isCorporateDomain && session.isSharedArchive && !session.isDeleted).map((session) => (
                     <button
                       key={session.id}
                       type="button"
@@ -6587,14 +7166,14 @@ if (!response.ok) {
                       <span className="shrink-0 text-[9px] text-slate-400">Shared</span>
                     </button>
                   ))}
-                  {!sovereignRooms.length && !sessions.some((session) => session.isSharedArchive && !session.isDeleted) && (
+                  {!sovereignRooms.length && (isCorporateDomain || !sessions.some((session) => session.isSharedArchive && !session.isDeleted)) && (
                     <p className="px-3 py-1.5 text-[10px] text-slate-400">No shared chats yet.</p>
                   )}
                 </div>
               )}
             </section>
 
-            {sessions.filter((session) => !session.isDeleted && !session.isSharedArchive).map((session) => (
+            {!isCorporateDomain && sessions.filter((session) => !session.isDeleted && !session.isSharedArchive).map((session) => (
               <div
                 key={session.id}
                 onClick={() => handleSelectSession(session)}
@@ -6611,6 +7190,7 @@ if (!response.ok) {
                     <MessageSquare className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
                   )}
                   <span className="truncate">{session.title}</span>
+                  {session.isArchived && <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[8px] font-bold uppercase text-amber-800">Archived</span>}
                 </div>
 
                 <div className="flex shrink-0 items-center gap-0.5 opacity-100 transition-opacity md:opacity-0 group-hover:opacity-100 focus-within:opacity-100">
@@ -6716,15 +7296,15 @@ if (!response.ok) {
                 </div>
               </div>
             ))}
-            <button
+            {!isCorporateDomain && <button
               type="button"
               onClick={() => setTrashOpen((open) => !open)}
               className="mt-2 flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[11px] font-semibold text-slate-500 hover:bg-white/70"
             >
               <span className="flex items-center gap-2"><Trash2 className="h-3.5 w-3.5" /> Trash / Recently Deleted</span>
               <span>{trashSessions.length}</span>
-            </button>
-            {trashOpen && (
+            </button>}
+            {!isCorporateDomain && trashOpen && (
               <div className="mb-2 space-y-1 rounded-xl border border-slate-200 bg-white/70 p-2">
                 {trashSessions.length ? trashSessions.map((deletedSession) => {
                   const deletedAt = deletedSession.deletedAt ? new Date(deletedSession.deletedAt).getTime() : Date.now();
@@ -6761,21 +7341,34 @@ if (!response.ok) {
                 Disclaimer &amp; Terms
               </button>
             </div>
-            <button
-              type="button"
-              onClick={() => setChatVaultOpen(true)}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white/80 px-3 py-2 text-[11px] font-semibold text-slate-700 hover:bg-white"
-            >
-              <Cloud className="h-4 w-4" />
-              Chat Vault &amp; Restore Backups
-            </button>
+            {!isCorporateDomain && (
+              <button
+                type="button"
+                onClick={() => setChatVaultOpen(true)}
+                className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white/80 px-3 py-2 text-[11px] font-semibold text-slate-700 hover:bg-white"
+              >
+                <Cloud className="h-4 w-4" />
+                Chat Vault &amp; Restore Backups
+              </button>
+            )}
 
             <div className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-200 bg-white/70 p-2">
-              <GenieAvatar
-                src={profileAvatar}
-                alt={userProfile.name}
-                className={`h-9 w-9 shrink-0 rounded-full border ${selectedTheme.borderClass}`}
-              />
+              {isCorporateDomain ? (
+                <GenieBrandAvatar
+                  mode="workspace"
+                  corporatePhotoUrl={corporateAvatarUrl}
+                  corporateName={userProfile.name}
+                  tenantId={corporateTenantId}
+                  className="h-9 w-9 shrink-0 rounded-full"
+                  label={userProfile.name}
+                />
+              ) : (
+                <GenieAvatar
+                  src={profileAvatar}
+                  alt={userProfile.name}
+                  className={`h-9 w-9 shrink-0 rounded-full border ${selectedTheme.borderClass}`}
+                />
+              )}
               <div className="min-w-0 flex-1">
                 <span className="block truncate text-[11px] font-bold leading-tight text-slate-800">{userProfile.name}</span>
                 <span className="block truncate text-[9px] text-slate-500">{userProfile.email || "Guest"}</span>
@@ -6813,7 +7406,18 @@ if (!response.ok) {
             isCorporateDomain={isCorporateDomain}
             workspaceName={isCorporateDomain ? "Corp Active" : spaceMode === "workspace" ? "Workspace" : "Personal"}
             profileGender={userProfile.gender}
+            corporateAvatarUrl={corporateAvatarUrl}
+            corporateDisplayName={userProfile.name}
+            corporateTenantId={corporateTenantId}
             activeMemberCount={activeRoomMemberCount}
+            members={members.map((member) => ({
+              id: member.id,
+              name: member.name,
+              role: member.role,
+              isOriginAdmin: member.is_origin_admin,
+              avatarUrl: member.avatarUrl,
+              status: member.status,
+            }))}
             capacityLabel={roomCapacityLabel}
             chromeClass={currentTheme.chromeClass}
             chromeSurfaceClass={currentTheme.chromeSurfaceClass}
@@ -6830,16 +7434,41 @@ if (!response.ok) {
             onOpenSettings={() => setSettingsOpen(true)}
             isAuthenticated={isAuthenticated}
             isRoomHost={isCurrentRoomHost}
+            canInviteMembers={!isCorporateDomain && (!isTeamMode || canManageRoomPolicy)}
+            canExport={canExportActiveChat}
+            exportDisabledReason={exportDisabledReason}
+            onExport={(format) => void exportActiveChat(format)}
+            onPurgeContext={purgeLocalChatContext}
             onCopyInvite={(mode) => void copyHeaderInvite(mode)}
             onLeaveRoom={handleExitRoomToPersonal}
             onEndRoom={() => void endActiveRoom()}
+            isSuperAdmin={isSuperAdminVerified}
+            adminTelemetry={isSuperAdminVerified ? adminTelemetry : null}
+            adminTelemetryError={adminTelemetryError}
           />
+          {securityToast && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="absolute right-4 top-16 z-50 max-w-sm rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-xs font-semibold text-amber-950 shadow-xl"
+            >
+              {securityToast}
+              <button
+                type="button"
+                onClick={() => setSecurityToast(null)}
+                className="ml-3 font-bold underline underline-offset-2"
+                aria-label="Dismiss security notice"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {isVoiceCallOpen && canAccessVoiceCall() && (
             <VoiceCallModal
               key={voiceCallId}
               callId={voiceCallId}
               isTeamMode={isTeamMode}
-              contextMode={isTeamMode ? "workspace" : "personal"}
+              contextMode={spaceMode}
               participants={isTeamMode
                 ? (voiceCallParticipants.length ? voiceCallParticipants : members.filter((member) => member.status === "active"))
                   .map((member) => ({ id: member.id, name: member.name, avatarUrl: member.avatarUrl }))
@@ -6847,7 +7476,7 @@ if (!response.ok) {
               currentUser={{
                 id: roomIdentity || googleIdToken || "guest",
                 name: userProfile.name || "Guest User",
-                avatarUrl: profileAvatar,
+                avatarUrl: effectiveUserAvatar,
               }}
               remoteTurns={remoteVoiceTurns}
               languageCode={selectedLang.code}
@@ -6860,10 +7489,36 @@ if (!response.ok) {
 
           {/* SECTION 5: CHAT THREAD & CANVAS */}
           <div className="flex-1 min-h-0 flex relative overflow-hidden">
+            {isTeamMode && roomMemberCount > 1 && (
+              <aside
+                aria-label="Room participant presence"
+                className="absolute right-3 top-1/2 z-20 hidden -translate-y-1/2 flex-col items-center gap-3 rounded-2xl border border-slate-200/80 bg-white/85 p-2 shadow-lg backdrop-blur-md md:flex"
+              >
+                {members.map((member) => (
+                  <div key={member.id} className="relative" title={`${member.name}: ${
+                    member.status === "active" ? "active in this room" :
+                    member.status === "different_room" ? "active in another room" : "offline or idle"
+                  }`}>
+                    <GenieAvatar
+                      src={member.avatarUrl || "/default-avatar.png"}
+                      alt={member.name}
+                      className="h-9 w-9 rounded-full border border-slate-200"
+                    />
+                    <span
+                      className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white ${
+                        member.status === "active" ? "bg-emerald-500" :
+                        member.status === "different_room" ? "bg-rose-500" : "bg-amber-400"
+                      }`}
+                    />
+                  </div>
+                ))}
+              </aside>
+            )}
             <div
+              id="chat-transcript"
               ref={messageScrollRef}
               onScroll={handleMessageScroll}
-              className={`flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4 sm:py-6 transition-all ${activeCanvas ? "w-1/2 pr-2" : "w-full"}`}
+              className={`flex-1 min-h-0 overflow-y-auto px-3 sm:px-4 py-4 sm:py-6 transition-all md:pr-16 ${activeCanvas ? "w-1/2 pr-2" : "w-full"}`}
             >
               {mounted && !isTeamMode && !isTopicConversation && currentSession && (
                 <SessionMetadataBar
@@ -6871,6 +7526,8 @@ if (!response.ok) {
                     id: currentSession.id,
                     title: currentSession.title,
                     createdAt: currentSession.createdAt || currentSession.messages[0]?.timestamp || new Date().toISOString(),
+                    isArchived: currentSession.isArchived,
+                    messages,
                   }}
                   onRename={(newTitle) => {
                     setSessions((previous) => previous.map((session) =>
@@ -6889,7 +7546,13 @@ if (!response.ok) {
                   }}
                   onSelectMessages={beginMessageSelection}
                   isObserverOn={isObserverActive}
-                  onDelete={() => void softDeleteSession(currentSession)}
+                  participantCount={1}
+                  onArchive={archiveCurrentSession}
+                  onAutoArchive={() => void exportAndArchiveCurrentSession()}
+                  onWipeClientCache={wipeClientCacheAndTokens}
+                  onFullEphemeralReset={fullEphemeralReset}
+                  onForkCurrentMessage={() => duplicateCurrentTranscript(true)}
+                  onCloneTranscript={() => duplicateCurrentTranscript(false)}
                 />
               )}
               {isTeamMode && roomId.startsWith("direct:") && (
@@ -7512,7 +8175,7 @@ if (!response.ok) {
           {pendingCallTranscript && (
             <div className="absolute inset-x-4 bottom-4 z-40 mx-auto flex max-w-2xl flex-wrap items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-white/95 px-4 py-3 shadow-xl backdrop-blur-md">
               <p className="text-sm text-slate-700">
-                Call ended (Genie Master). Would you like to record this transcript to your session?
+              Call ended. Would you like to save this call log to your session?
               </p>
               <div className="flex items-center gap-2">
                 <button
@@ -7522,13 +8185,15 @@ if (!response.ok) {
                 >
                   Dismiss
                 </button>
-                <button
-                  type="button"
-                  onClick={savePendingCallTranscript}
-                  className="rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-indigo-700"
-                >
-                  Save Record
-                </button>
+                {(!isTeamMode || (spaceMode === "personal" ? isCurrentRoomHost : isCurrentRoomOriginAdmin)) && (
+                  <button
+                    type="button"
+                    onClick={savePendingCallTranscript}
+                    className="rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-indigo-700"
+                  >
+                    Save Call Log
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -7881,6 +8546,12 @@ if (!response.ok) {
                     disabled={isObserverActive && isQuotaEnforced && remainingDailyChats === 0}
                     className="flex-1 min-w-0 bg-transparent px-1 sm:px-3 text-slate-900 placeholder-slate-400 text-xs sm:text-sm focus:outline-none disabled:opacity-50"
                   />
+                  <span
+                    title="Credential tokens are scrubbed before sending"
+                    aria-label="Client-side credential scrubbing active"
+                  >
+                    <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-600" aria-hidden="true" />
+                  </span>
 
                   <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
                     <div className="relative">
@@ -7977,7 +8648,7 @@ if (!response.ok) {
 
                 {/* Visible User Disclaimer */}
                 <div className="flex items-center justify-center gap-1.5 sm:gap-2 mt-1.5 sm:mt-2 select-none text-[10px] sm:text-[11px] text-slate-400">
-                  <p className="truncate">Personal AI Genie can make mistakes.</p>
+                  <p className="truncate">AI responses are generated dynamically. Sensitive credential tokens are scrubbed client-side. By continuing, you agree to our Terms.</p>
                   <span>•</span>
                   <button
                     onClick={() => setLegalModalOpen(true)}
@@ -8151,7 +8822,7 @@ if (!response.ok) {
               <div>
                 <h3 className="font-bold text-slate-800 text-sm">Contextual Room Admin</h3>
                 <p className="text-[11px] text-slate-400">
-                  Sovereign: {isCurrentRoomHost ? "You" : members.find((member) => member.role === "sovereign")?.name || "Host"}
+                  Sovereign: {isCurrentRoomHost ? "You" : members.find((member) => member.is_host || member.role === "sovereign")?.name || "Host"}
                 </p>
               </div>
               <button onClick={() => setRoomAdminOpen(false)}>
@@ -8162,12 +8833,13 @@ if (!response.ok) {
             <section className="grid gap-2 sm:grid-cols-2">
               <button
                 type="button"
-                disabled={!isAuthenticated}
+                disabled={!isAuthenticated || !canManageRoomPolicy || (spaceMode === "personal" && activeRoomMemberCount >= 5)}
                 onClick={() => {
                   setRoomAdminOpen(false);
-                  void copyHeaderInvite("personal");
+                  void copyHeaderInvite(spaceMode);
                 }}
-                className="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2.5 text-left text-xs font-semibold text-cyan-900 hover:bg-cyan-100 disabled:opacity-50"
+                title={spaceMode === "personal" && activeRoomMemberCount >= 5 ? "Personal Room Full (Max 5)" : undefined}
+                className="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2.5 text-left text-xs font-semibold text-cyan-900 hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Copy 1-on-1 Named Invite Link
               </button>
@@ -8183,8 +8855,8 @@ if (!response.ok) {
               </div>
               <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
                 <span className="min-w-0 flex-1 text-xs font-semibold text-slate-800">Export Transcript</span>
-                <button type="button" onClick={() => exportRoomTranscript("md")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100">Markdown</button>
-                <button type="button" onClick={() => exportRoomTranscript("json")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100">JSON</button>
+                <button type="button" disabled={!canExportActiveChat} title={!canExportActiveChat ? exportDisabledReason : "Export Markdown"} onClick={() => void exportRoomTranscript("md")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50">Markdown</button>
+                <button type="button" disabled={!canExportActiveChat} title={!canExportActiveChat ? exportDisabledReason : "Export JSON"} onClick={() => void exportRoomTranscript("json")} className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50">JSON</button>
               </div>
               {isCurrentRoomHost && (
                 <button
@@ -8197,18 +8869,27 @@ if (!response.ok) {
               )}
             </section>
 
-            <DynamicTeamModal
-              mode={roomCapacityMode}
-              customCapacity={customRoomCapacity}
-              activeMembers={activeRoomMemberCount}
-              panelClass={currentTheme.bgLightClass}
-              borderClass={currentTheme.borderClass}
-              textClass={currentTheme.textClass}
-              mutedTextClass="text-slate-500"
-              surfaceClass="bg-white"
-              onModeChange={setRoomCapacityMode}
-              onCustomCapacityChange={setCustomRoomCapacity}
-            />
+            {canManageRoomPolicy && (
+              <DynamicTeamModal
+                mode={roomCapacityMode}
+                spaceMode={spaceMode}
+                customCapacity={customRoomCapacity}
+                activeMembers={activeRoomMemberCount}
+                historyVisibleBeforeJoin={historyVisibleBeforeJoin}
+                allowMemberExport={allowMemberExport}
+                canInviteMore={activeRoomMemberCount < 5}
+                panelClass={currentTheme.bgLightClass}
+                borderClass={currentTheme.borderClass}
+                textClass={currentTheme.textClass}
+                mutedTextClass="text-slate-500"
+                surfaceClass="bg-white"
+                onModeChange={setRoomCapacityMode}
+                onCustomCapacityChange={setCustomRoomCapacity}
+                onHistoryVisibilityChange={setHistoryVisibleBeforeJoin}
+                onMemberExportChange={setAllowMemberExport}
+                onAddMember={() => void copyHeaderInvite(spaceMode)}
+              />
+            )}
 
             <div className="grid grid-cols-2 gap-2 bg-slate-50 p-3 rounded-2xl border border-slate-200">
               <div className="space-y-1">
@@ -8332,7 +9013,7 @@ if (!response.ok) {
                         <span className="font-semibold text-slate-800 block truncate">{member.name}</span>
                         <span className="text-[10px] text-slate-400 block truncate">{member.email}</span>
                       </div>
-                      {member.role === "sovereign" && (
+                      {(member.is_host || member.role === "sovereign") && (
                         <span className="text-[9px] bg-purple-100 text-purple-700 font-bold px-1.5 py-0.5 rounded flex-shrink-0">
                           SOVEREIGN
                         </span>
@@ -8460,7 +9141,7 @@ if (!response.ok) {
         </div>
       )}
 
-      {friendsQueueOpen && (
+      {!isCorporateDomain && friendsQueueOpen && (
         <div
           className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm"
           role="presentation"
@@ -8582,7 +9263,7 @@ if (!response.ok) {
         </div>
       )}
 
-      {friendSearchOpen && (
+      {!isCorporateDomain && friendSearchOpen && (
         <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setFriendSearchOpen(false);
         }}>
@@ -9308,16 +9989,37 @@ if (!response.ok) {
                       <Key className="w-4 h-4 text-amber-500" />
                       <span className="text-xs font-bold text-slate-800">Bring Your Own Key (BYOK)</span>
                     </div>
-                    <a
-                      href="https://aistudio.google.com/app/apikey"
-                      target="_blank"
-                      rel="noreferrer"
-                      className={`flex items-center gap-1 text-[11px] font-semibold ${selectedTheme.textClass} hover:underline`}
-                    >
-                      <span>Get Gemini Key</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
+                    <div className="flex items-center gap-1.5">
+                      <a
+                        href="https://aistudio.google.com/app/apikey"
+                        target="_blank"
+                        rel="noreferrer"
+                        className={`flex items-center gap-1 text-[11px] font-semibold ${selectedTheme.textClass} hover:underline`}
+                      >
+                        <span>Get Gemini Key</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => setByokHelpOpen((open) => !open)}
+                        aria-label="BYOK mode and privacy guidance"
+                        aria-expanded={byokHelpOpen}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-purple-300 text-purple-700 hover:bg-purple-50"
+                      >
+                        <CircleHelp className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
+
+                  {byokHelpOpen && (
+                    <aside className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-[10px] leading-relaxed text-slate-700">
+                      <h4 className="font-bold text-slate-900">Personal Mode</h4>
+                      <p>Your key is stored in this browser and is not included in profile sync or Genie application logs. It is sent over HTTPS to Genie for request processing and forwarded to Google, which bills usage and applies its quotas. Room owners set past-history access; invited members cannot export multi-user Personal Mode rooms. Only the Room Owner can save call logs.</p>
+                      <h4 className="mt-2 font-bold text-slate-900">Workspace Mode</h4>
+                      <p>Server Genie uses platform quota; BYOK uses your organization&apos;s Google Cloud billing. The Origin Admin sets history/export permissions before invites. Workspace calls are saved automatically; only the Origin Admin may export or share logs.</p>
+                      <p className="mt-2 border-t border-indigo-200 pt-2">Local storage is browser/device scoped and is not a guarantee of encryption. Google usage is your billing responsibility. Revoke the key in Google AI Studio as well as removing this local copy.</p>
+                    </aside>
+                  )}
 
                   <div className="relative">
                     <input
@@ -9954,6 +10656,15 @@ if (!response.ok) {
     forceVoiceRecord = false
   ) {
     if (e) e.preventDefault();
+    if (!isTeamMode && currentSession?.isArchived) {
+      setSecurityToast("Archived sessions are read-only. Clone the transcript to continue chatting.");
+      return;
+    }
+    const isTenantWorkspaceRoom = sovereignRooms.some((room) => room.room_id === roomId);
+    if (isCorporateDomain && (!isTeamMode || !isTenantWorkspaceRoom)) {
+      setSecurityToast("Corporate Workspace chat must be started in a tenant-scoped room. Create or join a Workspace room first.");
+      return;
+    }
     let storedByokKey = "";
     try {
       storedByokKey = localStorage.getItem("genie_user_byok_key") || "";
@@ -9962,7 +10673,7 @@ if (!response.ok) {
     }
     const byokKey = storedByokKey.trim() || (byokVerified ? byokApiKey.trim() : "");
     const observerModeForRequest = forceObserverMode || isObserverActive;
-    const textToSend = customText !== undefined ? customText : prompt;
+    const textToSend = scrubSensitiveClientTokens(customText !== undefined ? customText : prompt);
     if (!textToSend.trim() && !forceRainbowTrigger) return;
     if (isStreaming) return;
     const topicIdForRequest = activeTopic?.id || "topic_1";
@@ -10140,6 +10851,7 @@ if (!response.ok) {
             google_id_token: googleIdToken,
             prompt: actualText,
             space_mode: spaceMode,
+            workspace_room_id: isCorporateDomain ? roomId : undefined,
             conversation_history: historyForRequest,
             provider: "gemini",
             models_cascade: ["gemini-3.6-flash"],
