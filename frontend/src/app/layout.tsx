@@ -2,25 +2,35 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import ClientRuntimeRecovery from "./ClientRuntimeRecovery";
 
+// Cloudflare Pages frontend URL (fallback to local or configured environment domain)
+const siteUrl = process.env.NEXT_PUBLIC_APP_URL || "https://personal-ai-genie-ten.vercel.app";
+
+export const viewport: Viewport = {
+  themeColor: "#0f172a",
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  interactiveWidget: "resizes-content",
+};
+
 export const metadata: Metadata = {
-  title: "Personal AI Genie — Autonomous Workspace & AI Companion",
+  title: "Personal AI Genie — Intelligent Collaboration Hub",
   description:
-    "Autonomous Multi-User Workspace, Personal AI Companion, and Unified Study Engine powered by high-performance multi-model cascades.",
-  metadataBase: new URL("https://personal-ai-genie-ten.vercel.app"),
+    "Zero-retention, encrypted collaborative workspace and real-time multi-agent intelligence.",
+  metadataBase: new URL(siteUrl),
+  applicationName: "Genie AI",
   keywords: [
     "Personal AI Genie",
-    "Personal AI Canvas",
-    "AI Study Engine",
+    "Genie AI",
     "Autonomous Multi-User Workspace",
-    "Gemini AI Assistant",
-    "Unified Study Engine",
-    "Notes to Flashcards AI",
-    "AI Team Collaboration",
+    "Real-time Voice Intelligence",
+    "AI Study Engine",
+    "Encrypted Collaboration",
   ],
   authors: [{ name: "Personal AI Genie Team" }],
   creator: "Personal AI Genie",
   publisher: "Personal AI Genie",
-  applicationName: "Personal AI Genie",
   alternates: {
     canonical: "/",
   },
@@ -36,37 +46,50 @@ export const metadata: Metadata = {
     },
   },
   manifest: "/manifest.json",
+  icons: {
+    icon: [
+      { url: "/favicon.ico" },
+      { url: "/icon-192x192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512x512.png", sizes: "512x512", type: "image/png" },
+    ],
+    shortcut: "/favicon.ico",
+    apple: [
+      { url: "/icon-192x192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512x512.png", sizes: "512x512", type: "image/png" },
+    ],
+  },
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "Genie AI",
+  },
   openGraph: {
-    title: "Personal AI Genie — Autonomous Workspace & AI Companion",
+    title: "Personal AI Genie — Intelligent Collaboration Hub",
     description:
-      "Autonomous Multi-User Workspace, Personal AI Companion, and Unified Study Engine.",
-    url: "https://personal-ai-genie-ten.vercel.app",
+      "Zero-retention, encrypted collaborative workspace and real-time multi-agent intelligence.",
+    url: siteUrl,
     siteName: "Personal AI Genie",
     locale: "en_US",
     type: "website",
+    images: [
+      {
+        url: "/icon-512x512.png",
+        width: 512,
+        height: 512,
+        alt: "Personal AI Genie App Icon",
+      },
+    ],
   },
   twitter: {
-    card: "summary_large_image",
+    card: "summary",
     title: "Personal AI Genie",
     description:
-      "Autonomous Multi-User Workspace, Personal AI Companion, and Unified Study Engine.",
-  },
-  icons: {
-    icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
-    shortcut: "/icon.svg",
-    apple: "/icon-512.png",
+      "Zero-retention, encrypted collaborative workspace and real-time multi-agent intelligence.",
+    images: ["/icon-512x512.png"],
   },
   verification: {
     google: "NGxRq5mFXrJoHtH2lQSVC_47TEjiL654u7ktVqM32UI",
   },
-};
-
-export const viewport: Viewport = {
-  width: "device-width",
-  initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
-  interactiveWidget: "resizes-content",
 };
 
 export default function RootLayout({
@@ -76,7 +99,12 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className="h-full">
-      <body className="h-full min-h-[100dvh] w-full bg-slate-50 text-slate-900 antialiased overflow-x-hidden">
+      <head>
+        <meta name="mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+      </head>
+      <body className="h-full min-h-[100dvh] w-full bg-slate-900 text-slate-100 antialiased overflow-x-hidden">
         <ClientRuntimeRecovery />
         {children}
       </body>

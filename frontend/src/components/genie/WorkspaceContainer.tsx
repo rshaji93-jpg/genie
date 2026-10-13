@@ -114,6 +114,58 @@ interface IndianLanguage {
   label: string;
 }
 
+type VoicePreset = "Aoede" | "Charon" | "Kore" | "Fenrir" | "Puck";
+
+const VOICE_PRESETS: {
+  key: VoicePreset;
+  gender: string;
+  description: string;
+  sample: string;
+  pitch: number;
+  rate: number;
+}[] = [
+  {
+    key: "Aoede",
+    gender: "Female",
+    description: "Soft, breezy, conversational",
+    sample: "Hey there! I'm Aoede. Take a breath, relax, and let's tackle your day together.",
+    pitch: 1.12,
+    rate: 0.94,
+  },
+  {
+    key: "Charon",
+    gender: "Male",
+    description: "Calm, steady, professional",
+    sample: "Greetings. I'm Charon. Steady focus and clarity—let's examine what needs to be solved.",
+    pitch: 0.88,
+    rate: 0.92,
+  },
+  {
+    key: "Kore",
+    gender: "Female",
+    description: "Firm, crisp, analytical",
+    sample: "Hello! Kore here. Direct, structured, and organized—what's our primary objective?",
+    pitch: 1.04,
+    rate: 1.02,
+  },
+  {
+    key: "Fenrir",
+    gender: "Male",
+    description: "Deep, authoritative, resolute",
+    sample: "Fenrir standing by. Big ideas, bold strategy—let's make things happen.",
+    pitch: 0.74,
+    rate: 0.96,
+  },
+  {
+    key: "Puck",
+    gender: "Male / Youthful",
+    description: "Playful, witty, high-energy",
+    sample: "Hey! Puck's in the room. Quick thoughts, clever moves—ready when you are!",
+    pitch: 1.22,
+    rate: 1.12,
+  },
+];
+
 const INDIAN_LANGUAGES: IndianLanguage[] = [
   { code: "en-IN", label: "EN (India)" },
   { code: "ta-IN", label: "தமிழ்" },
@@ -407,22 +459,16 @@ interface ChatSession {
 }
 
 interface AdminTelemetry {
-  total_registered_users: { total: number; personal: number; workspace: number };
-  active_connections_count: number;
-  live_active_users: Array<{
-    id: string;
-    name: string;
-    email: string;
-    avatar_url: string;
-    room_id: string;
-    focused: boolean;
-    status: "active" | "inactive" | "different_room";
-  }>;
+  total_registered: number;
+  live_active: number;
+  active_vips: number;
+  vip_pool_remaining: number;
 }
 
 interface VoiceCallTurnResult {
   text: string;
   audioData?: string;
+  audioMimeType?: string;
 }
 
 function parseMarkdownChatBackup(markdown: string): ChatSession[] {
@@ -560,9 +606,14 @@ interface RoomSocketEvent {
   sender_name?: string;
   detail?: string;
   call_id?: string;
+  started_by?: string;
   turn_id?: string;
   speaker?: { id: string; name: string; avatar_url?: string | null; role: "user" | "assistant" };
   timestamp?: string;
+  is_rejoin?: boolean;
+  requester?: { user_id?: string; display_name?: string; avatar_url?: string };
+  inviter?: { user_id?: string; display_name?: string; avatar_url?: string };
+  room_id?: string;
   participants?: Array<{ id: string; name: string; avatar_url?: string | null }>;
   started_at?: string;
   encrypted_payloads?: Record<string, RoomCiphertext>;
@@ -816,30 +867,50 @@ function GenieAvatar({
   }, [src]);
 
   const legacyPresetAssets: Record<string, string> = {
-    "genie-preset:guardian": "/avatars/Profile 1.png",
-    "genie-preset:vapor": "/avatars/Profile 2.png",
-    "genie-preset:cosmic": "/avatars/Profile 3.png",
-    "genie-preset:neutral": "/avatars/Profile 3.png",
-    "genie-preset:option_a": "/avatars/Profile 1.png",
-    "genie-preset:option_b": "/avatars/Profile 2.png",
-    "genie-preset:option_c": "/avatars/Profile 3.png",
-    "/avatars/option_a.svg": "/avatars/Profile 1.png",
-    "/avatars/option_b.svg": "/avatars/Profile 2.png",
-    "/avatars/option_c.svg": "/avatars/Profile 3.png",
+    "genie-preset:guardian": "/avatars/Profile-1.png",
+    "genie-preset:vapor": "/avatars/Profile-2.png",
+    "genie-preset:cosmic": "/avatars/Profile-3.png",
+    "genie-preset:neutral": "/avatars/Profile-3.png",
+    "genie-preset:option_a": "/avatars/Profile-1.png",
+    "genie-preset:option_b": "/avatars/Profile-2.png",
+    "genie-preset:option_c": "/avatars/Profile-3.png",
+    "/avatars/Profile 1.png": "/avatars/Profile-1.png",
+    "/avatars/Profile 2.png": "/avatars/Profile-2.png",
+    "/avatars/Profile 3.png": "/avatars/Profile-3.png",
+    "/avatars/option_a.svg": "/avatars/Profile-1.png",
+    "/avatars/option_b.svg": "/avatars/Profile-2.png",
+    "/avatars/option_c.svg": "/avatars/Profile-3.png",
   };
   const resolvedSrc = src && legacyPresetAssets[src]
     ? legacyPresetAssets[src]
     : src && !src.includes("default-user")
     ? src
-    : "/avatars/Profile 3.png";
+    : "/avatars/Profile-3.png";
+  const initials = (alt || "Genie")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || "")
+    .join("");
 
   return (
-    <img
-      src={hasError ? "/avatars/Profile 3.png" : resolvedSrc}
-      alt={alt || "Genie profile avatar"}
-      onError={() => setHasError(true)}
-      className={`${className} rounded-full object-cover flex-shrink-0`}
-    />
+    hasError ? (
+      <span
+        aria-label={`${alt || "User"} avatar`}
+        role="img"
+        className={`${className} inline-flex items-center justify-center rounded-full bg-cyan-100 font-bold text-cyan-900 flex-shrink-0`}
+      >
+        {initials}
+      </span>
+    ) : (
+      <img
+        src={resolvedSrc}
+        alt={alt || "Genie profile avatar"}
+        onError={() => setHasError(true)}
+        className={`${className} rounded-full object-cover flex-shrink-0`}
+      />
+    )
   );
 }
 
@@ -1076,12 +1147,14 @@ function MainChatApp() {
     name: "Guest User",
     email: "",
     mobileNumber: "",
+    mobileVerified: false,
     recoveryEmail: "",
     allowRoomInvites: "mutual_friends" as "mutual_friends" | "everyone",
     isCreator: false,
     avatarUrl: "genie-preset:neutral",
     googleAvatarUrl: "",
     role: "professional" as "student" | "professional",
+    preferredVoice: "Aoede" as VoicePreset,
     profession: "Healthcare Revenue Cycle & Client Operations",
     institution: "",
     studyFocus: "",
@@ -1130,6 +1203,7 @@ function MainChatApp() {
       setScopeVerifiedToken("");
       return;
     }
+
     let active = true;
     void fetch(getBackendApiUrl("/api/auth/session-scope"), {
       cache: "no-store",
@@ -1206,7 +1280,9 @@ function MainChatApp() {
   const [byokStatus, setByokStatus] = useState<string | null>(null);
   const [byokError, setByokError] = useState<string | null>(null);
   const [byokHelpOpen, setByokHelpOpen] = useState(false);
-  const [voicePreset, setVoicePreset] = useState<"Aoede" | "Charon">("Aoede");
+  const [voicePreset, setVoicePreset] = useState<VoicePreset>("Aoede");
+  const [activeVoicePreview, setActiveVoicePreview] = useState<VoicePreset | null>(null);
+  const voicePreviewUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const [profileTotpSetup, setProfileTotpSetup] = useState<{ qr_code: string; secret: string } | null>(null);
   const [profileTotpCode, setProfileTotpCode] = useState("");
   const [profileTotpBusy, setProfileTotpBusy] = useState(false);
@@ -1229,6 +1305,13 @@ function MainChatApp() {
   const [roomCryptoIdentity, setRoomCryptoIdentity] = useState<RoomCryptoIdentity | null>(null);
   const [discoverableFriends, setDiscoverableFriends] = useState<DiscoverableFriend[]>([]);
   const [pendingFriendRequests, setPendingFriendRequests] = useState<PendingFriendRequest[]>([]);
+  const [realtimeToast, setRealtimeToast] = useState<{
+    type: "friend" | "call";
+    userId: string;
+    displayName: string;
+    callId?: string;
+    roomId?: string;
+  } | null>(null);
   const [blockedUsers, setBlockedUsers] = useState<BlockedFriendProfile[]>([]);
   const [blockTarget, setBlockTarget] = useState<BlockedFriendProfile | DiscoverableFriend | null>(null);
   const [friendMenuUserId, setFriendMenuUserId] = useState<string | null>(null);
@@ -1322,19 +1405,32 @@ function MainChatApp() {
   const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
   const [voiceCallId, setVoiceCallId] = useState("");
   const [activeRoomVoiceCallId, setActiveRoomVoiceCallId] = useState("");
+  const [activeRoomCallOwnerId, setActiveRoomCallOwnerId] = useState("");
+  const [joinedRoomVoiceCallId, setJoinedRoomVoiceCallId] = useState("");
+  const [voiceCallStartedAt, setVoiceCallStartedAt] = useState<string | null>(null);
   const [voiceCallParticipants, setVoiceCallParticipants] = useState<RoomMember[]>([]);
+  const [activeVoiceSpeakerId, setActiveVoiceSpeakerId] = useState("");
+  const voiceSpeakerTimerRef = useRef<number | null>(null);
+  const [vipClaimGranted, setVipClaimGranted] = useState(false);
   const [remoteVoiceTurns, setRemoteVoiceTurns] = useState<VoiceCallTurn[]>([]);
   const [pendingCallTranscript, setPendingCallTranscript] = useState<VoiceCallTranscript | null>(null);
+  const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
   const setIsObserverActive = useCallback((active: boolean) => {
     if (!active) {
       setIsVoiceCallOpen(false);
       if (isTeamMode && activeRoomVoiceCallId) {
-        sendRoomEvent({ type: "voice_session.end", call_id: activeRoomVoiceCallId });
-        setActiveRoomVoiceCallId("");
+        sendRoomEvent({ type: "USER_LEFT_CALL", call_id: activeRoomVoiceCallId });
+        if (activeRoomCallOwnerId === roomIdentity) {
+          sendRoomEvent({ type: "voice_session.end", call_id: activeRoomVoiceCallId });
+          setActiveRoomVoiceCallId("");
+          setActiveRoomCallOwnerId("");
+        }
+        setJoinedRoomVoiceCallId("");
+        setVoiceCallStartedAt(null);
       }
     }
     setIsObserverActiveState(active);
-  }, [activeRoomVoiceCallId, isTeamMode]);
+  }, [activeRoomCallOwnerId, activeRoomVoiceCallId, isTeamMode, roomIdentity]);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -1364,6 +1460,54 @@ function MainChatApp() {
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    if (realtimeToast?.type !== "call") return;
+    const audioContext = new window.AudioContext();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = 440;
+    gain.gain.value = 0;
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start();
+
+    const pulse = () => {
+      const now = audioContext.currentTime;
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(0, now);
+      gain.gain.linearRampToValueAtTime(0.14, now + 0.04);
+      gain.gain.setValueAtTime(0.14, now + 0.32);
+      gain.gain.linearRampToValueAtTime(0, now + 0.4);
+    };
+    pulse();
+    let nextFrequency = 880;
+    const ringTimer = window.setInterval(() => {
+      oscillator.frequency.setValueAtTime(nextFrequency, audioContext.currentTime);
+      nextFrequency = nextFrequency === 440 ? 880 : 440;
+      pulse();
+    }, 1500);
+    void audioContext.resume().catch((error: unknown) => {
+      console.warn("Incoming call ringtone could not start:", error);
+    });
+
+    return () => {
+      window.clearInterval(ringTimer);
+      oscillator.stop();
+      oscillator.disconnect();
+      gain.disconnect();
+      void audioContext.close().catch((error: unknown) => {
+        console.warn("Incoming call ringtone could not be closed cleanly:", error);
+      });
+    };
+  }, [realtimeToast?.type, realtimeToast?.callId]);
+
+  useEffect(() => () => {
+    if (voiceSpeakerTimerRef.current !== null) {
+      window.clearTimeout(voiceSpeakerTimerRef.current);
+    }
+  }, []);
+
   const API_BASE = getBackendBaseUrl();
 
   const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID?.trim() || "";
@@ -1372,12 +1516,13 @@ function MainChatApp() {
   const isCorporateDomain = Boolean(
     googleIdToken && scopeVerifiedToken === googleIdToken && corporateTenantId,
   );
-  const effectiveUserAvatar = isCorporateDomain
-    ? corporateAvatarUrl
-    : profileAvatar;
-
   const isDevUser = userProfile.email.toLowerCase() === DEVELOPER_EMAIL.toLowerCase();
   const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
+  const effectiveUserAvatar = isMasterAdmin
+    ? "/admin-avatar.png"
+    : isCorporateDomain
+      ? corporateAvatarUrl
+      : profileAvatar;
   const canAccessVoiceCall = useCallback(() => {
     if (!isObserverActive) return false;
     if (userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com") return true;
@@ -1398,11 +1543,10 @@ function MainChatApp() {
 
   const isVipEligible =
     Boolean(googleIdToken) && VIP_ALLOWED_EMAILS.includes(userProfile.email.toLowerCase());
-  const isVipUser = isVipEligible && isVipSessionActive;
+  const isVipUser = isVipSessionActive && (isVipEligible || vipClaimGranted);
 
   const isQuotaEnforced = !isMasterAdmin && !isVipUser && !byokVerified;
   const remainingDailyChats = isMasterAdmin ? 999999 : Math.max(0, DAILY_FREE_LIMIT - dailyUsageCount);
-  const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
   const activeRoomMemberCount = members.filter((member) => member.status === "active").length;
   const roomMemberCount = members.length;
   const isCurrentRoomHost = members.some(
@@ -1601,7 +1745,7 @@ function MainChatApp() {
     return encryptAndSendRoomEvent(event, members);
   }
 
-  function startVoiceCall() {
+  function startVoiceCall(inviteRoomParticipants = false) {
     if (!canAccessVoiceCall()) {
       setVoiceCallGateNotice("Live Voice Calls are exclusive to BYOK users. Please add your Gemini API key in Settings > BYOK to start voice calls.");
       setSettingsTab("developer");
@@ -1612,18 +1756,93 @@ function MainChatApp() {
     const callId = isTeamMode && activeRoomVoiceCallId
       ? activeRoomVoiceCallId
       : window.crypto.randomUUID();
+    setVoiceCallStartedAt(new Date().toISOString());
     if (isTeamMode && !activeRoomVoiceCallId) {
-      if (!sendRoomEvent({ type: "voice_session.start", call_id: callId })) return;
+      if (!sendRoomEvent({
+        type: "voice_session.start",
+        call_id: callId,
+        voice_name: voicePreset,
+      })) return;
       setActiveRoomVoiceCallId(callId);
+      setActiveRoomCallOwnerId(roomIdentity);
+      setJoinedRoomVoiceCallId(callId);
       setVoiceCallParticipants(members.filter((member) => member.status === "active"));
       setRemoteVoiceTurns([]);
+    }
+    if (isTeamMode && activeRoomVoiceCallId && joinedRoomVoiceCallId !== callId) {
+      if (!sendRoomEvent({ type: "USER_JOINED_CALL", call_id: callId })) return;
+      setJoinedRoomVoiceCallId(callId);
+    } else if (inviteRoomParticipants && isTeamMode && activeRoomMemberCount >= 2) {
+      if (!sendRoomEvent({ type: "INCOMING_CALL", call_id: callId })) return;
     }
     setVoiceCallId(callId);
     setIsVoiceCallOpen(true);
   }
 
+  async function claimVipSecretPass(code: string, days: number) {
+    if (!googleIdToken) throw new Error("Sign in with Google before claiming VIP access.");
+    const response = await fetch(getBackendApiUrl("/api/vip/claim-secret-pass"), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${googleIdToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ code, days }),
+    });
+    const result = await response.json().catch(() => ({})) as { detail?: string; status?: string; expires_at?: string };
+    if (!response.ok || result.status !== "SUCCESS") {
+      throw new Error(result.detail || "VIP claim could not be completed.");
+    }
+    try {
+      localStorage.setItem(`genie_vip_claimed_${userProfile.email.toLowerCase()}`, "true");
+    } catch (error) {
+      console.warn("VIP entitlement is active but could not be cached on this device:", error);
+    }
+    setVipClaimGranted(true);
+    setIsVipSessionActive(true);
+    setSecurityToast(`VIP access activated until ${new Date(result.expires_at || "").toLocaleString()}.`);
+    window.setTimeout(() => setSecurityToast(null), 5000);
+  }
+
+  function endActiveCallFromHeader() {
+    if (isTeamMode && activeRoomVoiceCallId) {
+      sendRoomEvent({ type: "USER_LEFT_CALL", call_id: activeRoomVoiceCallId });
+      if (activeRoomCallOwnerId === roomIdentity) {
+        sendRoomEvent({ type: "voice_session.end", call_id: activeRoomVoiceCallId });
+        setActiveRoomVoiceCallId("");
+        setActiveRoomCallOwnerId("");
+      }
+      setJoinedRoomVoiceCallId("");
+      setVoiceCallStartedAt(null);
+    }
+    setVoiceCallStartedAt(null);
+    setIsVoiceCallOpen(false);
+  }
+
+  function changeVoiceCallLanguage(languageCode: string) {
+    if (spaceMode === "workspace") return;
+    const language = INDIAN_LANGUAGES.find((item) => item.code === languageCode);
+    if (!language) return;
+    setSelectedLang(language);
+    if (isTeamMode) {
+      sendRoomEvent({ type: "UPDATE_USER_LANGUAGE", language: languageCode });
+    }
+  }
+
+  function markVoiceSpeaker(userId: string) {
+    setActiveVoiceSpeakerId(userId);
+    if (voiceSpeakerTimerRef.current !== null) {
+      window.clearTimeout(voiceSpeakerTimerRef.current);
+    }
+    voiceSpeakerTimerRef.current = window.setTimeout(() => {
+      setActiveVoiceSpeakerId("");
+      voiceSpeakerTimerRef.current = null;
+    }, 1800);
+  }
+
   async function broadcastVoiceTurn(turn: VoiceCallTurn, callId: string) {
     if (!isTeamMode) return;
+    if (turn.role === "user") markVoiceSpeaker(turn.userId);
     const sent = await sendEncryptedRoomEvent({
       type: "voice_session.turn",
       content: turn.text,
@@ -1639,9 +1858,18 @@ function MainChatApp() {
 
   async function handleVoiceCallEnd(transcript: VoiceCallTranscript) {
     setIsVoiceCallOpen(false);
+    setVoiceCallStartedAt(null);
     if (isTeamMode) {
-      sendRoomEvent({ type: "voice_session.end", call_id: transcript.callId });
-      setActiveRoomVoiceCallId("");
+      sendRoomEvent({
+        type: "USER_LEFT_CALL",
+        call_id: transcript.callId,
+      });
+      if (activeRoomCallOwnerId === roomIdentity) {
+        sendRoomEvent({ type: "voice_session.end", call_id: transcript.callId });
+        setActiveRoomVoiceCallId("");
+        setActiveRoomCallOwnerId("");
+      }
+      setJoinedRoomVoiceCallId("");
       const canSaveRoomCallLog = spaceMode === "personal"
         ? isCurrentRoomHost
         : isCurrentRoomOriginAdmin;
@@ -2037,6 +2265,9 @@ function MainChatApp() {
           const savedProfile = localStorage.getItem("genie_user_profile");
           if (savedAuth === "true" && savedProfile) {
             const parsedProfile = JSON.parse(savedProfile);
+            setVipClaimGranted(
+              localStorage.getItem(`genie_vip_claimed_${String(parsedProfile.email || "").toLowerCase()}`) === "true",
+            );
             const isDevSession = localStorage.getItem("genie_session_token") === "dev-token-local-bypass";
             const isLocalRegistrationFallback =
               localStorage.getItem("genie_local_registration_fallback") === "true";
@@ -2087,6 +2318,7 @@ function MainChatApp() {
             email?: string;
             google_avatar_url?: string;
             mobile_number?: string;
+            mobile_verified?: boolean;
             recovery_email?: string;
             allow_room_invites?: "mutual_friends" | "everyone";
             is_creator?: boolean;
@@ -2136,6 +2368,7 @@ function MainChatApp() {
             name: result.profile?.display_name || previous.name,
             email,
             mobileNumber: result.profile?.mobile_number || previous.mobileNumber,
+            mobileVerified: result.profile?.mobile_verified === true,
             recoveryEmail: result.profile?.recovery_email || previous.recoveryEmail,
             avatarUrl: result.profile?.avatar_url || previous.avatarUrl,
             gender: result.profile?.gender || previous.gender,
@@ -2150,6 +2383,7 @@ function MainChatApp() {
           email: result.profile?.email || userProfile.email,
           googleAvatarUrl: result.profile?.google_avatar_url || userProfile.googleAvatarUrl,
           mobileNumber: result.profile?.mobile_number || "",
+          mobileVerified: result.profile?.mobile_verified === true,
           recoveryEmail: result.profile?.recovery_email || "",
           allowRoomInvites: result.profile?.allow_room_invites || "mutual_friends",
           isCreator: Boolean(result.profile?.is_creator),
@@ -2420,8 +2654,19 @@ if (!response.ok || !Array.isArray(result.topics)) {
         const savedKey = localStorage.getItem("genie_user_byok_key") || "";
         setByokApiKey(savedKey);
         setByokStatus(savedKey ? "Saved on this device · test to activate" : null);
-        const savedVoice = localStorage.getItem("genie_tts_voice_preset");
-        if (savedVoice === "Aoede" || savedVoice === "Charon") setVoicePreset(savedVoice);
+        const savedProfile = JSON.parse(localStorage.getItem("genie_user_profile") || "{}") as {
+          preferredVoice?: string;
+        };
+        const savedVoice =
+          localStorage.getItem("genie_preferred_voice") ||
+          localStorage.getItem("genie_tts_voice_preset") ||
+          savedProfile.preferredVoice ||
+          "Aoede";
+        if (VOICE_PRESETS.some(({ key }) => key === savedVoice)) {
+          const preset = savedVoice as VoicePreset;
+          setVoicePreset(preset);
+          setUserProfile((previous) => ({ ...previous, preferredVoice: preset }));
+        }
       } catch (error) {
         console.error("Device preferences could not be loaded:", error);
         setByokError("Device preferences could not be loaded from local storage.");
@@ -2430,15 +2675,70 @@ if (!response.ok || !Array.isArray(result.topics)) {
     return () => window.clearTimeout(timeout);
   }, [mounted]);
 
-  function selectVoicePreset(preset: "Aoede" | "Charon") {
+  function selectVoicePreset(preset: VoicePreset) {
     setVoicePreset(preset);
+    setUserProfile((previous) => ({ ...previous, preferredVoice: preset }));
     try {
+      localStorage.setItem("genie_preferred_voice", preset);
       localStorage.setItem("genie_tts_voice_preset", preset);
+      const updatedProfile = { ...userProfile, preferredVoice: preset };
+      localStorage.setItem(
+        "genie_user_profile",
+        JSON.stringify({ ...updatedProfile, customApiKey: "", totpPasscode: "" }),
+      );
     } catch (error) {
       console.error("Voice preference could not be saved:", error);
-      setChatError("Voice preference could not be saved in this browser.");
+      setChatError("Voice preference was selected but could not be saved to this browser.");
     }
+    if (activeVoicePreview) stopVoicePreview();
   }
+
+  function stopVoicePreview() {
+    window.speechSynthesis.cancel();
+    voicePreviewUtteranceRef.current = null;
+    setActiveVoicePreview(null);
+  }
+
+  function previewVoice(preset: VoicePreset) {
+    stopVoicePreview();
+    stopActiveRegionalAudio();
+    window.dispatchEvent(new Event("genie:stop-call-audio"));
+    if (activeVoicePreview === preset) return;
+
+    const voice = VOICE_PRESETS.find((item) => item.key === preset);
+    if (!voice) return;
+    const utterance = new SpeechSynthesisUtterance(voice.sample);
+    utterance.pitch = voice.pitch;
+    utterance.rate = voice.rate;
+    const browserVoices = window.speechSynthesis.getVoices();
+    const preferredBrowserVoice = browserVoices.find((browserVoice) =>
+      voice.gender.toLowerCase().includes("female")
+        ? /female|woman|zira|samantha|victoria|karen/i.test(browserVoice.name)
+        : /male|man|david|daniel|alex|james/i.test(browserVoice.name),
+    );
+    if (preferredBrowserVoice) utterance.voice = preferredBrowserVoice;
+    utterance.onend = () => {
+      if (voicePreviewUtteranceRef.current === utterance) {
+        voicePreviewUtteranceRef.current = null;
+        setActiveVoicePreview(null);
+      }
+    };
+    utterance.onerror = (event) => {
+      if (voicePreviewUtteranceRef.current === utterance) {
+        voicePreviewUtteranceRef.current = null;
+        setActiveVoicePreview(null);
+        console.error("Voice preview playback failed:", event.error);
+        setChatError("Voice preview could not be played in this browser.");
+      }
+    };
+    voicePreviewUtteranceRef.current = utterance;
+    setActiveVoicePreview(preset);
+    window.speechSynthesis.speak(utterance);
+  }
+
+  useEffect(() => () => {
+    window.speechSynthesis.cancel();
+  }, []);
 
   useEffect(() => {
     if (
@@ -2582,8 +2882,40 @@ if (!response.ok || !Array.isArray(result.topics)) {
         return;
       }
 
+      if (update.type === "FRIEND_REQUEST_RECEIVED" && update.requester?.user_id) {
+        setRealtimeToast({
+          type: "friend",
+          userId: update.requester.user_id,
+          displayName: update.requester.display_name || "A Genie user",
+        });
+        void loadFriendsQueue();
+        return;
+      }
+
+      if ((update.type === "INCOMING_CALL" || update.type === "INCOMING_CALL_INVITE") && update.inviter?.user_id) {
+        setRealtimeToast({
+          type: "call",
+          userId: update.inviter.user_id,
+          displayName: update.inviter.display_name || "A Genie friend",
+          callId: update.call_id,
+          roomId: update.room_id,
+        });
+        return;
+      }
+
       if (update.type === "voice_session.started" && update.call_id) {
+        if (update.is_rejoin) {
+          socket.send(JSON.stringify({
+            type: "USER_JOINED_CALL",
+            call_id: update.call_id,
+          }));
+        }
         setActiveRoomVoiceCallId(update.call_id);
+        setActiveRoomCallOwnerId(update.started_by || "");
+        if (update.is_rejoin || update.started_by === roomIdentity) {
+          setJoinedRoomVoiceCallId(update.call_id);
+        }
+        setVoiceCallStartedAt(update.started_at || new Date().toISOString());
         setVoiceCallParticipants((update.participants || []).map((participant) => ({
           id: participant.id,
           name: participant.name,
@@ -2618,6 +2950,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
             text,
             timestamp: update.timestamp || new Date().toISOString(),
           };
+          if (turn.role === "user") markVoiceSpeaker(turn.userId);
           setRemoteVoiceTurns((previous) =>
             previous.some((item) => item.id === turn.id) ? previous : [...previous, turn],
           );
@@ -2630,6 +2963,9 @@ if (!response.ok || !Array.isArray(result.topics)) {
 
       if (update.type === "voice_session.ended") {
         setActiveRoomVoiceCallId("");
+        setActiveRoomCallOwnerId("");
+        setJoinedRoomVoiceCallId("");
+        setVoiceCallStartedAt(null);
         return;
       }
 
@@ -2842,7 +3178,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
   }, [roomMessages, isTeamMode, roomIdentity]);
 
   useEffect(() => {
-    if (!mounted || !isAuthenticated || !isVipEligible) {
+    if (!mounted || !isAuthenticated || (!isVipEligible && !vipClaimGranted)) {
       setIsVipSessionActive(false);
       setVipSessionLimitReached(false);
       setActiveVipSessionCount(0);
@@ -2911,7 +3247,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       void updateSession("release");
     };
-  }, [mounted, isAuthenticated, isVipEligible, userProfile.email, googleIdToken, API_BASE]);
+  }, [mounted, isAuthenticated, isVipEligible, vipClaimGranted, userProfile.email, googleIdToken, API_BASE]);
 
   // Google OAuth Initializer
   useEffect(() => {
@@ -3203,6 +3539,28 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       await loadFriendsQueue();
     } catch (error) {
       console.error("Friend request response failed:", error);
+      setFriendsQueueError(error instanceof Error ? error.message : "Friend request could not be updated.");
+    }
+  }
+
+  async function respondToRealtimeFriendRequest(accepted: boolean) {
+    if (!googleIdToken || !realtimeToast || realtimeToast.type !== "friend") return;
+    try {
+      const response = await fetch(getBackendApiUrl("/api/friends/respond"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          requester_id: realtimeToast.userId,
+          status: accepted ? "ACCEPTED" : "REJECTED",
+        }),
+      });
+      const result = (await response.json()) as { detail?: string };
+      if (!response.ok) throw new Error(result.detail || "Friend request could not be updated.");
+      setRealtimeToast(null);
+      await loadFriendsQueue();
+    } catch (error) {
+      console.error("Realtime friend request response failed:", error);
       setFriendsQueueError(error instanceof Error ? error.message : "Friend request could not be updated.");
     }
   }
@@ -4105,6 +4463,7 @@ if (!response.ok) {
       localStorage.removeItem("genie_terms_agreed");
       localStorage.removeItem("genie_session_token");
       localStorage.removeItem("genie_local_registration_fallback");
+      localStorage.removeItem(`genie_vip_claimed_${userProfile.email.toLowerCase()}`);
       sessionStorage.removeItem("genie_google_id_token");
       if ((window as any).google?.accounts?.id) {
         (window as any).google.accounts.id.disableAutoSelect();
@@ -4112,6 +4471,7 @@ if (!response.ok) {
       }
     }
     setIsAuthenticated(false);
+    setVipClaimGranted(false);
     setIsRoomUnlocked(false);
     setRegistrationRequired(false);
     setRegistrationReauthRequired(false);
@@ -4139,12 +4499,14 @@ if (!response.ok) {
       name: "Guest User",
       email: "",
       mobileNumber: "",
+      mobileVerified: false,
       recoveryEmail: "",
       allowRoomInvites: "mutual_friends",
       isCreator: false,
       avatarUrl: "",
       googleAvatarUrl: "",
       role: "professional",
+      preferredVoice: "Aoede",
       profession: "Healthcare Revenue Cycle & Client Operations",
       institution: "",
       studyFocus: "",
@@ -4646,6 +5008,27 @@ if (!response.ok) {
     else await exportCurrentSessionTranscript(format);
   }
 
+  function downloadChatVaultBackup() {
+    if (!canExportActiveChat) {
+      setChatError(exportDisabledReason);
+      return;
+    }
+    const backup = {
+      version: 2,
+      exported_at: new Date().toISOString(),
+      sessions,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {
+      type: "application/json;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `Genie_Chat_Vault_${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   function wipeRoomForAll() {
     if (!isCurrentRoomHost) {
       setChatError("Only the room host can wipe this chat.");
@@ -5122,6 +5505,7 @@ if (!response.ok) {
       const audioData = (await audioResponse.json()) as {
         text?: string;
         audio?: string;
+        audio_mime_type?: string;
         candidates?: {
           content?: {
             parts?: { text?: string; inlineData?: { data?: string; mimeType?: string } }[];
@@ -5140,6 +5524,7 @@ if (!response.ok) {
       return {
         text: assistantText,
         audioData: audioData.audio,
+        audioMimeType: audioData.audio_mime_type,
       };
     } catch (error) {
       console.warn("Voice turn failed:", error);
@@ -5262,6 +5647,7 @@ if (!response.ok) {
           display_name: string;
           email: string;
           mobile_number: string;
+          mobile_verified?: boolean;
           recovery_email: string;
           avatar_url: string;
           gender: string;
@@ -5281,6 +5667,7 @@ if (!response.ok) {
         name: result.profile.display_name,
         email: result.profile.email,
         mobileNumber: result.profile.mobile_number,
+        mobileVerified: result.profile.mobile_verified === true,
         recoveryEmail: result.profile.recovery_email,
         avatarUrl: result.profile.avatar_url || "genie-preset:neutral",
         gender: result.profile.gender || "",
@@ -5497,6 +5884,7 @@ if (!response.ok) {
   }
 
   async function handleRegistrationAvatarFile(file?: File) {
+    if (isMasterAdmin) return;
     if (!file) return;
     if (file.size > 2 * 1024 * 1024) {
       setRegistrationError("Choose an avatar image no larger than 2 MB.");
@@ -5544,6 +5932,7 @@ if (!response.ok) {
       const fallbackToken = googleIdToken;
       const localProfile = {
         ...userProfile,
+        avatarUrl: isMasterAdmin ? "/admin-avatar.png" : userProfile.avatarUrl,
         providerId: userProfile.providerId || (fallbackToken === "dev-token-local-bypass" ? "dev-admin" : ""),
         authProvider: (userProfile.authProvider || "google") as "google",
         name: userProfile.name.trim(),
@@ -5575,12 +5964,12 @@ if (!response.ok) {
           google_id_token: googleIdToken,
           email: userProfile.email.trim(),
           display_name: userProfile.name.trim(),
-          avatar_url: userProfile.avatarUrl || "genie-preset:neutral",
-          avatar_type: userProfile.avatarUrl === "/avatars/Profile 1.png"
+          avatar_url: isMasterAdmin ? "/admin-avatar.png" : userProfile.avatarUrl || "genie-preset:neutral",
+          avatar_type: userProfile.avatarUrl === "/avatars/Profile-1.png"
             ? "option_a"
-            : userProfile.avatarUrl === "/avatars/Profile 2.png"
+            : userProfile.avatarUrl === "/avatars/Profile-2.png"
             ? "option_b"
-            : userProfile.avatarUrl === "/avatars/Profile 3.png"
+            : userProfile.avatarUrl === "/avatars/Profile-3.png"
             ? "option_c"
             : undefined,
           mobile_number: userProfile.mobileNumber.trim(),
@@ -5602,6 +5991,7 @@ if (!response.ok) {
           email: string;
           google_avatar_url?: string;
           mobile_number: string;
+          mobile_verified?: boolean;
           recovery_email: string;
           allow_room_invites: "mutual_friends" | "everyone";
           avatar_url?: string;
@@ -5623,6 +6013,7 @@ if (!response.ok) {
         email: result.profile.email,
         googleAvatarUrl: result.profile.google_avatar_url || userProfile.googleAvatarUrl,
         mobileNumber: result.profile.mobile_number,
+        mobileVerified: result.profile.mobile_verified === true,
         recoveryEmail: result.profile.recovery_email,
         allowRoomInvites: result.profile.allow_room_invites,
         avatarUrl: result.profile.avatar_url || userProfile.avatarUrl,
@@ -5775,6 +6166,7 @@ if (!response.ok) {
   }
 
   async function handleProfileAvatarFile(file?: File) {
+    if (isMasterAdmin) return;
     if (!file) return;
     if (file.size > 2 * 1024 * 1024) {
       setProfileSaveError("Choose an image no larger than 2 MB.");
@@ -5827,7 +6219,7 @@ if (!response.ok) {
           display_name: profileEditor.name.trim(),
           mobile_number: profileEditor.mobileNumber.trim(),
           recovery_email: profileEditor.recoveryEmail.trim(),
-          avatar_url: profileEditor.avatarUrl,
+          avatar_url: isMasterAdmin ? "/admin-avatar.png" : profileEditor.avatarUrl,
           gender: profileEditor.gender,
         }),
       });
@@ -5836,6 +6228,7 @@ if (!response.ok) {
           display_name: string;
           email: string;
           mobile_number: string;
+          mobile_verified?: boolean;
           recovery_email: string;
           avatar_url: string;
           gender: string;
@@ -5853,8 +6246,9 @@ if (!response.ok) {
         name: result.profile.display_name,
         email: result.profile.email,
         mobileNumber: result.profile.mobile_number,
+        mobileVerified: result.profile.mobile_verified === true,
         recoveryEmail: result.profile.recovery_email,
-        avatarUrl: result.profile.avatar_url,
+        avatarUrl: isMasterAdmin ? "/admin-avatar.png" : result.profile.avatar_url,
         gender: result.profile.gender,
       };
       setUserProfile(updatedProfile);
@@ -6130,13 +6524,24 @@ if (!response.ok) {
                 className="w-full cursor-not-allowed rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm text-slate-500"
               />
             </label>
-            <fieldset className="space-y-2">
-              <legend className="text-xs font-semibold text-slate-700">Avatar Selector</legend>
+            <fieldset disabled={isMasterAdmin} className="space-y-2 disabled:opacity-70">
+              <legend className="text-xs font-semibold text-slate-700">
+                {isMasterAdmin ? "Admin Avatar (read-only)" : "Avatar Selector"}
+              </legend>
+              {isMasterAdmin && (
+                <Image
+                  src="/admin-avatar.png"
+                  width={64}
+                  height={64}
+                  alt="Admin Avatar"
+                  className="rounded-full border border-purple-500/30 object-cover shadow-lg"
+                />
+              )}
               <div className="grid grid-cols-3 gap-2">
                 {([
-                  ["/avatars/Profile 1.png", "Option A: Profile 1", "Profile 1"],
-                  ["/avatars/Profile 2.png", "Option B: Profile 2", "Profile 2"],
-                  ["/avatars/Profile 3.png", "Option C: Profile 3", "Profile 3"],
+                  ["/avatars/Profile-1.png", "Option A: Profile 1", "Profile 1"],
+                  ["/avatars/Profile-2.png", "Option B: Profile 2", "Profile 2"],
+                  ["/avatars/Profile-3.png", "Option C: Profile 3", "Profile 3"],
                 ] as const).map(([avatar, label, description]) => (
                   <button
                     key={avatar}
@@ -6168,7 +6573,7 @@ if (!response.ok) {
                   }}
                 />
               </label>
-              {userProfile.avatarUrl.startsWith("data:image/") && (
+              {!isMasterAdmin && userProfile.avatarUrl.startsWith("data:image/") && (
                 <div className="flex items-center justify-center gap-2 text-[10px] text-slate-500">
                   <GenieAvatar src={userProfile.avatarUrl} alt="Custom avatar preview" className="h-9 w-9 rounded-full object-cover" />
                   <span>Custom avatar preview</span>
@@ -6365,7 +6770,14 @@ if (!response.ok) {
             </label>
             <div className="grid gap-3 sm:grid-cols-2">
               <label className="block space-y-1.5">
-                <span className="text-xs font-semibold text-slate-700">Mobile / Contact Number</span>
+                <span className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-slate-700">Mobile / Contact Number</span>
+                  {userProfile.mobileVerified && profileEditor.mobileNumber.trim() === userProfile.mobileNumber.trim() && (
+                    <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700">
+                      ✓ Verified
+                    </span>
+                  )}
+                </span>
                 <input
                   required
                   type="tel"
@@ -6474,17 +6886,30 @@ if (!response.ok) {
             </section>
             <section className="space-y-3 rounded-2xl border border-slate-200 p-3.5">
               <div className="flex items-center gap-3">
-                <GenieAvatar src={profileEditor.avatarUrl} alt="Selected Genie avatar" className="h-14 w-14 rounded-full border border-slate-200" />
+                {isMasterAdmin ? (
+                  <Image
+                    src="/admin-avatar.png"
+                    width={64}
+                    height={64}
+                    alt="Admin Avatar"
+                    className="rounded-full border border-purple-500/30 object-cover shadow-lg"
+                  />
+                ) : (
+                  <GenieAvatar src={profileEditor.avatarUrl} alt="Selected Genie avatar" className="h-14 w-14 rounded-full border border-slate-200" />
+                )}
                 <div>
-                  <h3 className="text-xs font-bold text-slate-800">Avatar Selector</h3>
-                  <p className="text-[10px] text-slate-500">Select a Genie design or upload your own image.</p>
+                  <h3 className="text-xs font-bold text-slate-800">{isMasterAdmin ? "Admin Avatar (read-only)" : "Avatar Selector"}</h3>
+                  <p className="text-[10px] text-slate-500">
+                    {isMasterAdmin ? "The primary administrator avatar cannot be changed." : "Select a Genie design or upload your own image."}
+                  </p>
                 </div>
               </div>
+              {!isMasterAdmin && <fieldset className="space-y-2">
               <div className="grid grid-cols-3 gap-2">
                 {([
-                  ["/avatars/Profile 1.png", "Option A: Profile 1", "Profile 1"],
-                  ["/avatars/Profile 2.png", "Option B: Profile 2", "Profile 2"],
-                  ["/avatars/Profile 3.png", "Option C: Profile 3", "Profile 3"],
+                  ["/avatars/Profile-1.png", "Option A: Profile 1", "Profile 1"],
+                  ["/avatars/Profile-2.png", "Option B: Profile 2", "Profile 2"],
+                  ["/avatars/Profile-3.png", "Option C: Profile 3", "Profile 3"],
                 ] as const).map(([value, label, description]) => (
                   <button
                     key={value}
@@ -6522,6 +6947,7 @@ if (!response.ok) {
               {profileEditor.avatarUrl.startsWith("data:image/") && (
                 <p className="text-center text-[10px] text-slate-500">Your upload is previewed in a circular crop.</p>
               )}
+              </fieldset>}
             </section>
             {profileSaveError && <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{profileSaveError}</p>}
             <div className="flex justify-end gap-2">
@@ -6830,8 +7256,13 @@ if (!response.ok) {
                 <Plus className="h-5 w-5" />
               </button>
               {!isCorporateDomain && (
-                <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="relative rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
                   <UserPlus className="h-5 w-5" />
+                  {pendingFriendRequests.length > 0 && (
+                    <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-600 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                      {pendingFriendRequests.length > 99 ? "99+" : pendingFriendRequests.length}
+                    </span>
+                  )}
                 </button>
               )}
               <button type="button" onClick={() => setTrashOpen((open) => !open)} title="Trash" aria-label="Trash" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
@@ -7406,6 +7837,9 @@ if (!response.ok) {
             isCorporateDomain={isCorporateDomain}
             workspaceName={isCorporateDomain ? "Corp Active" : spaceMode === "workspace" ? "Workspace" : "Personal"}
             profileGender={userProfile.gender}
+            userEmail={userProfile.email}
+            isPrimaryVip={isMasterAdmin}
+            isAdmin={isSuperAdminVerified}
             corporateAvatarUrl={corporateAvatarUrl}
             corporateDisplayName={userProfile.name}
             corporateTenantId={corporateTenantId}
@@ -7429,15 +7863,16 @@ if (!response.ok) {
             activeClass={currentTheme.primaryClass}
             onOpenRoom={() => setRoomAdminOpen(true)}
             onStartVoiceCall={startVoiceCall}
-            isObserverOn={isObserverActive}
+            onStartRoomCall={() => startVoiceCall(true)}
+            isCallActive={isVoiceCallOpen}
+            callStartedAt={voiceCallStartedAt}
+            onEndActiveCall={endActiveCallFromHeader}
+            onClaimVip={claimVipSecretPass}
             canAccessVoiceCall={hasVoiceCallAccess}
             onOpenSettings={() => setSettingsOpen(true)}
             isAuthenticated={isAuthenticated}
             isRoomHost={isCurrentRoomHost}
             canInviteMembers={!isCorporateDomain && (!isTeamMode || canManageRoomPolicy)}
-            canExport={canExportActiveChat}
-            exportDisabledReason={exportDisabledReason}
-            onExport={(format) => void exportActiveChat(format)}
             onPurgeContext={purgeLocalChatContext}
             onCopyInvite={(mode) => void copyHeaderInvite(mode)}
             onLeaveRoom={handleExitRoomToPersonal}
@@ -7446,6 +7881,57 @@ if (!response.ok) {
             adminTelemetry={isSuperAdminVerified ? adminTelemetry : null}
             adminTelemetryError={adminTelemetryError}
           />
+          {realtimeToast && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="fixed right-4 top-4 z-[130] w-[min(24rem,calc(100vw-2rem))] rounded-2xl border border-cyan-900/30 bg-slate-950 p-4 text-white shadow-2xl"
+            >
+              <p className="text-sm font-semibold">
+                {realtimeToast.type === "friend"
+                  ? `${realtimeToast.displayName} sent you a friend request`
+                  : `${realtimeToast.displayName} invited you to a voice call`}
+              </p>
+              <div className="mt-3 flex justify-end gap-2">
+                {realtimeToast.type === "friend" ? (
+                  <>
+                    <button type="button" onClick={() => void respondToRealtimeFriendRequest(true)} className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold hover:bg-emerald-500">Accept</button>
+                    <button type="button" onClick={() => void respondToRealtimeFriendRequest(false)} className="rounded-lg bg-rose-700 px-3 py-1.5 text-xs font-bold hover:bg-rose-600">Decline</button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (realtimeToast.roomId === roomId && realtimeToast.callId) {
+                          if (canAccessVoiceCall()) {
+                            if (!sendRoomEvent({ type: "USER_JOINED_CALL", call_id: realtimeToast.callId })) return;
+                            setActiveRoomVoiceCallId(realtimeToast.callId);
+                            setJoinedRoomVoiceCallId(realtimeToast.callId);
+                            setVoiceCallStartedAt(new Date().toISOString());
+                            setVoiceCallId(realtimeToast.callId);
+                            setIsVoiceCallOpen(true);
+                          } else {
+                            startVoiceCall();
+                          }
+                        } else {
+                          setFriendsQueueError("Open the invited room before accepting its call.");
+                        }
+                        setRealtimeToast(null);
+                      }}
+                      className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold hover:bg-emerald-500"
+                    >
+                      Join Call 🟢
+                    </button>
+                    <button type="button" onClick={() => setRealtimeToast(null)} className="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-bold hover:bg-slate-600">Dismiss ✕</button>
+                  </>
+                )}
+                {realtimeToast.type === "friend" && (
+                  <button type="button" onClick={() => setRealtimeToast(null)} aria-label="Dismiss notification" className="rounded-lg px-2 py-1.5 text-xs font-semibold text-slate-300 hover:bg-white/10">Later ✕</button>
+                )}
+              </div>
+            </div>
+          )}
           {securityToast && (
             <div
               role="status"
@@ -7481,6 +7967,9 @@ if (!response.ok) {
               remoteTurns={remoteVoiceTurns}
               languageCode={selectedLang.code}
               languageLabel={selectedLang.label}
+              onCopyInvite={() => void copyHeaderInvite(spaceMode)}
+              onPingFriend={() => setFriendsQueueOpen(true)}
+              onLanguageChange={changeVoiceCallLanguage}
               onSubmitTurn={submitVoiceCallTurn}
               onBroadcastTurn={broadcastVoiceTurn}
               onEndCall={(transcript) => void handleVoiceCallEnd(transcript)}
@@ -7502,7 +7991,7 @@ if (!response.ok) {
                     <GenieAvatar
                       src={member.avatarUrl || "/default-avatar.png"}
                       alt={member.name}
-                      className="h-9 w-9 rounded-full border border-slate-200"
+                      className={`h-9 w-9 rounded-full border border-slate-200 ${activeVoiceSpeakerId === member.id ? "animate-pulse ring-2 ring-cyan-400 ring-offset-2" : ""}`}
                     />
                     <span
                       className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-white ${
@@ -7648,7 +8137,7 @@ if (!response.ok) {
                         <div className={`flex max-w-full items-start gap-2 ${isTeamMode ? "flex-row-reverse" : "flex-col items-end"}`}>
                           {isTeamMode && (
                             <GenieAvatar
-                              src={members.find((member) => member.id === msg.sender_id)?.avatarUrl || (msg.sender_id === roomIdentity ? userProfile.avatarUrl : "")}
+                              src={members.find((member) => member.id === msg.sender_id)?.avatarUrl || (msg.sender_id === roomIdentity ? profileAvatar : "")}
                               alt={`${msg.senderName || userProfile.name}'s avatar`}
                               className="mt-1 h-8 w-8 shrink-0 rounded-full border border-slate-200"
                             />
@@ -7762,9 +8251,9 @@ if (!response.ok) {
                                       {turn.role === "assistant" ? (
                                         <BrandAvatar variant="cosmic-shadow" className="mt-0.5 h-6 w-6 shrink-0" label="Genie Master" />
                                       ) : (
-                                        <img
-                                          src={turn.userAvatar || "/default-avatar.png"}
-                                          alt=""
+                                        <GenieAvatar
+                                          src={turn.userAvatar || undefined}
+                                          alt={turn.userName}
                                           className="mt-0.5 h-6 w-6 shrink-0 rounded-full object-cover"
                                         />
                                       )}
@@ -8717,7 +9206,7 @@ if (!response.ok) {
                 className="flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition-all"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Save Terms & Docs (.md)</span>
+                <span>Download</span>
               </button>
 
               <button
@@ -9661,7 +10150,7 @@ if (!response.ok) {
                 <div className={`flex flex-wrap items-center justify-between gap-3 p-3 ${selectedTheme.bgLightClass} border ${selectedTheme.borderClass} rounded-2xl`}>
                   <div className="flex min-w-0 flex-[1_1_14rem] items-center gap-3">
                     <GenieAvatar
-                      src={userProfile.avatarUrl}
+                      src={profileAvatar}
                       alt={userProfile.name}
                       className={`w-11 h-11 rounded-full border-2 ${selectedTheme.borderClass} shadow-sm flex-shrink-0`}
                     />
@@ -9924,24 +10413,40 @@ if (!response.ok) {
                   <p className="mt-1 text-xs text-slate-500">Choose a calm voice for spoken Genie responses.</p>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-2">
-                  {([
-                    ["Aoede", "Soft, warm, conversational", "Female"],
-                    ["Charon", "Smooth, calm, steady", "Male"],
-                  ] as const).map(([preset, description, voiceType]) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => selectVoicePreset(preset)}
-                      aria-pressed={voicePreset === preset}
-                      className={`rounded-2xl border p-4 text-left transition-colors ${
-                        voicePreset === preset
-                          ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} ${selectedTheme.textClass}`
-                          : "border-slate-200 hover:bg-slate-50"
+                  {VOICE_PRESETS.map(({ key, gender, description, sample }) => (
+                    <article
+                      key={key}
+                      className={`rounded-2xl border p-4 transition-colors ${
+                        activeVoicePreview === key
+                          ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass} animate-pulse`
+                          : voicePreset === key
+                            ? `${selectedTheme.borderClass} ${selectedTheme.bgLightClass}`
+                            : "border-slate-200"
                       }`}
                     >
-                      <span className="block text-sm font-bold">{voiceType}: {preset}</span>
-                      <span className="mt-1 block text-xs text-slate-500">{description}</span>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => selectVoicePreset(key)}
+                        aria-pressed={voicePreset === key}
+                        className="w-full text-left"
+                      >
+                        <span className="block text-sm font-bold">{gender}: {key}</span>
+                        <span className="mt-1 block text-xs text-slate-500">{description}</span>
+                        <span className="mt-2 block text-xs italic text-slate-600">&ldquo;{sample}&rdquo;</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => previewVoice(key)}
+                        aria-pressed={activeVoicePreview === key}
+                        className={`mt-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+                          activeVoicePreview === key
+                            ? "bg-rose-100 text-rose-700 hover:bg-rose-200"
+                            : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                        }`}
+                      >
+                        {activeVoicePreview === key ? "⏹ Stop" : "▶ Test Voice"}
+                      </button>
+                    </article>
                   ))}
                 </div>
               </section>
@@ -10243,15 +10748,43 @@ if (!response.ok) {
                     className={`flex items-center gap-1.5 px-3 py-1.5 ${selectedTheme.primaryClass} text-white rounded-xl text-xs font-bold transition-all shadow-xs`}
                   >
                     <Download className="w-3.5 h-3.5" />
-                    <span>Download (.md)</span>
+                    <span>Download</span>
                   </button>
                 </div>
+
+                <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4">
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-800">Chats &amp; Archives</h4>
+                    <p className="mt-1 text-[11px] text-slate-500">Download the current conversation or its complete machine-readable backup.</p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={!canExportActiveChat}
+                      title="Best for human reading. Downloads clean text with speaker names, timestamps, and formatted code blocks."
+                      onClick={() => void exportActiveChat("markdown")}
+                      className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Download Formatted Document
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!canExportActiveChat}
+                      title="Technical data backup. Contains the complete machine-readable session structure used to restore chats into your Chat Vault."
+                      onClick={downloadChatVaultBackup}
+                      className="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs font-semibold text-cyan-800 hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      Download Backup Archive
+                    </button>
+                  </div>
+                  {!canExportActiveChat && <p className="text-[10px] text-amber-700">{exportDisabledReason}</p>}
+                </section>
 
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-2xl text-xs text-slate-600 space-y-2">
                   <p className="font-semibold text-slate-800">Active Multi-Model Failover Highlights:</p>
                   <ul className="list-disc pl-4 space-y-1 text-[11px]">
                     <li>Active cascade across authorized Google Gemini endpoints.</li>
-                    <li>RFC 6238 TOTP two-tier authentication and 20 free daily quota enforcement.</li>
+                    <li>RFC 6238 TOTP two-tier authentication and 10 free daily quota enforcement.</li>
                     <li>Non-professional algorithmic output: verify all code and technical data.</li>
                   </ul>
                   <button

@@ -1,26 +1,35 @@
 {
-  "name": "Personal AI Genie",
-  "short_name": "Genie",
-  "description": "Autonomous Multi-User Workspace & Personal AI Companion",
+  "name": "Personal AI Genie — Intelligent Collaboration Hub",
+  "short_name": "Genie AI",
+  "description": "Zero-retention, encrypted collaborative workspace and real-time voice intelligence.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#F0F2F6",
-  "theme_color": "#7c3aed",
+  "display_override": ["standalone", "window-controls-overlay"],
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
   "icons": [
     {
-      "src": "/icon-512.png",
+      "src": "/icon-192x192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/icon-512.png",
+      "src": "/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-512x512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/icon-512.png",
+      "src": "/icon-512x512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

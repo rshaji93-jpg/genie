@@ -20,15 +20,16 @@ import sys
 import threading
 import time
 import uuid
+import wave
 import httpx
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Set
 from urllib.parse import urlsplit
-from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from dotenv import dotenv_values, load_dotenv
 from google.auth.exceptions import GoogleAuthError
@@ -453,6 +454,84 @@ def initialize_archive_store():
                 )
                 """
             )
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    handle TEXT UNIQUE COLLATE NOCASE,
+                    display_name TEXT NOT NULL,
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    google_sub TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS friendships (
+                    id TEXT PRIMARY KEY,
+                    requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    addressee_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK(status IN ('PENDING', 'ACCEPTED', 'REJECTED', 'BLOCKED')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(requester_id, addressee_id),
+                    CHECK(requester_id <> addressee_id)
+                );
+                CREATE TABLE IF NOT EXISTS social_profiles (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    provider TEXT NOT NULL CHECK(provider IN ('meta', 'google')),
+                    provider_user_id TEXT NOT NULL,
+                    social_handle TEXT NOT NULL DEFAULT '',
+                    synced_at TEXT NOT NULL,
+                    UNIQUE(provider, provider_user_id)
+                );
+                CREATE TABLE IF NOT EXISTS rooms (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    room_type TEXT NOT NULL CHECK(room_type IN ('personal', 'workspace')),
+                    default_language TEXT NOT NULL DEFAULT 'en-IN',
+                    voice_persona TEXT NOT NULL DEFAULT 'aura'
+                        CHECK(voice_persona IN ('aura', 'orion', 'echo', 'vigil', 'nova', 'desi')),
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    invite_token TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS room_participants (
+                    id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+                    guest_name TEXT,
+                    guest_email TEXT,
+                    selected_language TEXT NOT NULL DEFAULT 'en-IN',
+                    role TEXT NOT NULL CHECK(role IN ('host', 'member', 'guest')),
+                    joined_at TEXT NOT NULL,
+                    CHECK(user_id IS NOT NULL OR guest_name IS NOT NULL)
+                );
+                CREATE TABLE IF NOT EXISTS room_messages (
+                    id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    sender_type TEXT NOT NULL CHECK(sender_type IN ('user', 'guest', 'genie')),
+                    sender_id TEXT NOT NULL,
+                    sender_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    artifact_code TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS session_summaries (
+                    id TEXT PRIMARY KEY,
+                    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+                    room_type TEXT NOT NULL CHECK(room_type IN ('personal', 'workspace')),
+                    summary_markdown TEXT NOT NULL,
+                    action_items_json TEXT NOT NULL DEFAULT '[]',
+                    recipients_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS friendships_addressee_status
+                    ON friendships(addressee_id, status);
+                CREATE INDEX IF NOT EXISTS room_messages_room_created
+                    ON room_messages(room_id, created_at);
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_registry (
@@ -461,6 +540,7 @@ def initialize_archive_store():
                     display_name TEXT NOT NULL,
                     avatar_url TEXT NOT NULL DEFAULT '',
                     mobile_number TEXT NOT NULL,
+                    mobile_verified BOOLEAN NOT NULL DEFAULT 0,
                     recovery_email TEXT NOT NULL DEFAULT '',
                     terms_accepted_at TEXT NOT NULL,
                     allow_room_invites TEXT NOT NULL DEFAULT 'mutual_friends',
@@ -468,7 +548,11 @@ def initialize_archive_store():
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     gender TEXT NOT NULL DEFAULT '',
-                    tenant_id TEXT NOT NULL DEFAULT ''
+                    tenant_id TEXT NOT NULL DEFAULT '',
+                    is_vip BOOLEAN NOT NULL DEFAULT 0,
+                    vip_expires_at TIMESTAMP,
+                    vip_duration_type TEXT,
+                    is_admin BOOLEAN NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -490,6 +574,24 @@ def initialize_archive_store():
             if "tenant_id" not in registry_columns:
                 connection.execute(
                     "ALTER TABLE user_registry ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''"
+                )
+            for column, declaration in (
+                ("is_vip", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("vip_expires_at", "TIMESTAMP"),
+                ("vip_duration_type", "TEXT"),
+                ("is_admin", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("mobile_verified", "BOOLEAN NOT NULL DEFAULT 0"),
+            ):
+                if column not in registry_columns:
+                    connection.execute(
+                        f"ALTER TABLE user_registry ADD COLUMN {column} {declaration}"
+                    )
+            admin_emails = sorted({*ADMIN_EMAILS, SUPER_ADMIN_IDENTIFIER})
+            admin_placeholders = ",".join("?" for _ in admin_emails)
+            if admin_placeholders:
+                connection.execute(
+                    f"UPDATE user_registry SET is_admin = 1 WHERE lower(email) IN ({admin_placeholders})",
+                    [email.lower() for email in admin_emails],
                 )
             connection.execute(
                 """
@@ -737,7 +839,7 @@ class DirectVoiceTurnRequest(BaseModel):
     contents: List[Dict[str, Any]] = Field(min_length=1, max_length=20)
     transcript: str = Field(min_length=1, max_length=5000)
     dialect: str = Field(min_length=2, max_length=64)
-    voice_name: str = Field(pattern="^(Aoede|Charon)$")
+    voice_name: str = Field(pattern="^(Aoede|Charon|Kore|Fenrir|Puck)$")
     user_email: Optional[str] = None
     google_id_token: Optional[str] = None
     user_byok_key: Optional[str] = None
@@ -1307,6 +1409,17 @@ class RoomManager:
                     for message in visible_history
                 ],
             })
+            active_call = self.voice_calls.get(room_id)
+            if active_call:
+                await connection.websocket.send_json({
+                    "type": "voice_session.started",
+                    "call_id": active_call["call_id"],
+                    "voice_name": active_call.get("voice_name", "Aoede"),
+                    "started_by": active_call["started_by"],
+                    "started_at": active_call["started_at"],
+                    "participants": self._active_users(room_id),
+                    "is_rejoin": True,
+                })
             await self._presence(room_id)
             for message in self.messages[room_id].values():
                 if message["delivered_to"]:
@@ -1328,6 +1441,16 @@ class RoomManager:
     async def disconnect(self, room_id: str, websocket: WebSocket):
         async with self.lock:
             connection = self.identities.get(websocket)
+            call = self.voice_calls.get(room_id)
+            if connection and call and connection.client_id in call.get("participants", set()):
+                call["participants"].discard(connection.client_id)
+                for peer in list(self.connections.get(room_id, set())):
+                    if peer is not websocket:
+                        await peer.send_json({
+                            "type": "PEER_LEFT",
+                            "call_id": call["call_id"],
+                            "peer_id": connection.client_id,
+                        })
             self.connections.get(room_id, set()).discard(websocket)
             self.identities.pop(websocket, None)
             if not self.connections.get(room_id):
@@ -1421,11 +1544,17 @@ class RoomManager:
                 if not call_id or len(call_id) > 80:
                     await websocket.send_json({"type": "error", "detail": "A valid voice session ID is required."})
                     return
+                voice_name = str(event.get("voice_name") or "Aoede")
+                if voice_name not in {"Aoede", "Charon", "Kore", "Fenrir", "Puck"}:
+                    await websocket.send_json({"type": "error", "detail": "Voice persona is invalid."})
+                    return
                 call = {
                     "call_id": call_id,
+                    "voice_name": voice_name,
                     "started_by": connection.client_id,
                     "started_at": datetime.now(timezone.utc).isoformat(),
                     "responders": set(),
+                    "participants": {connection.client_id},
                 }
                 self.voice_calls[room_id] = call
                 participants = self._active_users(room_id)
@@ -1433,9 +1562,107 @@ class RoomManager:
                     await peer.send_json({
                         "type": "voice_session.started",
                         "call_id": call_id,
+                        "voice_name": voice_name,
                         "started_by": connection.client_id,
                         "started_at": call["started_at"],
                         "participants": participants,
+                    })
+            elif event_type == "INCOMING_CALL":
+                call_id = str(event.get("call_id") or "")
+                call = self.voice_calls.get(room_id)
+                if (
+                    not call
+                    or call.get("call_id") != call_id
+                    or connection.client_id not in call.get("participants", set())
+                ):
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "The active voice session could not be invited.",
+                    })
+                    return
+                for peer in list(self.connections.get(room_id, set())):
+                    recipient = self.identities.get(peer)
+                    if peer is websocket or recipient is None:
+                        continue
+                    await peer.send_json({
+                        "type": "INCOMING_CALL",
+                        "call_id": call_id,
+                        "room_id": room_id,
+                        "inviter": {
+                            "user_id": connection.client_id,
+                            "display_name": connection.display_name,
+                            "avatar_url": connection.avatar_url,
+                        },
+                    })
+            elif event_type in {"USER_JOINED_CALL", "USER_LEFT_CALL"}:
+                call = self.voice_calls.get(room_id)
+                call_id = str(event.get("call_id") or "")
+                if not call or call.get("call_id") != call_id:
+                    await websocket.send_json({"type": "error", "detail": "Voice session was not found."})
+                    return
+                participants = call.setdefault("participants", set())
+                if event_type == "USER_JOINED_CALL":
+                    participants.add(connection.client_id)
+                    outbound = {
+                        "type": "PEER_JOINED",
+                        "call_id": call_id,
+                        "peer_id": connection.client_id,
+                        "peer": {
+                            "id": connection.client_id,
+                            "name": connection.display_name,
+                            "avatar_url": connection.avatar_url,
+                        },
+                    }
+                else:
+                    participants.discard(connection.client_id)
+                    outbound = {
+                        "type": "PEER_LEFT",
+                        "call_id": call_id,
+                        "peer_id": connection.client_id,
+                    }
+                for peer in list(self.connections.get(room_id, set())):
+                    if peer is not websocket:
+                        await peer.send_json(outbound)
+            elif event_type in {"CALL_OFFER", "CALL_ANSWER", "ICE_CANDIDATE"}:
+                call = self.voice_calls.get(room_id)
+                call_id = str(event.get("call_id") or "")
+                target_id = str(event.get("target_id") or "")
+                participants = call.get("participants", set()) if call else set()
+                if (
+                    not call
+                    or call.get("call_id") != call_id
+                    or connection.client_id not in participants
+                    or target_id not in participants
+                    or target_id == connection.client_id
+                ):
+                    await websocket.send_json({"type": "error", "detail": "WebRTC signal target is not an active call participant."})
+                    return
+                signal = event.get("signal")
+                if event_type == "ICE_CANDIDATE":
+                    signal = event.get("candidate", signal)
+                if not isinstance(signal, dict):
+                    await websocket.send_json({"type": "error", "detail": "WebRTC signal payload is invalid."})
+                    return
+                for peer in list(self.connections.get(room_id, set())):
+                    recipient = self.identities.get(peer)
+                    if recipient and recipient.client_id == target_id:
+                        await peer.send_json({
+                            "type": event_type,
+                            "call_id": call_id,
+                            "sender_id": connection.client_id,
+                            "signal": signal,
+                            "candidate": signal if event_type == "ICE_CANDIDATE" else None,
+                        })
+            elif event_type == "UPDATE_USER_LANGUAGE":
+                language = str(event.get("language") or event.get("language_code") or "")
+                if not re.fullmatch(r"[a-z]{2,3}(?:-[A-Z]{2})?", language):
+                    await websocket.send_json({"type": "error", "detail": "Language code is invalid."})
+                    return
+                for peer in list(self.connections.get(room_id, set())):
+                    await peer.send_json({
+                        "type": "USER_LANGUAGE_UPDATED",
+                        "user_id": connection.client_id,
+                        "language": language,
                     })
             elif event_type == "voice_session.turn":
                 call_id = str(event.get("call_id") or "")
@@ -1487,6 +1714,12 @@ class RoomManager:
                 call = self.voice_calls.get(room_id)
                 if not call or call.get("call_id") != call_id:
                     await websocket.send_json({"type": "error", "detail": "Voice session was not found."})
+                    return
+                if call.get("started_by") != connection.client_id:
+                    await websocket.send_json({
+                        "type": "error",
+                        "detail": "Only the call initiator can end the shared voice session.",
+                    })
                     return
                 self.voice_calls.pop(room_id, None)
                 for peer in list(self.connections.get(room_id, set())):
@@ -1793,31 +2026,238 @@ class RoomManager:
 room_manager = RoomManager()
 
 
+async def get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Google sign-in is required.")
+    identity = await asyncio.to_thread(
+        verified_identity_from_token,
+        authorization.removeprefix("Bearer ").strip(),
+        request,
+    )
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        row = connection.execute(
+            """
+            SELECT is_admin, is_vip, vip_expires_at
+            FROM user_registry WHERE user_id = ?
+            """,
+            (identity["sub"],),
+        ).fetchone()
+    vip_expires_at = row[2] if row else None
+    is_active_vip = bool(
+        row
+        and row[1]
+        and vip_expires_at
+        and vip_expires_at > datetime.now(timezone.utc).isoformat()
+    )
+    return {
+        **identity,
+        "is_admin": bool(row and row[0]),
+        "is_vip": is_active_vip,
+    }
+
+
+@app.get("/admin/telemetry", include_in_schema=False)
+@app.get("/api/py/admin/telemetry", include_in_schema=False)
 @app.get("/api/admin/telemetry")
 async def get_admin_telemetry(
-    admin_identity: Dict[str, Any] = Depends(verify_super_admin),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    del admin_identity
+    authenticated_email = str(current_user.get("email") or "").strip().lower()
+    if not (
+        current_user.get("is_admin") is True
+        or current_user.get("is_vip") is True
+        or authenticated_email == ADMIN_EMAIL
+    ):
+        raise HTTPException(status_code=403, detail="Administrator access is required.")
+    now = datetime.now(timezone.utc).isoformat()
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
-        registered_users = connection.execute(
+        total_registered = connection.execute(
+            "SELECT COUNT(*) FROM user_registry"
+        ).fetchone()[0]
+        active_vips = connection.execute(
             """
-            SELECT
-                COUNT(*),
-                SUM(CASE WHEN tenant_id = '' THEN 1 ELSE 0 END),
-                SUM(CASE WHEN tenant_id != '' THEN 1 ELSE 0 END)
-            FROM user_registry
-            """
-        ).fetchone()
-    presence = room_manager.telemetry_presence()
+            SELECT COUNT(*) FROM user_registry
+            WHERE is_vip = 1 AND vip_expires_at IS NOT NULL AND vip_expires_at > ?
+            """,
+            (now,),
+        ).fetchone()[0]
     return {
-        "total_registered_users": {
-            "total": int(registered_users[0] or 0),
-            "personal": int(registered_users[1] or 0),
-            "workspace": int(registered_users[2] or 0),
-        },
-        "active_connections_count": len(room_manager.identities),
-        "live_active_users": presence,
+        "total_registered": int(total_registered or 0),
+        "live_active": len(room_manager.identities),
+        "active_vips": int(active_vips or 0),
+        "vip_pool_remaining": max(0, 20 - int(active_vips or 0)),
     }
+
+
+@app.post("/api/vip/claim-secret-pass")
+async def claim_vip_secret_pass(
+    payload: Dict[str, Any],
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    code = payload.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise HTTPException(status_code=422, detail="A TOTP code is required.")
+    try:
+        totp = pyotp.TOTP(os.getenv("ADMIN_TOTP_SECRET", "BASE32SECRET3232"))
+        valid_code = totp.verify(code.strip(), valid_window=1)
+    except (TypeError, ValueError) as error:
+        logger.exception("The configured administrator TOTP secret is invalid.")
+        raise HTTPException(status_code=500, detail="VIP claim verification is unavailable.") from error
+    if not valid_code:
+        raise HTTPException(status_code=403, detail="Invalid secret pass code.")
+
+    requested_days = payload.get("days", 7)
+    if isinstance(requested_days, bool) or not isinstance(requested_days, int):
+        requested_days = 7
+    days = max(1, min(7, requested_days))
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    expires_at = (now + timedelta(days=days)).isoformat()
+    try:
+        with closing(sqlite3.connect(ARCHIVE_DB_PATH, timeout=15)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            user_id = str(current_user["sub"])
+            active_vips = connection.execute(
+                """
+                SELECT COUNT(*) FROM user_registry
+                WHERE is_vip = 1 AND vip_expires_at IS NOT NULL AND vip_expires_at > ?
+                  AND user_id != ?
+                """,
+                (now_iso, user_id),
+            ).fetchone()[0]
+            if int(active_vips or 0) >= VIP_SESSION_LIMIT:
+                connection.rollback()
+                raise HTTPException(status_code=409, detail="VIP capacity full.")
+
+            account = connection.execute(
+                "SELECT user_id FROM user_registry WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if not account:
+                email = str(current_user["email"]).strip().lower()
+                connection.execute(
+                    """
+                    INSERT INTO user_registry
+                        (user_id, email, display_name, avatar_url, mobile_number, recovery_email,
+                         terms_accepted_at, created_at, updated_at, is_admin)
+                    VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        email,
+                        str(current_user.get("name") or email)[:120],
+                        str(current_user.get("picture") or "")[:2048],
+                        now_iso,
+                        now_iso,
+                        int(current_user["email"].strip().lower() in {*ADMIN_EMAILS, SUPER_ADMIN_IDENTIFIER}),
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE user_registry
+                SET is_vip = 1, vip_duration_type = ?, vip_expires_at = ?, updated_at = ?
+                WHERE user_id = ?
+                """,
+                (f"{days}_days", expires_at, now_iso, user_id),
+            )
+            connection.commit()
+    except HTTPException:
+        raise
+    except sqlite3.Error as error:
+        logger.exception("VIP claim could not be persisted.")
+        raise HTTPException(status_code=503, detail="VIP claim could not be saved.") from error
+    return {"status": "SUCCESS", "expires_at": expires_at}
+
+
+@app.get("/disclaimer", response_class=HTMLResponse)
+async def byok_ai_platform_disclaimer():
+    return HTMLResponse(
+        content="""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Bring Your Own Key and AI platform liability disclaimer for Personal AI Genie">
+<title>BYOK &amp; AI Platform Liability Disclaimer</title>
+<style>
+:root{color-scheme:dark;background:#070b12;color:#e5edf7;font:16px/1.7 system-ui,-apple-system,Segoe UI,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#10233a 0,#070b12 55%);min-height:100vh}
+main{max-width:900px;margin:0 auto;padding:64px 24px 80px}header{border-bottom:1px solid #164e63;padding-bottom:28px;margin-bottom:32px}
+.eyebrow{color:#67e8f9;text-transform:uppercase;letter-spacing:.16em;font-size:.75rem;font-weight:700}
+h1{font-size:clamp(2rem,6vw,3.5rem);line-height:1.1;letter-spacing:-.04em;margin:.6rem 0}
+h2{font-size:1.25rem;color:#a5f3fc;margin:0 0 8px}section{padding:22px 24px;margin:16px 0;border:1px solid #164e63;border-radius:18px;background:#0b1420}
+p{margin:0;color:#c5d1df}footer{margin-top:32px;color:#8292a6;font-size:.85rem}
+a{color:#67e8f9}
+</style></head><body><main><header><div class="eyebrow">Personal AI Genie · Legal</div>
+<h1>Bring Your Own Key (BYOK) &amp; AI Platform Liability Disclaimer</h1>
+<p>Effective October 13, 2026. Please review these terms before connecting a third-party AI provider.</p></header>
+<section><h2>User responsibility for billing and quotas</h2><p>You are responsible for the Google Cloud, Google AI Studio, or other provider account connected with your API key, including its billing settings, usage limits, quota management, and compliance with that provider's terms. Provider usage may incur charges directly on your account.</p></section>
+<section><h2>Zero platform liability for third-party services</h2><p>Personal AI Genie does not control third-party pricing, rate limits, availability, account enforcement, or provider decisions. To the extent permitted by law, the platform is not responsible for third-party charges, service interruptions, quota exhaustion, or actions taken by a provider against your account.</p></section>
+<section><h2>Advisory AI output</h2><p>AI-generated output may be incomplete, inaccurate, insecure, or unsuitable for your needs. You are responsible for independently reviewing and validating generated code, commands, and recommendations before use, especially in production or safety-sensitive environments.</p></section>
+<section><h2>Zero key pooling</h2><p>Your BYOK credentials are client-isolated and are not pooled, shared with other users, or used to fund another user's requests. You authorize the selected provider to process requests using your own credential and account.</p></section>
+<footer>Use of this service remains subject to applicable law and the terms of your chosen AI provider.</footer>
+</main></body></html>"""
+    )
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def zero_knowledge_privacy_policy():
+    return HTMLResponse(
+        content="""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Zero-Knowledge Privacy Policy for Personal AI Genie">
+<title>Zero-Knowledge Privacy Policy</title>
+<style>
+:root{color-scheme:dark;background:#070b12;color:#e5edf7;font:16px/1.7 system-ui,-apple-system,Segoe UI,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#10233a 0,#070b12 55%);min-height:100vh}
+main{max-width:900px;margin:0 auto;padding:64px 24px 80px}header{border-bottom:1px solid #164e63;padding-bottom:28px;margin-bottom:32px}
+.eyebrow{color:#67e8f9;text-transform:uppercase;letter-spacing:.16em;font-size:.75rem;font-weight:700}
+h1{font-size:clamp(2rem,6vw,3.5rem);line-height:1.1;letter-spacing:-.04em;margin:.6rem 0}
+h2{font-size:1.25rem;color:#a5f3fc;margin:0 0 8px}section{padding:22px 24px;margin:16px 0;border:1px solid #164e63;border-radius:18px;background:#0b1420}
+p{margin:0;color:#c5d1df}footer{margin-top:32px;color:#8292a6;font-size:.85rem}
+</style></head><body><main><header><div class="eyebrow">Personal AI Genie · Privacy</div>
+<h1>Zero-Knowledge Privacy Policy</h1>
+<p>Effective October 13, 2026. This policy describes identity, content, telemetry, and credential handling.</p></header>
+<section><h2>Zero-retention architecture</h2><p>We do not mine or train AI models on your chats or WebRTC audio. Room communications are encrypted client-side before relay; AI context is shared with an AI provider only when you explicitly invoke an AI feature. Third-party providers may process submitted requests under their own terms.</p></section>
+<section><h2>Deterministic Google Sign-In identity</h2><p>Google Sign-In is used to verify account identity and associate account-owned features with a stable Google subject identifier. We use verified identity claims for authentication and do not infer identity from chat content.</p></section>
+<section><h2>Aggregate-only administrator telemetry</h2><p>Administrator telemetry exposes only aggregate registered-account counts, current WebSocket connection counts, active VIP counts, and remaining VIP capacity. It does not expose individual names, email addresses, room identifiers, message contents, or personal activity.</p></section>
+<section><h2>Instant credential erasure and key revocation</h2><p>You can erase credentials stored in your browser through the application's credential-clearing controls. Removing or rotating a provider key revokes the application's ability to use that key; you should also revoke it with the provider. Clearing browser storage removes local credentials and locally held encryption material.</p></section>
+<footer>Questions about privacy may be directed to the service operator through the contact information published with the application.</footer>
+</main></body></html>"""
+    )
+
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_of_service():
+    return HTMLResponse(
+        content="""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Terms of Service for Personal AI Genie">
+<title>Terms of Service | Personal AI Genie</title>
+<style>
+:root{color-scheme:dark;background:#070b12;color:#e5edf7;font:16px/1.7 system-ui,-apple-system,Segoe UI,sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#10233a 0,#070b12 55%);min-height:100vh}
+main{max-width:900px;margin:0 auto;padding:64px 24px 80px}header{border-bottom:1px solid #164e63;padding-bottom:28px;margin-bottom:32px}
+.eyebrow{color:#67e8f9;text-transform:uppercase;letter-spacing:.16em;font-size:.75rem;font-weight:700}
+h1{font-size:clamp(2rem,6vw,3.5rem);line-height:1.1;letter-spacing:-.04em;margin:.6rem 0}
+h2{font-size:1.25rem;color:#a5f3fc;margin:0 0 8px}section{padding:22px 24px;margin:16px 0;border:1px solid #164e63;border-radius:18px;background:#0b1420}
+p{margin:0;color:#c5d1df}footer{margin-top:32px;color:#8292a6;font-size:.85rem}
+</style></head><body><main><header><div class="eyebrow">Personal AI Genie · Legal</div>
+<h1>Terms of Service</h1>
+<p>Effective October 13, 2026. These terms govern your access to and use of Personal AI Genie.</p></header>
+<section><h2>1. Agreement and eligibility</h2><p>By accessing or using Personal AI Genie, you agree to these Terms. If you use the service for an organization, you represent that you are authorized to accept these Terms on its behalf. Do not use the service if you do not agree.</p></section>
+<section><h2>2. Accounts and security</h2><p>You are responsible for the accuracy of information associated with your account, safeguarding your sign-in credentials, and activity performed through your account. Notify the service operator promptly if you believe your account or credentials have been compromised.</p></section>
+<section><h2>3. Acceptable use</h2><p>Use the service only for lawful purposes and in compliance with applicable laws and third-party terms. Do not attempt to disrupt, probe, or gain unauthorized access to the service; misuse another person's account or data; or use the service to create or distribute unlawful, harmful, or infringing material.</p></section>
+<section><h2>4. Your content and shared rooms</h2><p>You retain rights to content you provide. You grant the service only the limited permissions needed to operate features you request, such as relaying encrypted room messages or processing a prompt through an AI provider you select. You are responsible for having permission to share content with room participants and third-party providers. Room participants may independently retain or disclose information they can access.</p></section>
+<section><h2>5. AI providers and generated output</h2><p>AI features may rely on third-party providers and are subject to their availability and terms. AI output can be inaccurate or incomplete and is provided for informational assistance, not as professional advice. Review and independently validate output, including code, before relying on or deploying it. BYOK billing, quotas, and provider-account responsibilities are described in the <a href="/disclaimer" style="color:#67e8f9">BYOK &amp; AI Platform Liability Disclaimer</a>.</p></section>
+<section><h2>6. Privacy</h2><p>Our handling of identity, room communications, telemetry, and credentials is described in the <a href="/privacy" style="color:#67e8f9">Zero-Knowledge Privacy Policy</a>. Review that policy before using the service.</p></section>
+<section><h2>7. Service availability and changes</h2><p>We may update, suspend, or discontinue all or part of the service for operational, security, or legal reasons. We may revise these Terms; material revisions will be reflected by updating this page and its effective date. Continued use after revised terms take effect constitutes acceptance where permitted by law.</p></section>
+<section><h2>8. Disclaimers and limitation of liability</h2><p>To the extent permitted by law, the service is provided on an “as available” basis without warranties of uninterrupted availability, accuracy, or fitness for a particular purpose. To the extent permitted by law, the service operator will not be liable for indirect, incidental, special, consequential, or punitive damages, or loss of data, profits, or goodwill, arising from your use of the service or third-party services. Nothing in these Terms excludes liability that cannot lawfully be excluded.</p></section>
+<section><h2>9. Suspension and termination</h2><p>You may stop using the service at any time. Access may be suspended or terminated if reasonably necessary to address a security risk, legal requirement, material breach of these Terms, or harm to users or the service. Provisions that by their nature should continue after termination will survive.</p></section>
+<section><h2>10. General</h2><p>These Terms do not limit rights that cannot be waived under applicable law. If any provision is unenforceable, the remaining provisions remain in effect. These Terms and any dispute concerning them are subject to applicable law and any mandatory consumer protections in your jurisdiction.</p></section>
+<footer>For questions about these Terms, contact the service operator using the contact information published with the application.</footer>
+</main></body></html>"""
+    )
 
 
 def verified_identity_from_token(
@@ -1887,6 +2327,7 @@ async def enforce_personal_api_scope(request: Request, call_next):
 
 @app.get("/api/auth/session-scope")
 async def get_verified_session_scope(
+    request: Request,
     authorization: Optional[str] = Header(default=None),
 ):
     if not authorization or not authorization.startswith("Bearer "):
@@ -1894,7 +2335,11 @@ async def get_verified_session_scope(
     identity = await asyncio.to_thread(
         verified_identity_from_token,
         authorization.removeprefix("Bearer ").strip(),
+        request,
     )
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            ensure_social_user(connection, identity)
     return {
         "scope": "workspace" if verified_workspace_tenant(identity) else "personal",
         "tenant_id": verified_workspace_tenant(identity),
@@ -1903,6 +2348,530 @@ async def get_verified_session_scope(
         "corporate_avatar_url": identity.get("picture", ""),
         "is_super_admin": identity["email"].strip().lower() == SUPER_ADMIN_IDENTIFIER,
     }
+
+
+def ensure_social_user(connection: sqlite3.Connection, identity: Dict[str, str]) -> str:
+    google_sub = str(identity["sub"])
+    email = str(identity["email"]).strip().lower()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = connection.execute(
+        "SELECT id FROM users WHERE google_sub = ?", (google_sub,)
+    ).fetchone()
+    user_id = existing[0] if existing else str(uuid.uuid4())
+    connection.execute(
+        """
+        INSERT INTO users (id, email, display_name, avatar_url, google_sub, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(google_sub) DO UPDATE SET
+            email = excluded.email,
+            display_name = excluded.display_name,
+            avatar_url = excluded.avatar_url
+        """,
+        (
+            user_id,
+            email,
+            str(identity.get("name") or email)[:120],
+            str(identity.get("picture") or "")[:2048],
+            google_sub,
+            now,
+        ),
+    )
+    return user_id
+
+
+def social_identity_from_request(
+    request: Request,
+    authorization: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    bearer = (
+        authorization.removeprefix("Bearer ").strip()
+        if authorization and authorization.startswith("Bearer ")
+        else ""
+    )
+    token = bearer or str((payload or {}).get("google_id_token") or "")
+    if token == "dev-token-local-bypass" and not (
+        DEV_AUTH_BYPASS_ENABLED and is_local_development_request(request)
+    ):
+        raise HTTPException(status_code=401, detail="Development sign-in is only available from localhost.")
+    return verified_identity_from_token(token, request)
+
+
+@app.post("/api/auth/google")
+async def google_social_login(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    token = str(
+        payload.get("google_id_token")
+        or payload.get("id_token")
+        or (authorization.removeprefix("Bearer ") if authorization else "")
+    ).strip()
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, None, {"google_id_token": token}
+    )
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            user_id = ensure_social_user(connection, identity)
+    session_token = create_internal_session_token(identity)
+    return {
+        "token": session_token,
+        "session_token": session_token,
+        "user": {
+            "id": user_id,
+            "google_sub": identity["sub"],
+            "email": identity["email"],
+            "display_name": identity.get("name", ""),
+            "avatar_url": identity.get("picture", ""),
+        },
+    }
+
+
+@app.post("/api/auth/claim-handle")
+async def claim_social_handle(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    handle = str(payload.get("handle") or "").strip().removeprefix("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", handle):
+        raise HTTPException(
+            status_code=422,
+            detail="Handle must be 3-30 characters and contain only letters, numbers, and underscores.",
+        )
+    try:
+        with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+            with connection:
+                user_id = ensure_social_user(connection, identity)
+                connection.execute(
+                    "UPDATE users SET handle = ? WHERE id = ?", (handle, user_id)
+                )
+                connection.execute(
+                    """
+                    INSERT INTO social_directory
+                        (user_id, display_name, handle, avatar_url, meta_user_id, email, updated_at)
+                    VALUES (?, ?, ?, ?, '', ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        handle = excluded.handle, updated_at = excluded.updated_at
+                    """,
+                    (
+                        identity["sub"],
+                        identity.get("name") or identity["email"],
+                        handle,
+                        identity.get("picture") or "",
+                        identity["email"],
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+    except sqlite3.IntegrityError as error:
+        raise HTTPException(status_code=409, detail="That handle is already claimed.") from error
+    return {"handle": handle, "user_id": user_id}
+
+
+def resolve_social_user(connection: sqlite3.Connection, target: str) -> Optional[sqlite3.Row]:
+    normalized = target.strip().removeprefix("@")
+    connection.row_factory = sqlite3.Row
+    return connection.execute(
+        """
+        SELECT id, google_sub, email, handle, display_name, avatar_url
+        FROM users WHERE id = ? OR google_sub = ? OR handle = ? COLLATE NOCASE
+        """,
+        (normalized.removeprefix("google:"), normalized.removeprefix("google:"), normalized),
+    ).fetchone()
+
+
+@app.post("/api/friends/request")
+async def create_relational_friend_request(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    target = str(payload.get("target_id") or payload.get("target_user_id") or "").strip()
+    if not target:
+        raise HTTPException(status_code=422, detail="A target user ID or handle is required.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            requester_id = ensure_social_user(connection, identity)
+            recipient = resolve_social_user(connection, target)
+            if recipient is None:
+                raise HTTPException(status_code=404, detail="Registered user was not found.")
+            if recipient["id"] == requester_id:
+                raise HTTPException(status_code=400, detail="You cannot friend-request yourself.")
+            if are_users_blocked(identity["sub"], recipient["google_sub"]):
+                raise HTTPException(status_code=403, detail="This relationship is unavailable because of a block.")
+            relation = connection.execute(
+                "SELECT id, status FROM friendships WHERE requester_id = ? AND addressee_id = ?",
+                (requester_id, recipient["id"]),
+            ).fetchone()
+            incoming = connection.execute(
+                "SELECT status FROM friendships WHERE requester_id = ? AND addressee_id = ?",
+                (recipient["id"], requester_id),
+            ).fetchone()
+            if relation and relation[1] == "ACCEPTED" or incoming and incoming[0] == "ACCEPTED":
+                return {"status": "already_friends"}
+            if incoming and incoming[0] == "PENDING":
+                raise HTTPException(status_code=409, detail="This user has already sent you a friend request.")
+            connection.execute(
+                """
+                INSERT INTO friendships (id, requester_id, addressee_id, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'PENDING', ?, ?)
+                ON CONFLICT(requester_id, addressee_id) DO UPDATE SET
+                    status = 'PENDING', created_at = excluded.created_at, updated_at = excluded.updated_at
+                """,
+                (str(uuid.uuid4()), requester_id, recipient["id"], now, now),
+            )
+    async with room_manager.lock:
+        for websocket, connection in list(room_manager.identities.items()):
+            if connection.client_id == f"google:{recipient['google_sub']}":
+                await websocket.send_json({
+                    "type": "FRIEND_REQUEST_RECEIVED",
+                    "requester": {
+                        "user_id": identity["sub"],
+                        "display_name": identity.get("name") or identity["email"],
+                        "avatar_url": identity.get("picture") or "",
+                    },
+                })
+    return {"status": "PENDING"}
+
+
+@app.post("/api/friends/respond")
+async def respond_relational_friend_request(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    requester = str(payload.get("requester_id") or "").strip()
+    status = str(payload.get("status") or payload.get("response") or "").upper()
+    status = {"ACCEPT": "ACCEPTED", "ACCEPTED": "ACCEPTED", "REJECT": "REJECTED", "REJECTED": "REJECTED"}.get(status, "")
+    if not requester or not status:
+        raise HTTPException(status_code=422, detail="A requester ID and ACCEPTED or REJECTED status are required.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            addressee_id = ensure_social_user(connection, identity)
+            requester_user = resolve_social_user(connection, requester)
+            if requester_user is None:
+                raise HTTPException(status_code=404, detail="Friend request was not found.")
+            updated = connection.execute(
+                """
+                UPDATE friendships SET status = ?, updated_at = ?
+                WHERE requester_id = ? AND addressee_id = ? AND status = 'PENDING'
+                """,
+                (status, now, requester_user["id"], addressee_id),
+            )
+            if updated.rowcount != 1:
+                raise HTTPException(status_code=404, detail="Friend request is no longer available.")
+    return {"status": status}
+
+
+@app.get("/api/friends/list")
+async def list_relational_friends(
+    request: Request, authorization: Optional[str] = Header(default=None)
+):
+    identity = await asyncio.to_thread(social_identity_from_request, request, authorization)
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            user_id = ensure_social_user(connection, identity)
+        rows = connection.execute(
+            """
+            SELECT u.id, u.google_sub, u.handle, u.display_name, u.avatar_url
+            FROM friendships f JOIN users u
+              ON u.id = CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END
+            WHERE f.status = 'ACCEPTED' AND (f.requester_id = ? OR f.addressee_id = ?)
+            ORDER BY u.display_name COLLATE NOCASE
+            """,
+            (user_id, user_id, user_id),
+        ).fetchall()
+    return {"friends": [
+        {
+            "user_id": row[0],
+            "google_sub": row[1],
+            "handle": row[2],
+            "display_name": row[3],
+            "avatar_url": row[4],
+            "online": room_manager._presence_status(f"google:{row[1]}") == "active",
+        }
+        for row in rows
+    ]}
+
+
+@app.get("/api/friends/pending")
+async def list_relational_pending_requests(
+    request: Request, authorization: Optional[str] = Header(default=None)
+):
+    identity = await asyncio.to_thread(social_identity_from_request, request, authorization)
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            user_id = ensure_social_user(connection, identity)
+        rows = connection.execute(
+            """
+            SELECT u.id, u.google_sub, u.handle, u.display_name, u.avatar_url, f.created_at
+            FROM friendships f JOIN users u ON u.id = f.requester_id
+            WHERE f.addressee_id = ? AND f.status = 'PENDING'
+            ORDER BY f.created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return {"requests": [
+        {
+            "user_id": row[0],
+            "google_sub": row[1],
+            "handle": row[2],
+            "display_name": row[3],
+            "avatar_url": row[4],
+            "created_at": row[5],
+        }
+        for row in rows
+    ]}
+
+
+@app.get("/api/friends/mutual/{target_id}")
+async def list_mutual_friends(
+    target_id: str, request: Request, authorization: Optional[str] = Header(default=None)
+):
+    identity = await asyncio.to_thread(social_identity_from_request, request, authorization)
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            current_id = ensure_social_user(connection, identity)
+        target = resolve_social_user(connection, target_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Registered user was not found.")
+        rows = connection.execute(
+            """
+            SELECT u.id, u.google_sub, u.handle, u.display_name, u.avatar_url
+            FROM users u
+            WHERE u.id NOT IN (?, ?)
+              AND EXISTS (
+                SELECT 1 FROM friendships f
+                WHERE f.status = 'ACCEPTED'
+                  AND ((f.requester_id = ? AND f.addressee_id = u.id)
+                    OR (f.addressee_id = ? AND f.requester_id = u.id))
+              )
+              AND EXISTS (
+                SELECT 1 FROM friendships f
+                WHERE f.status = 'ACCEPTED'
+                  AND ((f.requester_id = ? AND f.addressee_id = u.id)
+                    OR (f.addressee_id = ? AND f.requester_id = u.id))
+              )
+            """,
+            (current_id, target["id"], current_id, current_id, target["id"], target["id"]),
+        ).fetchall()
+    return {"friends": [
+        {"user_id": row[0], "google_sub": row[1], "handle": row[2], "display_name": row[3], "avatar_url": row[4]}
+        for row in rows
+        if not are_users_blocked(identity["sub"], row[1])
+        and not are_users_blocked(target["google_sub"], row[1])
+    ]}
+
+
+@app.post("/api/friends/sync")
+async def sync_social_profiles(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    profiles = payload.get("profiles") or payload.get("social_profiles") or []
+    if not isinstance(profiles, list) or len(profiles) > 500:
+        raise HTTPException(status_code=422, detail="Supply up to 500 social profiles.")
+    matched = []
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            user_id = ensure_social_user(connection, identity)
+            for item in profiles:
+                if not isinstance(item, dict):
+                    continue
+                provider = str(item.get("provider") or "meta").lower()
+                provider_user_id = str(item.get("provider_user_id") or item.get("id") or "").strip()
+                handle = str(item.get("social_handle") or item.get("handle") or "").strip()[:120]
+                if provider not in {"meta", "google"} or not provider_user_id or len(provider_user_id) > 256:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO social_profiles (id, user_id, provider, provider_user_id, social_handle, synced_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(provider, provider_user_id) DO UPDATE SET
+                        user_id = excluded.user_id, social_handle = excluded.social_handle, synced_at = excluded.synced_at
+                    """,
+                    (str(uuid.uuid4()), user_id, provider, provider_user_id, handle, now),
+                )
+                registered = connection.execute(
+                    """
+                    SELECT id, handle, display_name, avatar_url FROM users
+                    WHERE lower(handle) = lower(?) OR google_sub = ?
+                    """,
+                    (handle.removeprefix("@"), provider_user_id),
+                ).fetchone()
+                if registered and registered[0] != user_id:
+                    matched.append({
+                        "user_id": registered[0],
+                        "handle": registered[1],
+                        "display_name": registered[2],
+                        "avatar_url": registered[3],
+                    })
+    return {"matched_users": matched}
+
+
+def deliver_workspace_session_minutes(recipients: List[str], room_title: str, minutes: str):
+    smtp_host = (os.getenv("SMTP_HOST") or os.getenv("GENIE_SMTP_HOST") or "").strip()
+    smtp_user = (os.getenv("SMTP_USER") or os.getenv("GENIE_SMTP_USER") or "").strip()
+    smtp_password = os.getenv("SMTP_PASS") or os.getenv("GENIE_SMTP_PASSWORD") or ""
+    smtp_from = (os.getenv("SMTP_FROM") or os.getenv("GENIE_SMTP_FROM") or smtp_user).strip()
+    if not all((smtp_host, smtp_user, smtp_password, smtp_from)):
+        logger.error("Workspace session minutes could not be dispatched: SMTP is not configured.")
+        return
+    message = EmailMessage()
+    message["Subject"] = f"Meeting minutes: {room_title[:150]}"
+    message["From"] = smtp_from
+    message["To"] = ", ".join(recipients)
+    message.set_content(minutes)
+    message.add_alternative(
+        f"<!doctype html><html><body><h1>{html.escape(room_title[:150])}</h1>"
+        f"<pre style='white-space:pre-wrap'>{html.escape(minutes)}</pre></body></html>",
+        subtype="html",
+    )
+    try:
+        port = int(os.getenv("SMTP_PORT") or os.getenv("GENIE_SMTP_PORT", "587"))
+        if port == 465:
+            with smtplib.SMTP_SSL(smtp_host, port, timeout=15) as smtp:
+                smtp.login(smtp_user, smtp_password)
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_host, port, timeout=15) as smtp:
+                smtp.starttls()
+                smtp.login(smtp_user, smtp_password)
+                smtp.send_message(message)
+    except (OSError, smtplib.SMTPException, ValueError):
+        logger.exception("Workspace session minutes email dispatch failed.")
+
+
+@app.post("/api/rooms/{room_id}/end-session")
+async def end_social_room_session(
+    room_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            actor_id = ensure_social_user(connection, identity)
+        room = connection.execute(
+            "SELECT title, room_type FROM rooms WHERE id = ?", (room_id,)
+        ).fetchone()
+        if room is None:
+            raise HTTPException(status_code=404, detail="Room does not exist.")
+        participant = connection.execute(
+            "SELECT role FROM room_participants WHERE room_id = ? AND user_id = ?",
+            (room_id, actor_id),
+        ).fetchone()
+        if not participant or participant[0] != "host":
+            raise HTTPException(status_code=403, detail="Only the room host can end this session.")
+        messages = connection.execute(
+            """
+            SELECT sender_name, content FROM room_messages
+            WHERE room_id = ? ORDER BY created_at LIMIT 5000
+            """,
+            (room_id,),
+        ).fetchall()
+        recipients = [
+            row[0] for row in connection.execute(
+                """
+                SELECT DISTINCT u.email FROM room_participants p
+                JOIN users u ON u.id = p.user_id
+                WHERE p.room_id = ? AND u.email <> ''
+                """,
+                (room_id,),
+            ).fetchall()
+        ]
+    if not messages:
+        raise HTTPException(status_code=409, detail="There are no room messages to summarize.")
+    transcript = "\n".join(f"{name}: {content}" for name, content in messages)
+    prompt = (
+        "Return only a valid JSON object with keys summary_markdown (string) and "
+        "action_items (array of objects with task, owner, and due_date). Write concise executive "
+        "meeting minutes in English. Do not invent facts; use null when an owner or due date is unknown.\n\n"
+        f"Room type: {room[1]}\nTranscript:\n{transcript[:100000]}"
+    )
+    diagnostics: List[str] = []
+    summary = None
+    for model in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        if not GEMINI_MASTER_KEY:
+            break
+        summary = await asyncio.to_thread(
+            request_gemini_direct, model, GEMINI_MASTER_KEY, prompt, [], diagnostics
+        )
+        if summary:
+            break
+    if not summary and OPENROUTER_KEY:
+        summary = await asyncio.to_thread(
+            request_openrouter_model,
+            OPENROUTER_FREE_MODELS[0],
+            OPENROUTER_KEY,
+            prompt,
+            [],
+            diagnostics,
+        )
+    if not summary:
+        logger.error("Room summary generation failed: %s", "; ".join(diagnostics[-4:]))
+        raise HTTPException(status_code=503, detail="Meeting minutes could not be generated.")
+    try:
+        structured_summary = json.loads(summary)
+        if not isinstance(structured_summary, dict) or not isinstance(
+            structured_summary.get("summary_markdown"), str
+        ) or not isinstance(structured_summary.get("action_items"), list):
+            raise ValueError("The generated minutes have an invalid response shape.")
+        summary = structured_summary["summary_markdown"]
+        action_items = structured_summary["action_items"]
+    except (json.JSONDecodeError, ValueError) as error:
+        logger.error("Room summary was not valid structured JSON.")
+        raise HTTPException(status_code=502, detail="Meeting minutes were generated in an invalid format.") from error
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO session_summaries
+                    (id, room_id, room_type, summary_markdown, action_items_json, recipients_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), room_id, room[1], summary, json.dumps(action_items), json.dumps(recipients), now),
+            )
+    if room[1] == "workspace":
+        if not recipients:
+            raise HTTPException(status_code=409, detail="The workspace room has no participant email recipients.")
+        background_tasks.add_task(
+            deliver_workspace_session_minutes, recipients, room[0], summary
+        )
+        return {"room_type": "workspace", "status": "dispatch_queued", "summary_markdown": summary}
+    filename = re.sub(r"[^A-Za-z0-9_-]+", "-", room[0]).strip("-") or "room"
+    return JSONResponse(
+        content={
+            "room_type": "personal",
+            "filename": f"{filename}-minutes.json",
+            "summary_markdown": summary,
+            "action_items": action_items,
+            "export": {"markdown": summary, "action_items": action_items},
+        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}-minutes.json"'},
+    )
 
 
 def audit_workspace_action(identity: Dict[str, str], event_type: str, room_id: str = "workspace-chat"):
@@ -2576,7 +3545,8 @@ async def get_registration(
         row = connection.execute(
             """
             SELECT display_name, mobile_number, recovery_email, allow_room_invites,
-                   terms_accepted_at, is_creator, avatar_url, gender, privacy_accepted_at
+                   terms_accepted_at, is_creator, avatar_url, gender, privacy_accepted_at,
+                   mobile_verified
             FROM user_registry WHERE email = ? COLLATE NOCASE
             """,
             (requested_email,),
@@ -2614,6 +3584,7 @@ async def get_registration(
                 "email": requested_email,
                 "google_avatar_url": identity.get("picture", "") if identity and identity["email"].lower() == requested_email else "",
                 "mobile_number": row[1] or "",
+                "mobile_verified": bool(row[9]),
                 "recovery_email": row[2] or "",
                 "allow_room_invites": row[3],
                 "terms_accepted": bool(row[4]),
@@ -2637,6 +3608,7 @@ async def get_registration(
             "email": requested_email,
             "google_avatar_url": identity.get("picture", "") if identity else "",
             "mobile_number": row[1],
+            "mobile_verified": bool(row[9]),
             "recovery_email": row[2],
             "allow_room_invites": row[3],
             "terms_accepted": bool(row[4]),
@@ -3250,9 +4222,9 @@ async def complete_registration(request: Request, req: RegistrationRequest):
     avatar_url = req.avatar_url.strip()
     if req.avatar_type:
         avatar_options = {
-            "option_a": "/avatars/Profile 1.png",
-            "option_b": "/avatars/Profile 2.png",
-            "option_c": "/avatars/Profile 3.png",
+            "option_a": "/avatars/Profile-1.png",
+            "option_b": "/avatars/Profile-2.png",
+            "option_c": "/avatars/Profile-3.png",
         }
         avatar_url = avatar_options.get(req.avatar_type.strip().lower(), avatar_url)
     mobile_number = (req.phone or req.mobile_number).strip()
@@ -3265,6 +4237,9 @@ async def complete_registration(request: Request, req: RegistrationRequest):
         "genie-preset:vapor",
         "genie-preset:cosmic",
         "genie-preset:neutral",
+        "/avatars/Profile-1.png",
+        "/avatars/Profile-2.png",
+        "/avatars/Profile-3.png",
         "/avatars/Profile 1.png",
         "/avatars/Profile 2.png",
         "/avatars/Profile 3.png",
@@ -3315,12 +4290,17 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                 INSERT INTO user_registry
                     (user_id, email, display_name, avatar_url, mobile_number, recovery_email,
                      terms_accepted_at, allow_room_invites, is_creator, created_at, updated_at,
-                     privacy_accepted_at, tenant_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'mutual_friends', ?, ?, ?, ?, ?)
+                     privacy_accepted_at, tenant_id, is_admin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'mutual_friends', ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
                     email = excluded.email,
                     display_name = excluded.display_name,
                     avatar_url = excluded.avatar_url,
+                    mobile_verified = CASE
+                        WHEN user_registry.mobile_number = excluded.mobile_number
+                        THEN user_registry.mobile_verified
+                        ELSE 0
+                    END,
                     mobile_number = excluded.mobile_number,
                     recovery_email = excluded.recovery_email,
                     terms_accepted_at = CASE
@@ -3332,6 +4312,7 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                         ELSE user_registry.privacy_accepted_at
                     END,
                     updated_at = excluded.updated_at,
+                    is_admin = MAX(user_registry.is_admin, excluded.is_admin),
                     tenant_id = CASE
                         WHEN excluded.tenant_id != '' THEN excluded.tenant_id
                         ELSE user_registry.tenant_id
@@ -3345,11 +4326,12 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                     mobile_number,
                     recovery_email,
                     now,
-                    int(identity["email"].strip().lower() in ADMIN_EMAILS),
+                    int(identity["email"].strip().lower() in {*ADMIN_EMAILS, SUPER_ADMIN_IDENTIFIER}),
                     now,
                     now,
                     now,
                     verified_workspace_tenant(identity) or "",
+                    int(identity["email"].strip().lower() in ADMIN_EMAILS),
                 ),
             )
             connection.execute(
@@ -3372,14 +4354,18 @@ async def complete_registration(request: Request, req: RegistrationRequest):
                 ),
             )
             saved_avatar = connection.execute(
-                "SELECT avatar_url FROM user_registry WHERE user_id = ?",
+                "SELECT avatar_url, mobile_verified FROM user_registry WHERE user_id = ?",
                 (identity["sub"],),
-            ).fetchone()[0]
+            ).fetchone()
+            saved_avatar, mobile_verified = saved_avatar[0], bool(saved_avatar[1])
     session_token = create_internal_session_token(identity)
     avatar_type = {
         "genie-preset:guardian": "option_a",
         "genie-preset:vapor": "option_b",
         "genie-preset:cosmic": "option_c",
+        "/avatars/Profile-1.png": "option_a",
+        "/avatars/Profile-2.png": "option_b",
+        "/avatars/Profile-3.png": "option_c",
         "/avatars/Profile 1.png": "option_a",
         "/avatars/Profile 2.png": "option_b",
         "/avatars/Profile 3.png": "option_c",
@@ -3403,6 +4389,7 @@ async def complete_registration(request: Request, req: RegistrationRequest):
             "email": identity["email"],
             "google_avatar_url": identity.get("picture", ""),
             "mobile_number": mobile_number,
+            "mobile_verified": mobile_verified,
             "recovery_email": recovery_email,
             "allow_room_invites": "mutual_friends",
             "terms_accepted": True,
@@ -3431,6 +4418,9 @@ async def update_registered_profile(req: ProfileUpdateRequest):
         "genie-preset:guardian",
         "genie-preset:neutral",
         "genie-preset:cosmic",
+        "/avatars/Profile-1.png",
+        "/avatars/Profile-2.png",
+        "/avatars/Profile-3.png",
         "/avatars/Profile 1.png",
         "/avatars/Profile 2.png",
         "/avatars/Profile 3.png",
@@ -3475,10 +4465,11 @@ async def update_registered_profile(req: ProfileUpdateRequest):
                 """
                 UPDATE user_registry
                 SET display_name = ?, mobile_number = ?, recovery_email = ?,
-                    avatar_url = ?, gender = ?, updated_at = ?
+                    avatar_url = ?, gender = ?, updated_at = ?,
+                    mobile_verified = CASE WHEN mobile_number = ? THEN mobile_verified ELSE 0 END
                 WHERE user_id = ?
                 """,
-                (display_name, mobile_number, recovery_email, avatar_url, gender, now, identity["sub"]),
+                (display_name, mobile_number, recovery_email, avatar_url, gender, now, mobile_number, identity["sub"]),
             )
             if cursor.rowcount != 1:
                 raise HTTPException(status_code=404, detail="Registered profile was not found.")
@@ -3490,12 +4481,17 @@ async def update_registered_profile(req: ProfileUpdateRequest):
                 """,
                 (display_name, avatar_url, now, identity["sub"]),
             )
+            mobile_verified = bool(connection.execute(
+                "SELECT mobile_verified FROM user_registry WHERE user_id = ?",
+                (identity["sub"],),
+            ).fetchone()[0])
     return {
         "status": "updated",
         "profile": {
             "display_name": display_name,
             "email": identity["email"],
             "mobile_number": mobile_number,
+            "mobile_verified": mobile_verified,
             "recovery_email": recovery_email,
             "avatar_url": avatar_url,
             "gender": gender,
@@ -4544,6 +5540,29 @@ def get_account_limits(identity: Optional[Dict[str, str]]) -> Dict[str, Any]:
             "is_vip": True,
             "unlimited": True,
         }
+    is_active_vip = False
+    if identity:
+        with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+            entitlement = connection.execute(
+                """
+                SELECT is_vip, vip_expires_at FROM user_registry
+                WHERE user_id = ?
+                """,
+                (identity["sub"],),
+            ).fetchone()
+        is_active_vip = bool(
+            entitlement
+            and entitlement[0]
+            and entitlement[1]
+            and entitlement[1] > datetime.now(timezone.utc).isoformat()
+        )
+    if is_active_vip:
+        return {
+            "tier": "vip",
+            "chats_remaining": 999999,
+            "is_vip": True,
+            "unlimited": True,
+        }
     email = identity["email"].lower() if identity else ""
     with daily_message_counts_lock:
         used = daily_message_counts.get(
@@ -5339,6 +6358,13 @@ VOICE_SYSTEM_INSTRUCTION = (
     "State only the direct core logic in 2 to 3 natural sentences. "
     "Do not use markdown headers, bullet points, tables, asterisks, math formulas, or URLs."
 )
+VOICE_PERSONA_INSTRUCTIONS = {
+    "Aoede": "Use a soft, breezy, conversational delivery.",
+    "Charon": "Use a calm, steady, professional delivery.",
+    "Kore": "Use a firm, crisp, analytical delivery.",
+    "Fenrir": "Use a deep, authoritative, resolute delivery.",
+    "Puck": "Use a playful, witty, high-energy delivery.",
+}
 
 TTS_LANG_MAP = {
     "தமிழ்": "ta",
@@ -5471,6 +6497,7 @@ async def direct_voice_turn(
         voice_contents.append({"role": "user", "parts": [{"text": transcript}]})
     system_instruction = (
         f"{VOICE_SYSTEM_INSTRUCTION} Dialect: {req.dialect.strip()}."
+        f" Voice persona: {req.voice_name}. {VOICE_PERSONA_INSTRUCTIONS[req.voice_name]}"
         f"\n\n{req.system_text}".strip()
     )
     generated_text = ""
@@ -5577,32 +6604,107 @@ async def direct_voice_turn(
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         part["text"] = sanitize_voice_text(part["text"])
             generated_text = sanitize_voice_text(generated_text)
-            try:
-                dialect = req.dialect.strip()
-                cloud_language = GOOGLE_TTS_ONLY_DIALECTS.get(dialect)
-                if cloud_language:
-                    server_audio = await speak_text(
-                        TextToSpeechRequest(text=generated_text, lang=cloud_language)
+            audio_base64 = ""
+            audio_mime_type = "audio/mpeg"
+            if api_key:
+                try:
+                    tts_response = await client.post(
+                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent",
+                        params={"key": api_key},
+                        json={
+                            "contents": [{"parts": [{"text": generated_text}]}],
+                            "generationConfig": {
+                                "responseModalities": ["AUDIO"],
+                                "speechConfig": {
+                                    "voiceConfig": {
+                                        "prebuiltVoiceConfig": {"voiceName": req.voice_name}
+                                    }
+                                },
+                            },
+                        },
                     )
-                    audio_base64 = base64.b64encode(server_audio.body).decode("utf-8")
-                else:
-                    tts_lang = TTS_LANG_MAP.get(dialect, "en")
-                    audio_base64 = await asyncio.to_thread(
-                        synthesize_voice_audio,
-                        generated_text,
-                        tts_lang,
+                    if tts_response.status_code != 200:
+                        raise RuntimeError(
+                            f"Gemini voice synthesis failed (HTTP {tts_response.status_code})."
+                        )
+                    tts_data = tts_response.json()
+                    tts_candidates = tts_data.get("candidates") or []
+                    tts_content = tts_candidates[0].get("content") if tts_candidates else None
+                    tts_parts = tts_content.get("parts") if isinstance(tts_content, dict) else None
+                    audio_part = next(
+                        (
+                            part.get("inlineData")
+                            for part in (tts_parts or [])
+                            if isinstance(part, dict) and isinstance(part.get("inlineData"), dict)
+                        ),
+                        None,
                     )
-            except gTTSError as error:
-                logger.error("gTTS voice synthesis failed for dialect %r: %s", req.dialect, error)
-                raise HTTPException(
-                    status_code=502,
-                    detail="The speech synthesis provider could not complete the request.",
-                ) from error
+                    if not audio_part or not isinstance(audio_part.get("data"), str):
+                        raise ValueError("Gemini TTS returned no audio data.")
+                    raw_audio = base64.b64decode(audio_part["data"], validate=True)
+                    returned_mime = str(audio_part.get("mimeType") or "audio/pcm")
+                    if "pcm" in returned_mime.lower() or "l16" in returned_mime.lower():
+                        rate_match = re.search(r"rate=(\d+)", returned_mime)
+                        sample_rate = int(rate_match.group(1)) if rate_match else 24000
+                        if "l16" in returned_mime.lower():
+                            raw_audio = b"".join(
+                                raw_audio[offset : offset + 2][::-1]
+                                for offset in range(0, len(raw_audio) - 1, 2)
+                            )
+                        wav_buffer = io.BytesIO()
+                        with wave.open(wav_buffer, "wb") as wav_file:
+                            wav_file.setnchannels(1)
+                            wav_file.setsampwidth(2)
+                            wav_file.setframerate(sample_rate)
+                            wav_file.writeframes(raw_audio)
+                        raw_audio = wav_buffer.getvalue()
+                        audio_mime_type = "audio/wav"
+                    else:
+                        audio_mime_type = returned_mime
+                    audio_base64 = base64.b64encode(raw_audio).decode("utf-8")
+                except (
+                    httpx.TimeoutException,
+                    httpx.RequestError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    wave.Error,
+                ) as tts_error:
+                    logger.warning(
+                        "Gemini TTS for voice %s failed; using the configured speech fallback: %s",
+                        req.voice_name,
+                        tts_error,
+                    )
+
+            if not audio_base64:
+                try:
+                    dialect = req.dialect.strip()
+                    cloud_language = GOOGLE_TTS_ONLY_DIALECTS.get(dialect)
+                    if cloud_language:
+                        server_audio = await speak_text(
+                            TextToSpeechRequest(text=generated_text, lang=cloud_language)
+                        )
+                        audio_base64 = base64.b64encode(server_audio.body).decode("utf-8")
+                    else:
+                        tts_lang = TTS_LANG_MAP.get(dialect, "en")
+                        audio_base64 = await asyncio.to_thread(
+                            synthesize_voice_audio,
+                            generated_text,
+                            tts_lang,
+                        )
+                except gTTSError as error:
+                    logger.error("gTTS voice synthesis failed for dialect %r: %s", req.dialect, error)
+                    raise HTTPException(
+                        status_code=502,
+                        detail="The speech synthesis provider could not complete the request.",
+                    ) from error
             return JSONResponse(
                 content={
                     **result,
                     "text": generated_text,
                     "audio": audio_base64,
+                    "audio_mime_type": audio_mime_type,
                 }
             )
     except (httpx.TimeoutException, httpx.RequestError, RuntimeError, ValueError, TypeError) as e:
@@ -6102,8 +7204,25 @@ async def update_vip_session(
         raise HTTPException(status_code=401, detail="Google ID token verification failed.")
     if req.user_email and req.user_email.strip().lower() != verified_email:
         raise HTTPException(status_code=403, detail="VIP session identity does not match the signed-in account.")
-    if not local_identity and verified_email not in VIP_ALLOWED_EMAILS:
-        raise HTTPException(status_code=403, detail="VIP session is not eligible.")
+    if not local_identity:
+        with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+            entitlement = connection.execute(
+                """
+                SELECT is_vip, vip_expires_at, is_admin FROM user_registry
+                WHERE lower(email) = ?
+                """,
+                (verified_email.lower(),),
+            ).fetchone()
+        active_vip = bool(
+            entitlement
+            and entitlement[0]
+            and entitlement[1]
+            and entitlement[1] > datetime.now(timezone.utc).isoformat()
+        )
+        if not active_vip and verified_email.lower() not in {
+            email.lower() for email in VIP_ALLOWED_EMAILS
+        } and not (entitlement and entitlement[2]):
+            raise HTTPException(status_code=403, detail="VIP session is not eligible.")
     now = time.monotonic()
     with vip_sessions_lock:
         expired_sessions = [

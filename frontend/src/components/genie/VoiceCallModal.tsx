@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
-import { Loader2, Mic, MicOff, PhoneOff, Radio } from "lucide-react";
+import { Copy, Globe, Loader2, Mic, MicOff, PhoneOff, Radio, UserPlus } from "lucide-react";
 import { INDIAN_DIALECT_MAP } from "./voiceAudio";
 
 interface SpeechRecognitionResult {
@@ -63,9 +63,13 @@ interface VoiceCallModalProps {
   remoteTurns: VoiceCallTurn[];
   languageCode: string;
   languageLabel: string;
+  onCopyInvite: () => void;
+  onPingFriend: () => void;
+  onLanguageChange: (languageCode: string) => void;
   onSubmitTurn: (transcript: string) => Promise<{
     text: string;
     audioData?: string;
+    audioMimeType?: string;
   } | null>;
   onBroadcastTurn: (turn: VoiceCallTurn, callId: string) => Promise<void>;
   onEndCall: (transcript: VoiceCallTranscript) => void;
@@ -76,6 +80,9 @@ type CallPhase = "listening" | "thinking" | "speaking";
 export default function VoiceCallModal({
   languageCode,
   languageLabel,
+  onCopyInvite,
+  onPingFriend,
+  onLanguageChange,
   callId,
   isTeamMode,
   contextMode,
@@ -103,6 +110,7 @@ export default function VoiceCallModal({
   const activeAssistantTurnIdRef = useRef<string | null>(null);
   const speechStartedAtRef = useRef(0);
   const finishPlaybackRef = useRef<(() => void) | null>(null);
+  const microphoneStreamRef = useRef<MediaStream | null>(null);
   const processingRef = useRef(false);
   const mountedRef = useRef(true);
   const speechWindow =
@@ -121,6 +129,18 @@ export default function VoiceCallModal({
 
   useEffect(() => {
     callStartedAtRef.current = Date.now();
+  }, []);
+
+  useEffect(() => {
+    const stopCallAudio = () => {
+      const audio = activeAudioRef.current;
+      if (!audio) return;
+      audio.pause();
+      audio.currentTime = 0;
+      finishPlaybackRef.current?.();
+    };
+    window.addEventListener("genie:stop-call-audio", stopCallAudio);
+    return () => window.removeEventListener("genie:stop-call-audio", stopCallAudio);
   }, []);
 
   useEffect(() => {
@@ -148,13 +168,29 @@ export default function VoiceCallModal({
 
   useEffect(() => {
     mountedRef.current = true;
+    let cancelled = false;
+    void navigator.mediaDevices?.getUserMedia({ audio: true }).then((stream) => {
+      if (cancelled || !mountedRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      microphoneStreamRef.current = stream;
+    }).catch((mediaError: unknown) => {
+      if (mountedRef.current) {
+        console.error("Voice call microphone setup failed:", mediaError);
+        setError("Microphone access is unavailable. Allow microphone access and try again.");
+      }
+    });
     return () => {
+      cancelled = true;
       mountedRef.current = false;
       recognitionRef.current?.abort();
       activeAudioRef.current?.pause();
       if (activeAudioRef.current) activeAudioRef.current.currentTime = 0;
       finishPlaybackRef.current?.();
       activeAudioRef.current = null;
+      microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+      microphoneStreamRef.current = null;
     };
   }, []);
 
@@ -249,7 +285,9 @@ export default function VoiceCallModal({
             phaseRef.current = "speaking";
             speechStartedAtRef.current = Date.now();
             setPhase("speaking");
-            const audio = new Audio(`data:audio/mp3;base64,${turnResult.audioData}`);
+            const audio = new Audio(
+              `data:${turnResult.audioMimeType || "audio/mpeg"};base64,${turnResult.audioData}`,
+            );
             activeAudioRef.current = audio;
             await new Promise<void>((resolve, reject) => {
               const finish = () => {
@@ -395,6 +433,22 @@ export default function VoiceCallModal({
       <div className="relative flex min-h-[min(680px,90vh)] w-full max-w-xl flex-col items-center justify-between overflow-hidden rounded-[2rem] border border-indigo-200/20 bg-gradient-to-b from-slate-900 via-indigo-950 to-slate-950 px-6 py-8 text-white shadow-2xl sm:px-12">
         <div className="absolute inset-x-0 top-0 h-40 bg-indigo-500/10 blur-3xl" aria-hidden="true" />
         <div className="relative z-10 text-center">
+          <div className="mb-5 flex flex-wrap justify-center gap-2">
+            <button
+              type="button"
+              onClick={onCopyInvite}
+              className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
+            >
+              <Copy className="h-3.5 w-3.5" /> Copy Invite Link
+            </button>
+            <button
+              type="button"
+              onClick={onPingFriend}
+              className="inline-flex items-center gap-1.5 rounded-full border border-white/20 bg-white/10 px-3 py-2 text-xs font-semibold hover:bg-white/15"
+            >
+              <UserPlus className="h-3.5 w-3.5" /> Ping Friend
+            </button>
+          </div>
           <div className="mb-2 flex items-center justify-center gap-2 text-xs font-semibold uppercase tracking-[0.22em] text-indigo-200">
             <Radio className="h-4 w-4" />
             ((•)) LIVE VOICE CALL
@@ -501,6 +555,29 @@ export default function VoiceCallModal({
         </div>
 
         <div className="relative z-10 flex w-full items-center justify-center gap-4">
+          <label className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/10 px-3 py-2 text-xs font-semibold">
+            <Globe className="h-4 w-4" />
+            <span className="sr-only">Call language</span>
+            <select
+              aria-label="Call language"
+              value={contextMode === "workspace" ? "en-IN" : languageCode}
+              disabled={contextMode === "workspace"}
+              onChange={(event) => onLanguageChange(event.target.value)}
+              className="max-w-28 bg-transparent text-white outline-none disabled:cursor-not-allowed"
+            >
+              {[
+                ["en-IN", "English"],
+                ["ta-IN", "தமிழ்"],
+                ["hi-IN", "हिन्दी"],
+                ["ml-IN", "മലയാളം"],
+                ["te-IN", "తెలుగు"],
+                ["kn-IN", "ಕನ್ನಡ"],
+                ["bn-IN", "বাংলা"],
+              ].map(([code, label]) => (
+                <option key={code} value={code} className="bg-slate-900 text-white">{label}</option>
+              ))}
+            </select>
+          </label>
           <button
             type="button"
             onClick={toggleMute}
@@ -513,6 +590,8 @@ export default function VoiceCallModal({
             type="button"
             onClick={() => {
               recognitionRef.current?.abort();
+              microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+              microphoneStreamRef.current = null;
               activeAudioRef.current?.pause();
               if (activeAudioRef.current) activeAudioRef.current.currentTime = 0;
               const durationSeconds = Math.max(

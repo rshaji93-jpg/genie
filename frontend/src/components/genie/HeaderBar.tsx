@@ -1,15 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import Image from "next/image";
 import GenieBrandAvatar from "./GenieBrandAvatar";
+import StealthVipModal from "./StealthVipModal";
 import {
   Briefcase,
   Building2,
   ChevronDown,
   Info,
-  Lock,
   PhoneCall,
-  Download,
+  Mic,
   Activity,
   Settings,
   User,
@@ -31,17 +32,10 @@ interface HeaderMember {
 }
 
 interface AdminTelemetry {
-  total_registered_users: { total: number; personal: number; workspace: number };
-  active_connections_count: number;
-  live_active_users: Array<{
-    id: string;
-    name: string;
-    email: string;
-    avatar_url: string;
-    room_id: string;
-    focused: boolean;
-    status: "active" | "inactive" | "different_room";
-  }>;
+  total_registered: number;
+  live_active: number;
+  active_vips: number;
+  vip_pool_remaining: number;
 }
 
 interface HeaderBarProps {
@@ -52,6 +46,9 @@ interface HeaderBarProps {
   isCorporateDomain: boolean;
   workspaceName: string;
   profileGender?: string;
+  userEmail?: string;
+  isPrimaryVip?: boolean;
+  isAdmin?: boolean;
   corporateAvatarUrl?: string;
   corporateDisplayName?: string;
   corporateTenantId?: string;
@@ -68,15 +65,16 @@ interface HeaderBarProps {
   activeClass: string;
   onOpenRoom: () => void;
   onStartVoiceCall: () => void;
-  isObserverOn: boolean;
+  onStartRoomCall: () => void;
+  isCallActive: boolean;
+  callStartedAt: string | null;
+  onEndActiveCall: () => void;
+  onClaimVip: (code: string, days: number) => Promise<void>;
   canAccessVoiceCall: boolean;
   onOpenSettings: () => void;
   isAuthenticated: boolean;
   isRoomHost: boolean;
   canInviteMembers: boolean;
-  canExport: boolean;
-  exportDisabledReason: string;
-  onExport: (format: "markdown" | "json") => void;
   onPurgeContext: () => void;
   onCopyInvite: (mode: SpaceMode) => void;
   onLeaveRoom: () => void;
@@ -94,6 +92,9 @@ export default function HeaderBar({
   isCorporateDomain,
   workspaceName,
   profileGender,
+  userEmail,
+  isPrimaryVip,
+  isAdmin,
   corporateAvatarUrl,
   corporateDisplayName,
   corporateTenantId,
@@ -110,15 +111,16 @@ export default function HeaderBar({
   activeClass,
   onOpenRoom,
   onStartVoiceCall,
-  isObserverOn,
+  onStartRoomCall,
+  isCallActive,
+  callStartedAt,
+  onEndActiveCall,
+  onClaimVip,
   canAccessVoiceCall,
   onOpenSettings,
   isAuthenticated,
   isRoomHost,
   canInviteMembers,
-  canExport,
-  exportDisabledReason,
-  onExport,
   onPurgeContext,
   onCopyInvite,
   onLeaveRoom,
@@ -127,10 +129,38 @@ export default function HeaderBar({
   adminTelemetry,
   adminTelemetryError,
 }: HeaderBarProps) {
+  const isAdminAvatarLocked =
+    userEmail?.trim().toLowerCase() === "rshaji93@gmail.com" ||
+    Boolean(isPrimaryVip || isAdmin);
   const [teamGuideOpen, setTeamGuideOpen] = useState(false);
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
-  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [telemetryOpen, setTelemetryOpen] = useState(false);
+  const [vipModalOpen, setVipModalOpen] = useState(false);
+  const [clockNow, setClockNow] = useState(0);
+  const logoClickTimesRef = useRef<number[]>([]);
+  useEffect(() => {
+    if (!isCallActive) return;
+    const initialTick = window.setTimeout(() => setClockNow(Date.now()), 0);
+    const timer = window.setInterval(() => setClockNow(Date.now()), 1000);
+    return () => {
+      window.clearTimeout(initialTick);
+      window.clearInterval(timer);
+    };
+  }, [isCallActive]);
+  const callStartTime = callStartedAt ? Date.parse(callStartedAt) : clockNow;
+  const callElapsedSeconds = Number.isFinite(callStartTime)
+    ? Math.max(0, Math.floor((clockNow - callStartTime) / 1000))
+    : 0;
+  const callDuration = `${String(Math.floor(callElapsedSeconds / 60)).padStart(2, "0")}:${String(callElapsedSeconds % 60).padStart(2, "0")}`;
+  const handleBrandClick = () => {
+    const now = Date.now();
+    const clicks = [...logoClickTimesRef.current.filter((timestamp) => now - timestamp <= 2500), now];
+    logoClickTimesRef.current = clicks;
+    if (clicks.length === 5) {
+      logoClickTimesRef.current = [];
+      setVipModalOpen(true);
+    }
+  };
   const presenceCount = isTeamMode ? Math.max(1, activeMemberCount) : 1;
   const presenceDots = {
     active: members.filter((member) => member.status === "active").length,
@@ -142,20 +172,36 @@ export default function HeaderBar({
     <>
     <header className={`z-10 flex flex-shrink-0 items-center justify-between gap-2 border-b ${chromeBorderClass} ${chromeClass} px-3 py-2.5 ${chromeTextClass} shadow-lg sm:px-6 sm:py-3`}>
       <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-x-auto overscroll-x-contain pl-10 sm:gap-3 lg:pl-0">
-        <span className="inline-flex shrink-0 items-center gap-1.5" aria-label="Personal AI Genie">
-          <GenieBrandAvatar
-            gender={profileGender}
-            mode={isCorporateDomain && spaceMode === "workspace" ? "workspace" : "personal"}
-            corporatePhotoUrl={corporateAvatarUrl}
-            corporateName={corporateDisplayName}
-            tenantId={corporateTenantId}
-            className="h-6 w-6 rounded-lg sm:h-7 sm:w-7"
-            label="Personal AI Genie"
-          />
+        <button
+          type="button"
+          onClick={handleBrandClick}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md text-left"
+          aria-label="Personal AI Genie"
+          title="Personal AI Genie"
+        >
+          {isAdminAvatarLocked ? (
+            <Image
+              src="/admin-avatar.png"
+              width={64}
+              height={64}
+              alt="Admin Avatar"
+              className="h-7 w-7 rounded-full border border-purple-500/30 object-cover shadow-lg sm:h-7 sm:w-7"
+            />
+          ) : (
+            <GenieBrandAvatar
+              gender={profileGender}
+              mode={isCorporateDomain && spaceMode === "workspace" ? "workspace" : "personal"}
+              corporatePhotoUrl={corporateAvatarUrl}
+              corporateName={corporateDisplayName}
+              tenantId={corporateTenantId}
+              className="h-6 w-6 rounded-full object-cover sm:h-7 sm:w-7"
+              label="Personal AI Genie"
+            />
+          )}
           <span className="hidden bg-gradient-to-r from-violet-500 via-pink-500 to-amber-500 bg-clip-text text-sm font-extrabold tracking-tight text-transparent sm:inline">
             Personal AI Genie
           </span>
-        </span>
+        </button>
 
         {isCorporateDomain ? (
           <span className={`shrink-0 rounded-full border ${accentBorderClass} ${chromeSurfaceClass} px-3 py-1.5 text-[11px] font-bold ${accentTextClass}`}>
@@ -246,26 +292,6 @@ export default function HeaderBar({
       </div>
 
       <div className="flex shrink-0 flex-nowrap items-center gap-1.5 sm:gap-2">
-        {isObserverOn && (
-          <button
-            type="button"
-            onClick={onStartVoiceCall}
-            className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-medium shadow-sm transition-all ${
-              canAccessVoiceCall
-                ? "bg-violet-600 text-white hover:bg-violet-700"
-                : "border border-slate-300 bg-slate-100 text-slate-500 hover:bg-slate-200"
-            }`}
-            title={canAccessVoiceCall ? "Start Live Voice Call" : "Live Voice Calls require a Gemini API key"}
-            aria-label="Call Genie"
-          >
-            {canAccessVoiceCall ? (
-              <PhoneCall className="h-3.5 w-3.5" />
-            ) : (
-              <Lock className="h-3.5 w-3.5" />
-            )}
-            Call Genie
-          </button>
-        )}
         <span className={`hidden rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-3 py-1 text-xs font-bold sm:flex sm:items-center sm:gap-1`}>
           {isCorporateDomain && <Building2 className={`h-3.5 w-3.5 ${accentTextClass}`} />}
           <span className="bg-gradient-to-r from-violet-400 via-pink-400 to-amber-300 bg-clip-text text-transparent">
@@ -291,6 +317,51 @@ export default function HeaderBar({
             )}
           </button>
         </div>
+        {isCallActive ? (
+          <div className="flex items-center gap-1.5 rounded-full border border-emerald-500/50 bg-emerald-950/70 px-2.5 py-1.5 text-[11px] font-bold text-emerald-100 sm:px-3">
+            <Activity className="h-3.5 w-3.5 animate-pulse text-emerald-300" />
+            <span>In Call ({callDuration})</span>
+            <span className="text-emerald-300">|</span>
+            <button type="button" onClick={onEndActiveCall} className="text-rose-300 hover:text-rose-100">
+              End Call 🔴
+            </button>
+          </div>
+        ) : isTeamMode ? (
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={onStartRoomCall}
+              className="flex items-center gap-1.5 rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-emerald-500"
+              aria-label="Call Room"
+              title="Ring participants in this shared room"
+            >
+              <PhoneCall className="h-3.5 w-3.5" />
+              <span>Call Room</span>
+            </button>
+            <button
+              type="button"
+              onClick={onStartVoiceCall}
+              className="flex items-center gap-1.5 rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-emerald-500"
+              aria-label="Talk to Genie"
+              title={canAccessVoiceCall ? "Talk to Genie without ringing room participants" : "Add a Gemini API key to enable voice"}
+            >
+              <Mic className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">Talk to Genie</span>
+              <span className="sm:hidden">Genie</span>
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={onStartVoiceCall}
+            className="flex shrink-0 items-center gap-1.5 rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white shadow hover:bg-emerald-500"
+            aria-label="Call Genie"
+            title={canAccessVoiceCall ? "Start a voice session with Genie" : "Add a Gemini API key to enable voice"}
+          >
+            <PhoneCall className="h-3.5 w-3.5" />
+            <span>Call Genie</span>
+          </button>
+        )}
         {isSuperAdmin && (
           <button
             type="button"
@@ -302,37 +373,6 @@ export default function HeaderBar({
             <span className="hidden sm:inline">Telemetry</span>
           </button>
         )}
-        <div className="relative">
-          <button
-            type="button"
-            disabled={!canExport}
-            onClick={() => setExportMenuOpen((open) => !open)}
-            title={!canExport ? exportDisabledReason : "Export chat"}
-            aria-label="Export chat"
-            aria-expanded={exportMenuOpen}
-            className={`flex items-center gap-1 rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-2.5 py-1.5 text-[11px] font-semibold ${chromeMutedTextClass} disabled:cursor-not-allowed disabled:opacity-50`}
-          >
-            <Download className="h-3.5 w-3.5" />
-            Export <ChevronDown className="h-3 w-3" />
-          </button>
-          {exportMenuOpen && canExport && (
-            <div className={`absolute right-0 top-full z-50 mt-2 w-40 rounded-xl border ${chromeBorderClass} ${chromeSurfaceClass} p-1.5 ${chromeTextClass} shadow-xl`}>
-              {(["markdown", "json"] as const).map((format) => (
-                <button
-                  key={format}
-                  type="button"
-                  onClick={() => {
-                    onExport(format);
-                    setExportMenuOpen(false);
-                  }}
-                  className="w-full rounded-lg px-2.5 py-2 text-left text-xs font-medium capitalize hover:bg-slate-100"
-                >
-                  {format === "markdown" ? "Markdown (.md)" : "JSON (.json)"}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
         <div className="relative flex items-center">
           <button
             type="button"
@@ -440,6 +480,12 @@ export default function HeaderBar({
         </div>
       </div>
     </header>
+    {vipModalOpen && (
+      <StealthVipModal
+        onClose={() => setVipModalOpen(false)}
+        onClaim={onClaimVip}
+      />
+    )}
     {isSuperAdmin && telemetryOpen && (
       <div className="fixed inset-0 z-[120] bg-slate-950/50 sm:flex sm:justify-end" onMouseDown={(event) => {
         if (event.target === event.currentTarget) setTelemetryOpen(false);
@@ -452,7 +498,7 @@ export default function HeaderBar({
         >
           <div className="flex items-center justify-between gap-3">
             <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-400">Restricted · live registry</p>
+              <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-cyan-400">Aggregate-only telemetry</p>
               <h2 id="admin-telemetry-title" className="mt-1 flex items-center gap-2 text-lg font-extrabold">
                 <Activity className="h-5 w-5 text-cyan-400" /> Platform Telemetry
               </h2>
@@ -469,10 +515,10 @@ export default function HeaderBar({
             <>
               <div className="mt-5 grid grid-cols-2 gap-2">
                 {[
-                  ["Registered users", adminTelemetry.total_registered_users.total],
-                  ["Active WebSockets", adminTelemetry.active_connections_count],
-                  ["Personal accounts", adminTelemetry.total_registered_users.personal],
-                  ["Workspace accounts", adminTelemetry.total_registered_users.workspace],
+                  ["Registered users", adminTelemetry.total_registered],
+                  ["Active WebSockets", adminTelemetry.live_active],
+                  ["Active VIP seats", adminTelemetry.active_vips],
+                  ["VIP seats remaining", adminTelemetry.vip_pool_remaining],
                 ].map(([label, value]) => (
                   <div key={label} className="rounded-2xl border border-slate-800 bg-slate-900 p-3">
                     <p className="text-[10px] uppercase tracking-wide text-slate-400">{label}</p>
@@ -480,23 +526,7 @@ export default function HeaderBar({
                   </div>
                 ))}
               </div>
-              <div className="mt-6">
-                <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-slate-300">Live user presence</h3>
-                <div className="space-y-2">
-                  {adminTelemetry.live_active_users.map((user) => (
-                    <div key={`${user.id}:${user.room_id}`} className="flex items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/80 p-3">
-                      <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${user.status === "active" ? "bg-emerald-400" : user.status === "different_room" ? "bg-rose-400" : "bg-amber-400"}`} />
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">{user.name || user.email}</p>
-                        <p className="truncate text-[10px] text-slate-400">{user.email} · {user.room_id}</p>
-                      </div>
-                      <span className="shrink-0 text-[9px] uppercase text-slate-500">{user.status.replace("_", " ")}</span>
-                    </div>
-                  ))}
-                  {!adminTelemetry.live_active_users.length && <p className="rounded-xl border border-dashed border-slate-800 p-4 text-center text-xs text-slate-500">No active room connections.</p>}
-                </div>
-              </div>
-              <p className="mt-5 text-[10px] text-slate-500">Refreshes automatically every 10 seconds. Room content is not included.</p>
+              <p className="mt-5 text-[10px] text-slate-500">Refreshes every 10 seconds. No individual identities, room IDs, content, or personal activity are exposed.</p>
             </>
           )}
         </section>

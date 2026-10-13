@@ -1,10 +1,18 @@
 import type { NextConfig } from "next";
 
 const isDevelopment = process.env.NODE_ENV !== "production";
+const backendUrl = (
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 const nextConfig: NextConfig = {
-  typescript: {
-    ignoreBuildErrors: true,
+  images: {
+    unoptimized: true,
+    remotePatterns: [
+      { protocol: "https", hostname: "lh3.googleusercontent.com" },
+      { protocol: "https", hostname: "platform-lookaside.fbsbx.com" },
+      { protocol: "https", hostname: "graph.facebook.com" },
+    ],
   },
   allowedDevOrigins: [
     "*.trycloudflare.com",
@@ -18,19 +26,19 @@ const nextConfig: NextConfig = {
           : []),
         {
           source: "/api/py/tickets",
-          destination: "http://127.0.0.1:8000/api/tickets",
+          destination: `${backendUrl}/api/tickets`,
         },
         {
           source: "/api/py/ws/:path*",
-          destination: "http://127.0.0.1:8000/ws/:path*",
+          destination: `${backendUrl}/ws/:path*`,
         },
         {
           source: "/api/py/api/:path*",
-          destination: "http://127.0.0.1:8000/api/:path*",
+          destination: `${backendUrl}/api/:path*`,
         },
         {
           source: "/api/py/:path*",
-          destination: "http://127.0.0.1:8000/api/:path*",
+          destination: `${backendUrl}/api/:path*`,
         },
       ],
       afterFiles: [],

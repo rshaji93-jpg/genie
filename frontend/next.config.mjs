@@ -18,8 +18,20 @@ const nextConfig = {
     ],
   },
   async rewrites() {
-    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000';
+    const backendUrl = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
     return [
+      {
+        source: '/api/py/tickets',
+        destination: `${backendUrl}/api/tickets`,
+      },
+      {
+        source: '/api/py/ws/:path*',
+        destination: `${backendUrl}/ws/:path*`,
+      },
+      {
+        source: '/api/py/api/:path*',
+        destination: `${backendUrl}/api/:path*`,
+      },
       {
         source: '/api/py/:path*',
         destination: `${backendUrl}/api/:path*`,

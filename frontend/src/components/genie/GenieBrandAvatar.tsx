@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 type GenieBrandAvatarProps = {
   gender?: string;
   className?: string;
@@ -11,9 +13,9 @@ type GenieBrandAvatarProps = {
 type BrandAvatarVariant = "void-shaman" | "cosmic-shadow" | "faceless-weaver";
 
 const BRAND_ASSETS: Record<BrandAvatarVariant, string> = {
-  "void-shaman": "/avatars/Fixed brand Icon.png",
-  "cosmic-shadow": "/avatars/Genie Master.png",
-  "faceless-weaver": "/avatars/Genie PRO.png",
+  "void-shaman": "/avatars/Fixed-brand-Icon.png",
+  "cosmic-shadow": "/avatars/Genie-Master.png",
+  "faceless-weaver": "/avatars/Genie-PRO.png",
 };
 
 export default function GenieBrandAvatar({
@@ -66,10 +68,32 @@ export function BrandAvatar({
   className?: string;
   label?: string;
 }) {
+  const [failedImage, setFailedImage] = useState<{ variant: BrandAvatarVariant; failed: boolean }>({
+    variant,
+    failed: false,
+  });
+  const imageFailed = failedImage.variant === variant && failedImage.failed;
+  if (imageFailed) {
+    return (
+      <svg
+        role="img"
+        aria-label={label}
+        viewBox="0 0 40 40"
+        className={`${className} shrink-0 rounded-full`}
+      >
+        <circle cx="20" cy="20" r="20" fill="#111827" />
+        <path
+          d="M20 7.5 23.7 16l8.8 1-6.5 6 1.8 8.7-7.8-4.5-7.8 4.5 1.8-8.7-6.5-6 8.8-1L20 7.5Z"
+          fill="#67e8f9"
+        />
+      </svg>
+    );
+  }
   return (
     <img
       src={BRAND_ASSETS[variant]}
       alt={label}
+      onError={() => setFailedImage({ variant, failed: true })}
       className={`${className} shrink-0 rounded-full object-cover`}
     />
   );
