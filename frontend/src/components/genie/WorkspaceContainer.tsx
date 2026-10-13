@@ -1518,6 +1518,36 @@ function MainChatApp() {
   );
   const isDevUser = userProfile.email.toLowerCase() === DEVELOPER_EMAIL.toLowerCase();
   const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
+  const requireSocialAuth = useCallback((): string | null => {
+    const token = googleIdToken || getLocalDevelopmentToken();
+    if (isAuthenticated && token) return token;
+    setAuthenticatorLoginError("Please sign in with Google to use friends and social features.");
+    setAuthMode("login");
+    setFriendsQueueOpen(false);
+    setFriendSearchOpen(false);
+    return null;
+  }, [googleIdToken, isAuthenticated]);
+
+  function socialAuthHeaders(token: string, json = false): HeadersInit {
+    return {
+      Authorization: `Bearer ${token}`,
+      ...(json ? { "Content-Type": "application/json" } : {}),
+    };
+  }
+
+  const socialFetch = useCallback(async (url: string, init: RequestInit = {}): Promise<Response> => {
+    const token = requireSocialAuth();
+    if (!token) throw new Error("Sign in with Google to use friends and social features.");
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    return fetch(url, { ...init, credentials: "include", headers });
+  }, [requireSocialAuth]);
+
+  function openFriendsQueue() {
+    if (!requireSocialAuth()) return;
+    setFriendsQueueOpen(true);
+  }
+
   const effectiveUserAvatar = isMasterAdmin
     ? "/admin-avatar.png"
     : isCorporateDomain
@@ -3420,11 +3450,14 @@ if (!response.ok || !Array.isArray(result.topics)) {
             setMetaLoginError("Meta did not provide a profile-verification token.");
             return;
           }
-          void fetch(getBackendApiUrl("/api/social/discovery"), {
+          const authToken = requireSocialAuth();
+          if (!authToken) return;
+          void socialFetch(getBackendApiUrl("/api/social/discovery"), {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            headers: socialAuthHeaders(authToken, true),
             body: JSON.stringify({
-              google_id_token: googleIdToken,
+              google_id_token: authToken,
               meta_access_token: metaAccessToken,
               meta_user_id: profile.id,
               handle: profile.name || profile.id,
@@ -3466,7 +3499,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
   };
 
   const loadFriendsQueue = useCallback(async () => {
-   if (!googleIdToken) {
+   if (!googleIdToken || !isAuthenticated) {
      setDiscoverableFriends([]);
      setSovereignRooms([]);
      setPendingFriendRequests([]);
@@ -3478,7 +3511,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
      if (isCorporateDomain) {
        setDiscoverableFriends([]);
        setPendingFriendRequests([]);
-       const roomsResponse = await fetch(getBackendApiUrl("/api/rooms"), {
+       const roomsResponse = await socialFetch(getBackendApiUrl("/api/rooms"), {
          headers: { Authorization: `Bearer ${googleIdToken}` },
        });
        const roomResult = (await roomsResponse.json()) as { rooms?: SovereignRoomSummary[] } | SovereignRoomSummary[];
@@ -3490,9 +3523,9 @@ if (!response.ok || !Array.isArray(result.topics)) {
      }
      const headers = { Authorization: `Bearer ${googleIdToken}` };
      const [friendsResponse, roomsResponse, requestsResponse] = await Promise.all([
-       fetch(getBackendApiUrl("/api/social/friends"), { headers }),
-       fetch(getBackendApiUrl("/api/rooms"), { headers }),
-       fetch(getBackendApiUrl("/api/social/friend-requests"), { headers }),
+       socialFetch(getBackendApiUrl("/api/social/friends"), { headers }),
+       socialFetch(getBackendApiUrl("/api/rooms"), { headers }),
+       socialFetch(getBackendApiUrl("/api/social/friend-requests"), { headers }),
      ]);
 const [friendResult, roomResult, requestsResult] = await Promise.all([
       friendsResponse.ok ? friendsResponse.json().catch(() => ({ friends: [] })) : Promise.resolve({ friends: [] }),
@@ -3519,12 +3552,12 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
    } finally {
      setIsFriendsLoading(false);
    }
-  }, [googleIdToken, isCorporateDomain]);
+  }, [googleIdToken, isAuthenticated, isCorporateDomain, socialFetch]);
 
   async function respondToFriendRequest(request: PendingFriendRequest, accepted: boolean) {
-    if (!googleIdToken) return;
+    if (!requireSocialAuth()) return;
     try {
-      const response = await fetch(getBackendApiUrl("/api/social/friend-requests/respond"), {
+      const response = await socialFetch(getBackendApiUrl("/api/social/friend-requests/respond"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3544,9 +3577,10 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function respondToRealtimeFriendRequest(accepted: boolean) {
-    if (!googleIdToken || !realtimeToast || realtimeToast.type !== "friend") return;
+    if (!realtimeToast || realtimeToast.type !== "friend") return;
+    if (!requireSocialAuth()) return;
     try {
-      const response = await fetch(getBackendApiUrl("/api/friends/respond"), {
+      const response = await socialFetch(getBackendApiUrl("/api/friends/respond"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3578,7 +3612,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       return;
     }
     try {
-      const response = await fetch(getBackendApiUrl("/api/social/invites"), {
+      const response = await socialFetch(getBackendApiUrl("/api/social/invites"), {
         headers: { Authorization: `Bearer ${googleIdToken}` },
       });
       const result = (await response.json()) as { invites?: SocialInvite[]; detail?: string };
@@ -3595,7 +3629,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       setSocialInvites([]);
       setFriendsQueueError(error instanceof Error ? error.message : "Invitations could not be loaded.");
     }
-  }, [googleIdToken, isAuthenticated]);
+  }, [googleIdToken, isAuthenticated, socialFetch]);
 
   useEffect(() => {
     if (!isAuthenticated || !googleIdToken) return;
@@ -3605,7 +3639,8 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }, [isAuthenticated, googleIdToken, loadSocialInvites]);
 
   async function sendRoomInvite(friend: DiscoverableFriend) {
-    if (!googleIdToken || !isTeamMode || !roomId) {
+    if (!requireSocialAuth()) return;
+    if (!isTeamMode || !roomId) {
       setFriendsQueueError("Start or join a room before inviting a friend.");
       return;
     }
@@ -3617,7 +3652,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
           roomId.startsWith("share_") ? "personal" : "workspace",
         );
       }
-      const response = await fetch(getBackendApiUrl("/api/social/invites"), {
+      const response = await socialFetch(getBackendApiUrl("/api/social/invites"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -3638,9 +3673,9 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function respondToSocialInvite(invite: SocialInvite, accepted: boolean) {
-    if (!googleIdToken) return;
+    if (!requireSocialAuth()) return;
     try {
-      const response = await fetch(getBackendApiUrl(`/api/social/invites/${encodeURIComponent(invite.invite_id)}/respond`), {
+      const response = await socialFetch(getBackendApiUrl(`/api/social/invites/${encodeURIComponent(invite.invite_id)}/respond`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ google_id_token: googleIdToken, status: accepted ? "accepted" : "declined" }),
@@ -3657,12 +3692,12 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
 
   async function searchForFriend(event: React.FormEvent) {
     event.preventDefault();
-    if (!googleIdToken || !friendSearchEmail.trim()) return;
+    if (!requireSocialAuth() || !friendSearchEmail.trim()) return;
     setFriendSearchBusy(true);
     setFriendSearchResult(null);
     setFriendSearchNotFound(false);
     try {
-      const response = await fetch(
+      const response = await socialFetch(
         getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
@@ -3687,11 +3722,11 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
 
   async function searchOmniDirectory(event: React.FormEvent) {
     event.preventDefault();
-    const requestToken = googleIdToken || getLocalDevelopmentToken();
+    const requestToken = requireSocialAuth();
     if (omniSearchQuery.trim().length < 2) return;
     if (!requestToken) {
       setOmniSearchResults([]);
-      setOmniSearchError("Sign in again to search the directory.");
+      setOmniSearchError("Please sign in with Google to search the directory.");
       return;
     }
     setOmniSearchBusy(true);
@@ -3699,7 +3734,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     setOmniSearchNotFound(false);
     setOmniSearchResults([]);
     try {
-      const response = await fetch(
+      const response = await socialFetch(
         getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
         { headers: { Authorization: `Bearer ${requestToken}` } }
       );
@@ -3725,11 +3760,11 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function sendOnboardingInviteEmail(email: string) {
-    if (!googleIdToken) return;
+    if (!requireSocialAuth()) return;
     setInviteEmailBusy(true);
     setInviteEmailStatus(null);
     try {
-      const response = await fetch(getBackendApiUrl("/api/invite/email"), {
+      const response = await socialFetch(getBackendApiUrl("/api/invite/email"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ google_id_token: googleIdToken, email }),
@@ -3748,10 +3783,10 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function updateSocialRelationship(friend: DiscoverableFriend, action: "follow" | "friend-request") {
-    if (!googleIdToken) return;
+    if (!requireSocialAuth()) return;
     const endpoint = action === "follow" ? "/api/social/follow" : "/api/social/friend-requests";
     try {
-      const response = await fetch(getBackendApiUrl(endpoint), {
+      const response = await socialFetch(getBackendApiUrl(endpoint), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ google_id_token: googleIdToken, target_user_id: friend.user_id }),
@@ -3760,7 +3795,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       if (!response.ok) throw new Error(result.detail || `Relationship could not be updated (HTTP ${response.status}).`);
       setOmniSearchError(null);
       if (omniSearchQuery.trim()) {
-        const searchResponse = await fetch(
+        const searchResponse = await socialFetch(
           getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
           { headers: { Authorization: `Bearer ${googleIdToken}` } }
         );
@@ -3769,7 +3804,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
         setOmniSearchResults(searchResult.users || []);
       }
       if (friendSearchEmail.trim()) {
-        const searchResponse = await fetch(
+        const searchResponse = await socialFetch(
           getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
           { headers: { Authorization: `Bearer ${googleIdToken}` } }
         );
@@ -3921,7 +3956,12 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function startSharedConversationInvite(shareViaWhatsApp = false) {
-    if (!shareSessionId || !isAuthenticated || !googleIdToken || !roomIdentity) {
+    if (!shareSessionId) {
+      setChatError("Select a conversation before inviting someone.");
+      return;
+    }
+    if (!requireSocialAuth()) return;
+    if (!roomIdentity) {
       setChatError("Sign in with Google before inviting someone to a shared conversation.");
       return;
     }
@@ -4013,7 +4053,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   async function loadBlockedUsers() {
     if (!googleIdToken || !userProfile.providerId) return;
     try {
-      const response = await fetch(
+      const response = await socialFetch(
         getBackendApiUrl(`/api/friends/blocked-list?user_id=${encodeURIComponent(userProfile.providerId)}`),
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
@@ -4030,9 +4070,11 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function confirmBlockUser() {
-    if (!googleIdToken || !userProfile.providerId || !blockTarget) return;
+    if (!blockTarget) return;
+    if (!requireSocialAuth()) return;
+    if (!userProfile.providerId) return;
     try {
-      const response = await fetch(getBackendApiUrl("/api/friends/block"), {
+      const response = await socialFetch(getBackendApiUrl("/api/friends/block"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4061,9 +4103,9 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function unblockUser(target: BlockedFriendProfile) {
-    if (!googleIdToken || !userProfile.providerId) return;
+    if (!requireSocialAuth() || !userProfile.providerId) return;
     try {
-      const response = await fetch(getBackendApiUrl("/api/friends/unblock"), {
+      const response = await socialFetch(getBackendApiUrl("/api/friends/unblock"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -4087,9 +4129,9 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }, [settingsOpen, settingsTab, googleIdToken, userProfile.providerId]);
 
   async function openDirectFriendRoom(friend: DiscoverableFriend) {
-   if (!googleIdToken) return;
+   if (!requireSocialAuth()) return;
    try {
-     const response = await fetch(getBackendApiUrl("/api/social/direct-room"), {
+     const response = await socialFetch(getBackendApiUrl("/api/social/direct-room"), {
        method: "POST",
        headers: { "Content-Type": "application/json" },
        body: JSON.stringify({ google_id_token: googleIdToken, target_user_id: friend.user_id }),
@@ -4116,9 +4158,9 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function unlinkSocialDiscovery() {
-   if (!googleIdToken) return;
+   if (!requireSocialAuth()) return;
    try {
-     const response = await fetch(getBackendApiUrl("/api/social/discovery"), {
+     const response = await socialFetch(getBackendApiUrl("/api/social/discovery"), {
        method: "DELETE",
        headers: { Authorization: `Bearer ${googleIdToken}` },
      });
@@ -4148,9 +4190,10 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   async function saveSocialHandle(handle: string) {
    const cleanHandle = handle.trim();
    if (!cleanHandle) return;
+   if (!requireSocialAuth()) return;
    if (userProfile.isDiscoverable && googleIdToken) {
      try {
-       const response = await fetch(getBackendApiUrl("/api/social/discovery"), {
+       const response = await socialFetch(getBackendApiUrl("/api/social/discovery"), {
          method: "PUT",
          headers: { "Content-Type": "application/json" },
          body: JSON.stringify({ google_id_token: googleIdToken, handle: cleanHandle }),
@@ -4714,14 +4757,15 @@ if (!response.ok) {
     mode: "personal" | "workspace",
     title = roomTitle,
   ) {
-    if (!googleIdToken || !roomCryptoIdentity || !targetRoomId.startsWith(mode === "personal" ? "share_" : "invite_")) {
+    const authToken = requireSocialAuth();
+    if (!authToken || !roomCryptoIdentity || !targetRoomId.startsWith(mode === "personal" ? "share_" : "invite_")) {
       return;
     }
-    const response = await fetch(getBackendApiUrl("/api/rooms/configure"), {
+    const response = await socialFetch(getBackendApiUrl("/api/rooms/configure"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        google_id_token: googleIdToken,
+        google_id_token: authToken,
         room_id: targetRoomId,
         title: title || (mode === "personal" ? "Personal Room" : "Workspace"),
         passcode: roomPasscode,
@@ -5171,6 +5215,11 @@ if (!response.ok) {
 
   const handleSendDirectInvites = async (e: React.FormEvent) => {
     e.preventDefault();
+    const authToken = requireSocialAuth();
+    if (!authToken) {
+      setDispatchStatus("Please sign in with Google before sending room invitations.");
+      return;
+    }
     if (!requiredAttendees.trim() && !optionalAttendees.trim()) {
       alert("Please provide at least one required or optional attendee email address.");
       return;
@@ -5194,7 +5243,7 @@ if (!response.ok) {
     setDispatchStatus("Dispatching direct meeting invites via API credit...");
 
     const payload = {
-      google_id_token: googleIdToken,
+      google_id_token: authToken,
       user_email: "rshaji93@gmail.com",
       room_id: roomId,
       room_passcode: roomPasscode,
@@ -5213,7 +5262,7 @@ if (!response.ok) {
           roomId.startsWith("share_") ? "personal" : "workspace",
         );
       }
-      const response = await fetch(getBackendApiUrl("/api/room/send-invites"), {
+      const response = await socialFetch(getBackendApiUrl("/api/room/send-invites"), {
         method: "POST",
         credentials: "include",
         headers: {
@@ -6296,14 +6345,15 @@ if (!response.ok) {
   }
 
   async function updateInvitePrivacy(policy: "mutual_friends" | "everyone") {
-    if (!googleIdToken) return;
+    const authToken = requireSocialAuth();
+    if (!authToken) return;
     const previousPolicy = userProfile.allowRoomInvites;
     setUserProfile((previous) => ({ ...previous, allowRoomInvites: policy }));
     try {
-      const response = await fetch(getBackendApiUrl("/api/registration/invite-privacy"), {
+      const response = await socialFetch(getBackendApiUrl("/api/registration/invite-privacy"), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ google_id_token: googleIdToken, policy }),
+        body: JSON.stringify({ google_id_token: authToken, policy }),
       });
       const result = (await response.json()) as { detail?: string };
       if (!response.ok) throw new Error(result.detail || `Invite privacy could not be updated (HTTP ${response.status}).`);
@@ -7276,7 +7326,7 @@ if (!response.ok) {
                 <Plus className="h-5 w-5" />
               </button>
               {!isCorporateDomain && (
-                <button type="button" onClick={() => setFriendsQueueOpen(true)} title="Invite a friend" aria-label="Invite a friend" className="relative rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                <button type="button" onClick={openFriendsQueue} title="Invite a friend" aria-label="Invite a friend" className="relative rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
                   <UserPlus className="h-5 w-5" />
                   {pendingFriendRequests.length > 0 && (
                     <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-600 px-1 text-center text-[9px] font-bold leading-4 text-white">
@@ -7349,7 +7399,7 @@ if (!response.ok) {
             </div>
             <button
               type="button"
-              onClick={() => setFriendsQueueOpen(true)}
+              onClick={openFriendsQueue}
               disabled={!isAuthenticated}
               className="mt-2 w-full rounded-lg px-2 py-1.5 text-left text-[10px] font-semibold text-slate-500 hover:bg-white/70 disabled:opacity-50"
             >
@@ -7478,7 +7528,7 @@ if (!response.ok) {
                   );
                 }) : <p className="px-1 py-2 text-[10px] text-slate-400">{isAuthenticated ? "Accepted mutual friends appear here." : "Sign in to view your friends."}</p>}
               </div>
-              <button type="button" onClick={() => setFriendsQueueOpen(true)} disabled={!isAuthenticated} className="mt-1 w-full rounded-lg px-2 py-1.5 text-left text-[9px] font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-50">
+              <button type="button" onClick={openFriendsQueue} className="mt-1 w-full rounded-lg px-2 py-1.5 text-left text-[9px] font-semibold text-slate-500 hover:bg-slate-50">
                 Manage friends &amp; rooms
               </button>
             </section>
@@ -7882,7 +7932,7 @@ if (!response.ok) {
             accentTextClass={currentTheme.textClass}
             activeClass={currentTheme.primaryClass}
             onOpenRoom={() => setRoomAdminOpen(true)}
-            onOpenSocialDrawer={() => setFriendsQueueOpen(true)}
+            onOpenSocialDrawer={openFriendsQueue}
             socialNotificationCount={pendingFriendRequests.length + socialInvites.length}
             onStartVoiceCall={startVoiceCall}
             onStartRoomCall={() => startVoiceCall(true)}
@@ -7990,7 +8040,7 @@ if (!response.ok) {
               languageCode={selectedLang.code}
               languageLabel={selectedLang.label}
               onCopyInvite={() => void copyHeaderInvite(spaceMode)}
-              onPingFriend={() => setFriendsQueueOpen(true)}
+              onPingFriend={openFriendsQueue}
               onLanguageChange={changeVoiceCallLanguage}
               onSubmitTurn={submitVoiceCallTurn}
               onBroadcastTurn={broadcastVoiceTurn}
