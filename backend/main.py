@@ -454,6 +454,20 @@ def initialize_archive_store():
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS social_push_subscriptions (
+                    endpoint TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    subscription_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS social_push_subscriptions_user ON social_push_subscriptions(user_id)"
+            )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(
                 """
@@ -3004,6 +3018,11 @@ class SocialActionRequest(BaseModel):
     target_user_id: str = Field(min_length=1, max_length=256)
 
 
+class SocialFriendRequestPayload(BaseModel):
+    google_id_token: Optional[str] = None
+    target_user_id: str = Field(min_length=1, max_length=256)
+
+
 class RegistrationInviteRequest(BaseModel):
     google_id_token: str
     email: str = Field(min_length=6, max_length=254)
@@ -4585,34 +4604,55 @@ async def update_invite_privacy(req: InvitePrivacyRequest):
 
 
 @app.get("/api/social/search")
-async def search_social_user(query: str, authorization: Optional[str] = Header(default=None)):
+async def search_social_user(
+    request: Request,
+    q: Optional[str] = None,
+    query: Optional[str] = None,
+    authorization: Optional[str] = Header(default=None),
+):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Google sign-in is required.")
     identity = await asyncio.to_thread(
-        verified_identity_from_token, authorization.removeprefix("Bearer ").strip()
+        verified_identity_from_token,
+        authorization.removeprefix("Bearer ").strip(),
+        request,
     )
-    normalized_query = query.strip()
+    normalized_query = str(q or query or "").strip()
     if len(normalized_query) < 2:
         raise HTTPException(status_code=400, detail="Enter at least 2 characters to search.")
     search_pattern = f"%{normalized_query.lower()}%"
     with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
         rows = connection.execute(
             """
-            SELECT user_id, display_name, email, avatar_url
-            FROM user_registry
-            WHERE user_id != ?
-              AND (lower(display_name) LIKE ? OR lower(email) LIKE ?)
+            SELECT registry.user_id, registry.display_name, registry.email,
+                   COALESCE(directory.avatar_url, registry.avatar_url, ''),
+                   COALESCE(NULLIF(directory.handle, ''), registry.display_name)
+            FROM user_registry AS registry
+            LEFT JOIN social_directory AS directory ON directory.user_id = registry.user_id
+            WHERE registry.user_id != ?
+              AND (
+                  lower(registry.display_name) LIKE ?
+                  OR lower(registry.email) LIKE ?
+                  OR lower(COALESCE(directory.handle, '')) LIKE ?
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM user_blocks
-                  WHERE (blocker_id = ? AND blocked_id = user_registry.user_id)
-                     OR (blocker_id = user_registry.user_id AND blocked_id = ?)
+                  WHERE (blocker_id = ? AND blocked_id = registry.user_id)
+                     OR (blocker_id = registry.user_id AND blocked_id = ?)
               )
-            ORDER BY display_name COLLATE NOCASE LIMIT 20
+            ORDER BY registry.display_name COLLATE NOCASE LIMIT 20
             """,
-            (identity["sub"], search_pattern, search_pattern, identity["sub"], identity["sub"]),
+            (
+                identity["sub"],
+                search_pattern,
+                search_pattern,
+                search_pattern,
+                identity["sub"],
+                identity["sub"],
+            ),
         ).fetchall()
         results = []
-        for user_id, display_name, email, avatar_url in rows:
+        for user_id, display_name, email, avatar_url, handle in rows:
             pending_out = connection.execute(
                 "SELECT status FROM friend_requests WHERE requester_id = ? AND recipient_id = ?",
                 (identity["sub"], user_id),
@@ -4647,12 +4687,56 @@ async def search_social_user(query: str, authorization: Optional[str] = Header(d
                 {
                     "user_id": user_id,
                     "display_name": display_name,
-                    "handle": display_name,
+                    "email": email,
+                    "handle": handle,
                     "avatar_url": avatar_url,
                     "relationship": relation,
                 }
             )
     return {"found": bool(results), "users": results}
+
+
+@app.post("/api/social/push-subscription", status_code=201)
+async def save_social_push_subscription(
+    request: Request,
+    payload: Dict[str, Any],
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request, request, authorization, payload
+    )
+    subscription = payload.get("subscription")
+    if not isinstance(subscription, dict):
+        raise HTTPException(status_code=422, detail="A Web Push subscription is required.")
+    endpoint = str(subscription.get("endpoint") or "").strip()
+    keys = subscription.get("keys")
+    if (
+        not endpoint.startswith("https://")
+        or len(endpoint) > 4096
+        or not isinstance(keys, dict)
+        or not keys.get("p256dh")
+        or not keys.get("auth")
+    ):
+        raise HTTPException(status_code=422, detail="The Web Push subscription is invalid.")
+    subscription_json = json.dumps(subscription, separators=(",", ":"))
+    if len(subscription_json) > 16_384:
+        raise HTTPException(status_code=413, detail="The Web Push subscription is too large.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(sqlite3.connect(ARCHIVE_DB_PATH)) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO social_push_subscriptions
+                    (endpoint, user_id, subscription_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(endpoint) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    subscription_json = excluded.subscription_json,
+                    updated_at = excluded.updated_at
+                """,
+                (endpoint, identity["sub"], subscription_json, now, now),
+            )
+    return {"status": "stored"}
 
 
 @app.post("/api/social/invites")
@@ -4956,9 +5040,18 @@ async def follow_social_user(req: SocialActionRequest):
     return {"status": "following"}
 
 
-@app.post("/api/social/friend-requests")
-async def create_friend_request(req: SocialActionRequest):
-    identity = await asyncio.to_thread(verified_identity_from_token, req.google_id_token)
+@app.post("/api/social/friend-requests", status_code=201)
+async def create_friend_request(
+    request: Request,
+    req: SocialFriendRequestPayload,
+    authorization: Optional[str] = Header(default=None),
+):
+    identity = await asyncio.to_thread(
+        social_identity_from_request,
+        request,
+        authorization,
+        {"google_id_token": req.google_id_token or ""},
+    )
     target_id = canonical_user_id(req.target_user_id)
     if target_id == identity["sub"]:
         raise HTTPException(status_code=400, detail="You cannot friend-request your own account.")

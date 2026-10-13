@@ -42,6 +42,8 @@ import {
   callActiveGeminiCascade,
   getBackendBaseUrl,
   getBackendApiUrl,
+  getBackendWebSocketUrl,
+  getRoomIdFromPath,
 } from "../../app/engine";
 
 // Import Lucide icons
@@ -1325,6 +1327,9 @@ function MainChatApp() {
   const [friendSearchResult, setFriendSearchResult] = useState<DiscoverableFriend | null>(null);
   const [friendSearchNotFound, setFriendSearchNotFound] = useState(false);
   const [friendSearchBusy, setFriendSearchBusy] = useState(false);
+  const [pushNotificationBusy, setPushNotificationBusy] = useState(false);
+  const [pushNotificationStatus, setPushNotificationStatus] = useState<string | null>(null);
+  const [pendingRouteInviteId, setPendingRouteInviteId] = useState("");
   const [omniSearchQuery, setOmniSearchQuery] = useState("");
   const [omniSearchResults, setOmniSearchResults] = useState<DiscoverableFriend[]>([]);
   const [omniSearchNotFound, setOmniSearchNotFound] = useState(false);
@@ -1520,13 +1525,15 @@ function MainChatApp() {
   const isMasterAdmin = userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com";
   const requireSocialAuth = useCallback((): string | null => {
     const token = googleIdToken || getLocalDevelopmentToken();
-    if (isAuthenticated && token) return token;
-    setAuthenticatorLoginError("Please sign in with Google to use friends and social features.");
+    if (isAuthenticated && token && userProfile.providerId) return token;
+    setAuthenticatorLoginError("Please sign in to send requests");
+    setFriendsQueueError("Please sign in to send requests");
+    setSecurityToast("Please sign in to send requests");
     setAuthMode("login");
     setFriendsQueueOpen(false);
     setFriendSearchOpen(false);
     return null;
-  }, [googleIdToken, isAuthenticated]);
+  }, [googleIdToken, isAuthenticated, userProfile.providerId]);
 
   function socialAuthHeaders(token: string, json = false): HeadersInit {
     return {
@@ -1537,11 +1544,21 @@ function MainChatApp() {
 
   const socialFetch = useCallback(async (url: string, init: RequestInit = {}): Promise<Response> => {
     const token = requireSocialAuth();
-    if (!token) throw new Error("Sign in with Google to use friends and social features.");
+    if (!token) throw new Error("Please sign in to send requests");
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
-    return fetch(url, { ...init, credentials: "include", headers });
-  }, [requireSocialAuth]);
+    headers.set("X-User-ID", userProfile.providerId);
+    const response = await fetch(url, { ...init, credentials: "include", headers });
+    if (response.status === 401 || response.status === 403) {
+      const message = "Please sign in to send requests";
+      setAuthenticatorLoginError(message);
+      setFriendsQueueError(message);
+      setSecurityToast(message);
+      setAuthMode("login");
+      throw new Error(message);
+    }
+    return response;
+  }, [requireSocialAuth, userProfile.providerId]);
 
   function openFriendsQueue() {
     if (!requireSocialAuth()) return;
@@ -2211,9 +2228,23 @@ function MainChatApp() {
   useEffect(() => {
     try {
       if (typeof window !== "undefined") {
-        const pathShareRoom = window.location.pathname.match(/^\/room\/((?:share|invite)_[A-Za-z0-9_-]+)\/?$/)?.[1];
-        const initialRoomId =
-          pathShareRoom || new URLSearchParams(window.location.search).get("room");
+        let initialRoomId: string | null = null;
+        try {
+          const query = new URLSearchParams(window.location.search);
+          const joinRoom = query.get("join")?.trim() || "";
+          const inviteTarget = query.get("invite")?.trim() || "";
+          const inviteIsPendingId = /^[a-f0-9]{32}$/i.test(inviteTarget);
+          if (inviteIsPendingId) setPendingRouteInviteId(inviteTarget);
+          initialRoomId =
+            joinRoom ||
+            (inviteTarget && !inviteIsPendingId ? inviteTarget : null) ||
+            getRoomIdFromPath(window.location.pathname);
+          if (!initialRoomId) {
+            initialRoomId = query.get("room")?.trim() || null;
+          }
+        } catch (error) {
+          console.warn("Could not parse the requested room URL; opening the default workspace.", error);
+        }
         if (initialRoomId) {
           setRoomId(initialRoomId);
           setIsTeamMode(true);
@@ -2852,11 +2883,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
       return;
     }
 
-    const socketUrl = new URL(
-      `${API_BASE}/ws/rooms/${encodeURIComponent(roomId)}`,
-      window.location.origin
-    );
-    socketUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socketUrl = getBackendWebSocketUrl(`/ws/rooms/${encodeURIComponent(roomId)}`);
     const socket = new WebSocket(socketUrl);
     roomSocketRef.current = socket;
     readReceiptIdsRef.current.clear();
@@ -3638,6 +3665,71 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     return () => window.clearInterval(intervalId);
   }, [isAuthenticated, googleIdToken, loadSocialInvites]);
 
+  useEffect(() => {
+    if (!mounted || !isAuthenticated || !googleIdToken || !pendingRouteInviteId) return;
+    setPendingRouteInviteId("");
+    setFriendsQueueOpen(true);
+    void loadSocialInvites();
+  }, [mounted, isAuthenticated, googleIdToken, pendingRouteInviteId, loadSocialInvites]);
+
+  async function enableSocialNotifications() {
+    if (!requireSocialAuth()) return;
+    setPushNotificationBusy(true);
+    setPushNotificationStatus(null);
+    try {
+      if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+        throw new Error("Browser notifications are not supported here.");
+      }
+      const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY?.trim();
+      if (!vapidPublicKey) {
+        throw new Error("Push notifications are not configured for this deployment.");
+      }
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        throw new Error(permission === "denied"
+          ? "Notifications are blocked in browser settings."
+          : "Notification permission was not granted.");
+      }
+      const registration = await navigator.serviceWorker.register("/sw.js");
+      const existingSubscription = await registration.pushManager.getSubscription();
+      const normalizedVapidKey = vapidPublicKey.replace(/-/g, "+").replace(/_/g, "/");
+      const paddedVapidKey = normalizedVapidKey.padEnd(
+        normalizedVapidKey.length + ((4 - normalizedVapidKey.length % 4) % 4),
+        "=",
+      );
+      const applicationServerKey = Uint8Array.from(
+        atob(paddedVapidKey),
+        (character) => character.charCodeAt(0),
+      );
+      const subscription = existingSubscription || await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey,
+      });
+      const response = await socialFetch(getBackendApiUrl("/api/social/push-subscription"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          google_id_token: googleIdToken,
+          subscription: subscription.toJSON(),
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { detail?: string };
+      if (!response.ok) {
+        throw new Error(result.detail || `Notification registration failed (HTTP ${response.status}).`);
+      }
+      setPushNotificationStatus("Notifications enabled on this device.");
+    } catch (error) {
+      console.error("Social push notification setup failed:", error);
+      const message = error instanceof Error ? error.message : "Notifications could not be enabled.";
+      setPushNotificationStatus(message);
+      if (/sign in|unauthorized|forbidden/i.test(message)) {
+        setSecurityToast("Please sign in to send requests");
+      }
+    } finally {
+      setPushNotificationBusy(false);
+    }
+  }
+
   async function sendRoomInvite(friend: DiscoverableFriend) {
     if (!requireSocialAuth()) return;
     if (!isTeamMode || !roomId) {
@@ -3698,7 +3790,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     setFriendSearchNotFound(false);
     try {
       const response = await socialFetch(
-        getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
+        getBackendApiUrl(`/api/social/search?q=${encodeURIComponent(friendSearchEmail.trim())}`),
         { headers: { Authorization: `Bearer ${googleIdToken}` } }
       );
       const result = (await response.json()) as {
@@ -3735,7 +3827,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     setOmniSearchResults([]);
     try {
       const response = await socialFetch(
-        getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
+        getBackendApiUrl(`/api/social/search?q=${encodeURIComponent(omniSearchQuery.trim())}`),
         { headers: { Authorization: `Bearer ${requestToken}` } }
       );
       const result = (await response.json()) as { users?: DiscoverableFriend[]; detail?: string };
@@ -3796,7 +3888,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       setOmniSearchError(null);
       if (omniSearchQuery.trim()) {
         const searchResponse = await socialFetch(
-          getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(omniSearchQuery.trim())}`),
+          getBackendApiUrl(`/api/social/search?q=${encodeURIComponent(omniSearchQuery.trim())}`),
           { headers: { Authorization: `Bearer ${googleIdToken}` } }
         );
         const searchResult = (await searchResponse.json()) as { users?: DiscoverableFriend[] };
@@ -3805,7 +3897,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       }
       if (friendSearchEmail.trim()) {
         const searchResponse = await socialFetch(
-          getBackendApiUrl(`/api/social/search?query=${encodeURIComponent(friendSearchEmail.trim())}`),
+          getBackendApiUrl(`/api/social/search?q=${encodeURIComponent(friendSearchEmail.trim())}`),
           { headers: { Authorization: `Bearer ${googleIdToken}` } }
         );
         const searchResult = (await searchResponse.json()) as { users?: DiscoverableFriend[] };
@@ -3982,7 +4074,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
         : [];
     const inviteSessionId = shareInviteSessionId || `${session.id}_${window.crypto.randomUUID()}`;
     const sharedRoomId = `share_${inviteSessionId}`;
-    const inviteUrl = `${window.location.origin}/room/${sharedRoomId}`;
+    const inviteUrl = `${window.location.origin}/?join=${encodeURIComponent(sharedRoomId)}`;
     const whatsappWindow = shareViaWhatsApp ? window.open("about:blank", "_blank") : null;
     if (shareViaWhatsApp && !whatsappWindow) {
       setChatError("WhatsApp could not be opened. Allow pop-ups and try again.");
@@ -9732,12 +9824,23 @@ if (!response.ok) {
               </div>
               <div className="flex items-center gap-2">
                 <button type="button" onClick={() => { setFriendSearchOpen(true); setFriendSearchEmail(""); setFriendSearchResult(null); setFriendSearchNotFound(false); }} className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-2 text-[11px] font-semibold text-slate-700 hover:bg-slate-50">
-                  <Search className="h-3.5 w-3.5" /> Search email
+                  <Search className="h-3.5 w-3.5" /> Search members
                 </button>
                 <button type="button" onClick={() => setFriendsQueueOpen(false)} aria-label="Close Friends Queue" className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100">
                   <X className="h-4 w-4" />
                 </button>
               </div>
+            </div>
+            <div className="mb-4 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void enableSocialNotifications()}
+                disabled={pushNotificationBusy}
+                className="rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2 text-[11px] font-semibold text-cyan-900 disabled:opacity-50"
+              >
+                {pushNotificationBusy ? "Enabling…" : "Enable Notifications"}
+              </button>
+              {pushNotificationStatus && <p role="status" className="text-[11px] text-slate-600">{pushNotificationStatus}</p>}
             </div>
             {isFriendsLoading && <p role="status" className="mb-3 text-xs text-slate-500">Refreshing friends and rooms...</p>}
             {friendsQueueError && <p role="alert" className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{friendsQueueError}</p>}
@@ -9893,14 +9996,16 @@ if (!response.ok) {
                 ))}
               </div>
             )}
-            <p className="mt-4 text-[10px] font-bold uppercase tracking-wider text-slate-400">Invite by email</p>
+            <p className="mt-4 text-[10px] font-bold uppercase tracking-wider text-slate-400">Find a Genie member</p>
             <form onSubmit={(event) => void searchForFriend(event)} className="flex gap-2">
               <input
-                type="email"
+                type="text"
                 required
+                minLength={2}
+                maxLength={254}
                 value={friendSearchEmail}
                 onChange={(event) => { setFriendSearchEmail(event.target.value); setFriendSearchNotFound(false); setFriendSearchResult(null); }}
-                placeholder="Google email address"
+                placeholder="Username or email address"
                 className="min-w-0 flex-1 rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-cyan-500"
               />
               <button type="submit" disabled={friendSearchBusy} className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white disabled:opacity-50">
@@ -9930,15 +10035,17 @@ if (!response.ok) {
             )}
             {friendSearchNotFound && (
               <div className="mt-4 rounded-xl bg-slate-50 p-3">
-                <p className="text-xs text-slate-600">This email is not registered with Genie.</p>
-                <button
-                  type="button"
-                  disabled={inviteEmailBusy}
-                  onClick={() => void sendOnboardingInviteEmail(friendSearchEmail.trim())}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-700 px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-50"
-                >
-                  <Mail className="h-3.5 w-3.5" /> Send Invite Email
-                </button>
+                <p className="text-xs text-slate-600">No registered Genie member matched that username or email.</p>
+                {/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(friendSearchEmail.trim()) && (
+                  <button
+                    type="button"
+                    disabled={inviteEmailBusy}
+                    onClick={() => void sendOnboardingInviteEmail(friendSearchEmail.trim())}
+                    className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-cyan-700 px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-50"
+                  >
+                    <Mail className="h-3.5 w-3.5" /> Send Invite Email
+                  </button>
+                )}
               </div>
             )}
           </section>
