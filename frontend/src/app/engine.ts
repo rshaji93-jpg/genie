@@ -15,14 +15,29 @@ export interface Message {
 }
 
 const GEMINI_MODELS = ["gemini-3.6-flash"] as const;
+const LIVE_BACKEND_URL = "https://genie-backend-481849166496.asia-south1.run.app";
 
 export function getBackendBaseUrl(): string {
-  const configuredUrl =
+  const configuredUrl = (
     process.env.NEXT_PUBLIC_API_URL ||
-    process.env.NEXT_PUBLIC_BACKEND_URL ||
-    "https://genie-backend-481849166496.asia-south1.run.app";
+    process.env.NEXT_PUBLIC_BACKEND_URL
+  )?.trim();
+  if (!configuredUrl) return LIVE_BACKEND_URL;
 
-  return configuredUrl.trim().replace(/\/+$/, "");
+  try {
+    const parsedUrl = new URL(configuredUrl);
+    const isHttpUrl = parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:";
+    const isPagesHost =
+      parsedUrl.hostname === "personalaigenie.pages.dev" ||
+      parsedUrl.hostname.endsWith(".pages.dev");
+    if (isHttpUrl && !isPagesHost) {
+      return configuredUrl.replace(/\/+$/, "");
+    }
+  } catch {
+    // Relative or malformed API URLs must not resolve against the frontend origin.
+  }
+
+  return LIVE_BACKEND_URL;
 }
 
 export function getBackendApiUrl(path: string): string {
