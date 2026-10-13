@@ -64,6 +64,8 @@ interface HeaderBarProps {
   accentTextClass: string;
   activeClass: string;
   onOpenRoom: () => void;
+  onOpenSocialDrawer: () => void;
+  socialNotificationCount: number;
   onStartVoiceCall: () => void;
   onStartRoomCall: () => void;
   isCallActive: boolean;
@@ -110,6 +112,8 @@ export default function HeaderBar({
   accentTextClass,
   activeClass,
   onOpenRoom,
+  onOpenSocialDrawer,
+  socialNotificationCount,
   onStartVoiceCall,
   onStartRoomCall,
   isCallActive,
@@ -317,6 +321,23 @@ export default function HeaderBar({
             )}
           </button>
         </div>
+        {!isCorporateDomain && (
+          <button
+            type="button"
+            onClick={onOpenSocialDrawer}
+            aria-label={`Open friend requests and social notifications${socialNotificationCount ? ` (${socialNotificationCount} unread)` : ""}`}
+            title="Friend requests and social notifications"
+            className={`relative flex shrink-0 items-center gap-1.5 rounded-full border ${chromeBorderClass} ${chromeSurfaceClass} px-2.5 py-1.5 text-[11px] font-semibold ${chromeMutedTextClass} hover:bg-slate-100`}
+          >
+            <Users className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Friends</span>
+            {socialNotificationCount > 0 && (
+              <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-600 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                {socialNotificationCount > 99 ? "99+" : socialNotificationCount}
+              </span>
+            )}
+          </button>
+        )}
         {isCallActive ? (
           <div className="flex items-center gap-1.5 rounded-full border border-emerald-500/50 bg-emerald-950/70 px-2.5 py-1.5 text-[11px] font-bold text-emerald-100 sm:px-3">
             <Activity className="h-3.5 w-3.5 animate-pulse text-emerald-300" />

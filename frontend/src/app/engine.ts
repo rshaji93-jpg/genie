@@ -18,19 +18,11 @@ const GEMINI_MODELS = ["gemini-3.6-flash"] as const;
 
 export function getBackendBaseUrl(): string {
   const configuredUrl =
+    process.env.NEXT_PUBLIC_API_URL ||
     process.env.NEXT_PUBLIC_BACKEND_URL ||
-    process.env.NEXT_PUBLIC_API_URL;
+    "https://genie-backend-481849166496.asia-south1.run.app";
 
-  if (configuredUrl?.trim()) return configuredUrl.trim().replace(/\/+$/, "");
-
-  if (
-    typeof window !== "undefined" &&
-    (window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1")
-  ) {
-    return "/api/py";
-  }
-  return "/api/py";
+  return configuredUrl.trim().replace(/\/+$/, "");
 }
 
 export function getBackendApiUrl(path: string): string {

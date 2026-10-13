@@ -3920,7 +3920,7 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     }
   }
 
-  async function startSharedConversationInvite() {
+  async function startSharedConversationInvite(shareViaWhatsApp = false) {
     if (!shareSessionId || !isAuthenticated || !googleIdToken || !roomIdentity) {
       setChatError("Sign in with Google before inviting someone to a shared conversation.");
       return;
@@ -3943,17 +3943,37 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
     const inviteSessionId = shareInviteSessionId || `${session.id}_${window.crypto.randomUUID()}`;
     const sharedRoomId = `share_${inviteSessionId}`;
     const inviteUrl = `${window.location.origin}/room/${sharedRoomId}`;
+    const whatsappWindow = shareViaWhatsApp ? window.open("about:blank", "_blank") : null;
+    if (shareViaWhatsApp && !whatsappWindow) {
+      setChatError("WhatsApp could not be opened. Allow pop-ups and try again.");
+      return;
+    }
     try {
       await configureRoomInvitePermissions(
         sharedRoomId,
         "personal",
         `${session.title} · Shared Personal Room`,
       );
+    } catch (error) {
+      whatsappWindow?.close();
+      console.error("Shared room invite could not be prepared:", error);
+      setChatError("The invite room could not be prepared. Please try again.");
+      return;
+    }
+    try {
       await navigator.clipboard.writeText(inviteUrl);
     } catch (error) {
       console.error("Shared room invite link could not be copied:", error);
-      setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
-      return;
+      if (!shareViaWhatsApp) {
+        setChatError("The invite link could not be copied. Check clipboard permissions and try again.");
+        return;
+      }
+    }
+    if (whatsappWindow) {
+      const message = `Join my shared Genie conversation:`;
+      const encodedMessage = encodeURIComponent(message);
+      const encodedInviteUrl = encodeURIComponent(inviteUrl);
+      whatsappWindow.location.href = `https://wa.me/?text=${encodedMessage}%20${encodedInviteUrl}`;
     }
     shareTranscriptRef.current = transcript.map((message) => ({ ...message }));
     shareTranscriptOwnerRef.current = roomIdentity;
@@ -5575,7 +5595,7 @@ if (!response.ok) {
     if (reportType !== "ui_request" || !ticketDescription.trim()) return;
 
     try {
-      const response = await fetch("/api/py/tickets", {
+      const response = await fetch(getBackendApiUrl("/api/py/tickets"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -7862,6 +7882,8 @@ if (!response.ok) {
             accentTextClass={currentTheme.textClass}
             activeClass={currentTheme.primaryClass}
             onOpenRoom={() => setRoomAdminOpen(true)}
+            onOpenSocialDrawer={() => setFriendsQueueOpen(true)}
+            socialNotificationCount={pendingFriendRequests.length + socialInvites.length}
             onStartVoiceCall={startVoiceCall}
             onStartRoomCall={() => startVoiceCall(true)}
             isCallActive={isVoiceCallOpen}
@@ -9583,6 +9605,13 @@ if (!response.ok) {
             >
               <Copy className="h-3.5 w-3.5" />
               Start Secure Room & Copy Invite
+            </button>
+            <button
+              type="button"
+              onClick={() => void startSharedConversationInvite(true)}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-3 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-emerald-500"
+            >
+              Share Invite via WhatsApp
             </button>
           </div>
         </div>
