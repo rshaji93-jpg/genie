@@ -9,7 +9,6 @@ import {
   ShieldCheck,
   Sparkles,
   User,
-  UserPlus,
   Users,
   ChevronDown,
   Trash2,
@@ -83,14 +82,10 @@ export default function HeaderBar({
   isCorporateDomain = false,
   workspaceName = "Personal",
   profileGender = "",
-  userEmail = "",
   activeMemberCount,
   chromeClass,
   chromeBorderClass,
-  accentTextClass,
   onOpenRoom,
-  onOpenSocialDrawer,
-  socialNotificationCount = 0,
   onStartVoiceCall,
   onStartRoomCall,
   isCallActive,
@@ -102,8 +97,6 @@ export default function HeaderBar({
   onCopyInvite,
   onLeaveRoom,
   onEndRoom,
-  canSeeAdminTelemetry = false,
-  onOpenAdminDrawer,
 }: HeaderBarProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -128,10 +121,10 @@ export default function HeaderBar({
 
   return (
     <header
-      className={`relative z-30 flex min-h-14 w-full flex-wrap items-center justify-between gap-2 border-b px-3 py-2 sm:px-5 ${chromeClass} ${chromeBorderClass}`}
+      className={`relative z-30 flex min-h-16 w-full flex-nowrap items-center justify-between gap-3 border-b px-4 py-2.5 sm:px-6 ${chromeClass} ${chromeBorderClass}`}
     >
       {/* Left Brand + Mode Switcher */}
-      <div className="flex flex-wrap items-center gap-2 pl-9 md:pl-0">
+      <div className="flex shrink-0 items-center gap-3 pl-9 md:pl-0">
         <div className="flex items-center gap-2 pr-1">
           <GenieBrandAvatar
             gender={profileGender}
@@ -187,9 +180,9 @@ export default function HeaderBar({
         </button>
       </div>
 
-      {/* Right Controls: Personal Badge, Room Roster, Friends, Start Call (Friends), Call Genie (AI Agent), Settings */}
-      <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
-        <span className="hidden lg:inline-flex items-center rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-bold bg-gradient-to-r from-violet-600 via-pink-500 to-amber-500 bg-clip-text text-transparent">
+      {/* Right Controls: Friends & Telemetry removed from header per user specifications */}
+      <div className="flex shrink-0 items-center gap-2">
+        <span className="hidden xl:inline-flex items-center rounded-full border border-slate-200 bg-white px-3 py-1 text-xs font-bold bg-gradient-to-r from-violet-600 via-pink-500 to-amber-500 bg-clip-text text-transparent">
           {workspaceName}
         </span>
 
@@ -204,22 +197,6 @@ export default function HeaderBar({
           <ChevronDown className="h-3 w-3 text-slate-400" />
         </button>
 
-        {!isCorporateDomain && (
-          <button
-            type="button"
-            onClick={onOpenSocialDrawer}
-            className="relative inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-700 hover:bg-slate-50"
-          >
-            <UserPlus className="h-3.5 w-3.5 text-slate-600" />
-            <span>Friends</span>
-            {socialNotificationCount > 0 && (
-              <span className="ml-0.5 rounded-full bg-rose-600 px-1.5 py-0.2 text-[9px] font-extrabold text-white">
-                {socialNotificationCount}
-              </span>
-            )}
-          </button>
-        )}
-
         {isCallActive ? (
           <button
             type="button"
@@ -231,7 +208,6 @@ export default function HeaderBar({
           </button>
         ) : (
           <>
-            {/* Start Call -> Dedicated to Friends P2P */}
             <button
               type="button"
               onClick={onStartRoomCall}
@@ -242,29 +218,17 @@ export default function HeaderBar({
               <span>Start Call</span>
             </button>
 
-            {/* Call Genie -> Dedicated to AI Agent (Single or Group Token-Pooled Call) */}
+            {/* Call Genie with Sparkles icon */}
             <button
               type="button"
               onClick={onStartVoiceCall}
-              title="Call Genie AI Agent (uses initiator/room token pool)"
+              title="Call Genie AI Agent"
               className="inline-flex items-center gap-1.5 rounded-full border border-sky-200 bg-white px-3.5 py-1.5 text-xs font-bold text-sky-700 shadow-2xs transition hover:bg-sky-50"
             >
               <Sparkles className="h-3.5 w-3.5 text-sky-600" />
               <span>Call Genie</span>
             </button>
           </>
-        )}
-
-        {canSeeAdminTelemetry && onOpenAdminDrawer && (
-          <button
-            type="button"
-            onClick={onOpenAdminDrawer}
-            title="Admin Telemetry"
-            className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-xs font-bold text-violet-800 hover:bg-violet-100"
-          >
-            <ShieldCheck className="h-3.5 w-3.5" />
-            <span className="hidden xl:inline">Telemetry</span>
-          </button>
         )}
 
         {/* Settings + Room Quick Actions Menu */}
