@@ -7984,7 +7984,7 @@ async def handle_chat(
     master_persona = bool(
         has_image
         or req.force_genie_master
-        or (observer_mode and has_valid_tokens)
+        or observer_mode
     )
     pool_selection = gemini_pool.get_key(
         is_vip=is_active_vip or has_image,

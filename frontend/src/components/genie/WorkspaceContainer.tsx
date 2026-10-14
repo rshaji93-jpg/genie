@@ -8027,7 +8027,7 @@ async function submitVoiceCallTurn(transcript: string): Promise<VoiceCallTurnRes
                   {pendingFriendRequests.length + socialInvites.length > 0 && <span className="absolute -right-0.5 -top-0.5 min-w-3.5 rounded-full bg-rose-600 px-1 text-center text-[8px] font-bold leading-3.5 text-white">{pendingFriendRequests.length + socialInvites.length > 99 ? "99+" : pendingFriendRequests.length + socialInvites.length}</span>}
                 </button>
               )}
-              {(userProfile?.email?.trim().toLowerCase() === "rshaji93@gmail.com" || Boolean(getLocalDevelopmentToken())) && isSuperAdminVerified && (
+              {(userProfile?.email?.trim().toLowerCase() === "rshaji93@gmail.com") && (
                 <button type="button" onClick={() => void openAdminDrawer()} title="Admin telemetry" aria-label="Admin telemetry" className="rounded-lg p-2 text-violet-700 hover:bg-white/80">
                   <ShieldCheck className="h-4 w-4" />
                 </button>
