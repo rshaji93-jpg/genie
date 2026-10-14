@@ -50,6 +50,30 @@ export function getBackendApiUrl(path: string): string {
   return `${baseUrl}${endpoint}`;
 }
 
+export function getBackendWebSocketUrl(path: string): string {
+  const backendUrl = new URL(getBackendBaseUrl());
+  backendUrl.pathname = backendUrl.pathname.replace(/\/api\/py$|\/api$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  backendUrl.pathname = `${backendUrl.pathname.replace(/\/+$/, "")}${normalizedPath}`;
+  backendUrl.search = "";
+  backendUrl.hash = "";
+  backendUrl.protocol = backendUrl.protocol === "https:" ? "wss:" : "ws:";
+  return backendUrl.toString();
+}
+
+export function getRoomIdFromPath(pathname: string): string | null {
+  const match = pathname.match(/^\/room\/([^/]+)\/?$/);
+  if (!match) return null;
+  try {
+    const roomId = decodeURIComponent(match[1]).trim();
+    return roomId && roomId.length <= 200 && !/[\u0000-\u001f/\\]/.test(roomId)
+      ? roomId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function checkWakeWordTrigger(text: string): boolean {
   const lower = text.toLowerCase();
   const triggers = [

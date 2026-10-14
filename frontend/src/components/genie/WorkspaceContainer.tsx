@@ -10,9 +10,11 @@ import Script from "next/script";
 import { useRouter } from "next/navigation";
 import StudentBanner from "../../components/StudentBanner";
 import UnifiedStudyEngine from "../../components/UnifiedStudyEngine";
-import MessageBubble from "../../components/MessageBubble";
+import MessageBubble, { sanitizeChatText } from "../../components/MessageBubble";
 import VoiceMic from "../../components/VoiceMic";
 import DynamicTeamModal, { type RoomCapacityMode } from "./DynamicTeamModal";
+import StealthVipModal, { type VipApprovalRequest } from "./StealthVipModal";
+import RequestVIPModal from "./RequestVIPModal";
 import GenieBrandAvatar, { BrandAvatar } from "./GenieBrandAvatar";
 import HeaderBar from "./HeaderBar";
 import SessionMetadataBar from "./SessionMetadataBar";
@@ -53,6 +55,7 @@ import {
   Plus,
   MessageSquare,
   MoreVertical,
+  MoreHorizontal,
   Share2,
   Pin,
   Edit2,
@@ -101,13 +104,13 @@ import {
   Minimize2,
   FileText,
   FileUp,
+  ImagePlus,
   BookOpen,
   CheckSquare,
   Calculator,
   Square,
   UserPlus,
   Search,
-  ImagePlus,
   CircleHelp,
 } from "lucide-react";
 
@@ -117,6 +120,10 @@ interface IndianLanguage {
 }
 
 type VoicePreset = "Aoede" | "Charon" | "Kore" | "Fenrir" | "Puck";
+
+function isVoicePreset(value: string): value is VoicePreset {
+  return ["Aoede", "Charon", "Kore", "Fenrir", "Puck"].includes(value);
+}
 
 const VOICE_PRESETS: {
   key: VoicePreset;
@@ -337,10 +344,10 @@ const THEME_PRESETS: ThemePreset[] = [
 
 const THEME_STORAGE_KEY = "genie_workspace_theme";
 const ADMIN_EMAILS = ["rshaji93@gmail.com"];
-const VIP_ALLOWED_EMAILS = ["rshaji93@gmail.com", "manoharlumina@gmail.com", "ratnaraja007@gmail.com"];
+const VIP_ALLOWED_EMAILS = ["rshaji93@gmail.com"];
 const DEVELOPER_EMAIL = "ratnaraja007@gmail.com";
 const SUPPORT_DISPATCH_EMAIL = process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "support@genie.ai";
-const DAILY_FREE_LIMIT = 20;
+const DAILY_FREE_LIMIT = 10;
 
 function scrubSensitiveClientTokens(text: string): string {
   return text.replace(
@@ -393,6 +400,11 @@ interface SovereignRoomSummary {
 interface Message {
   role: "user" | "assistant";
   content: string;
+  image_data?: string;
+  image_url?: string;
+  imageUrl?: string;
+  forceGenieMaster?: boolean;
+  forceAiIntervention?: boolean;
   id?: string;
   text?: string;
   sender_id?: string;
@@ -463,9 +475,30 @@ interface ChatSession {
 interface AdminTelemetry {
   total_registered: number;
   live_active: number;
+  online_users?: number;
+  offline_users?: number;
   active_vips: number;
   vip_pool_remaining: number;
+  registered_accounts?: number;
+  active_websockets?: number;
+  offline_accounts?: number;
+  vip_claimed?: number;
+  remaining_vip_pool?: number;
+  requests?: unknown[];
 }
+
+const EMPTY_ADMIN_TELEMETRY: AdminTelemetry = {
+  total_registered: 0,
+  live_active: 0,
+  active_vips: 0,
+  vip_pool_remaining: 20,
+  registered_accounts: 0,
+  active_websockets: 0,
+  offline_accounts: 0,
+  vip_claimed: 0,
+  remaining_vip_pool: 20,
+  requests: [],
+};
 
 interface VoiceCallTurnResult {
   text: string;
@@ -608,6 +641,12 @@ interface RoomSocketEvent {
   sender_name?: string;
   detail?: string;
   call_id?: string;
+  signal?: RTCSessionDescriptionInit | RTCIceCandidateInit;
+  candidate?: RTCIceCandidateInit;
+  voice_name?: string;
+  language_code?: string;
+  transport?: "ai" | "mesh";
+  peer_id?: string;
   started_by?: string;
   turn_id?: string;
   speaker?: { id: string; name: string; avatar_url?: string | null; role: "user" | "assistant" };
@@ -633,9 +672,11 @@ function normalizeRoomMessage(raw: Message): Message {
     is_voice_record?: boolean;
     agent_name?: string;
     agent_output?: Message["agentOutput"];
+    force_genie_master?: boolean;
+    force_ai_intervention?: boolean;
   };
   const senderName = String(wire.sender_name || wire.display_name || wire.senderName || "Room member");
-  const role = wire.role === "assistant" || senderName.includes("Personal AI Genie") ? "assistant" : "user";
+  const role = wire.role === "assistant" || senderName.includes("Personal AI Genie") || senderName.includes("Genie Master") ? "assistant" : "user";
   const content = String(wire.content || wire.text || "");
   return {
     ...wire,
@@ -648,6 +689,8 @@ function normalizeRoomMessage(raw: Message): Message {
     senderName,
     agentName: wire.agentName || wire.agent_name,
     agentOutput: wire.agentOutput || wire.agent_output,
+    forceGenieMaster: Boolean(wire.forceGenieMaster || wire.force_genie_master),
+    forceAiIntervention: Boolean(wire.forceAiIntervention || wire.force_ai_intervention),
     is_edited: Boolean(wire.is_edited || wire.edited),
     is_deleted: Boolean(wire.is_deleted || wire.deleted),
     isVoiceRecord: Boolean(wire.isVoiceRecord || wire.is_voice_record),
@@ -1052,7 +1095,7 @@ async function fetchAuthenticatorSetup(
     cache: "no-store",
     headers,
   });
-  const result = (await response.json()) as {
+  const result = await response.json().catch(() => ({})) as {
     qr_code?: string;
     secret?: string;
     manual_secret?: string;
@@ -1085,6 +1128,8 @@ function MainChatApp() {
   const [showDevAuthBypass, setShowDevAuthBypass] = useState(false);
   const [registrationTermsAccepted, setRegistrationTermsAccepted] = useState(false);
   const [registrationPrivacyAccepted, setRegistrationPrivacyAccepted] = useState(false);
+  const [trustThisDevice, setTrustThisDevice] = useState(false);
+  const trustThisDeviceRef = useRef(false);
   const [authenticatorEnabled, setAuthenticatorEnabled] = useState(false);
   const [authenticatorSetupOpen, setAuthenticatorSetupOpen] = useState(false);
   const [authenticatorSetup, setAuthenticatorSetup] = useState<{ qr_code: string; secret: string } | null>(null);
@@ -1112,6 +1157,21 @@ function MainChatApp() {
   const [isDockHidden, setIsDockHidden] = useState(false);
   const [isTeamMode, setIsTeamMode] = useState(false);
   const [isObserverActive, setIsObserverActiveState] = useState(false);
+  const [adminDrawerOpen, setAdminDrawerOpen] = useState(false);
+  const [vipRequestModalOpen, setVipRequestModalOpen] = useState(false);
+  const [pendingVipRequests, setPendingVipRequests] = useState<Array<{
+    request_id: string;
+    user_id: string;
+    email: string;
+    display_name: string;
+    message: string;
+    created_at: string;
+  }>>([]);
+  const [vipReviewTarget, setVipReviewTarget] = useState<{
+    request: VipApprovalRequest;
+    action: "approve" | "reject";
+  } | null>(null);
+  const [adminDrawerError, setAdminDrawerError] = useState("");
 
   const [dailyUsageCount, setDailyUsageCount] = useState<number>(0);
   const [isVipSessionActive, setIsVipSessionActive] = useState(false);
@@ -1127,6 +1187,7 @@ function MainChatApp() {
   const [enteredRoomPasscode, setEnteredRoomPasscode] = useState("");
   const [isRoomUnlocked, setIsRoomUnlocked] = useState(false);
   const [roomGateError, setRoomGateError] = useState(false);
+  const [roomFullError, setRoomFullError] = useState(false);
   const [confirmRegenerateModalOpen, setConfirmRegenerateModalOpen] = useState(false);
 
   const [legalModalOpen, setLegalModalOpen] = useState(false);
@@ -1155,7 +1216,9 @@ function MainChatApp() {
     isCreator: false,
     avatarUrl: "genie-preset:neutral",
     googleAvatarUrl: "",
-    role: "professional" as "student" | "professional",
+    role: "professional" as "student" | "professional" | "admin",
+    is_admin: false,
+    is_vip: 0,
     preferredVoice: "Aoede" as VoicePreset,
     profession: "Healthcare Revenue Cycle & Client Operations",
     institution: "",
@@ -1185,20 +1248,142 @@ function MainChatApp() {
     userProfile.avatarUrl.startsWith("genie-preset:") && userProfile.avatarUrl !== "genie-preset:neutral"
       ? userProfile.avatarUrl
       : "";
-  const profileAvatar = customAvatar || selectedAvatar || userProfile.googleAvatarUrl || "/default-avatar.png";
+  const profileAvatar = customAvatar || selectedAvatar || userProfile.googleAvatarUrl || "/avatars/Fixed-brand-Icon.png";
   useEffect(() => () => {
     if (profileTotpToastTimerRef.current) clearTimeout(profileTotpToastTimerRef.current);
   }, []);
   const [googleIdToken, setGoogleIdToken] = useState("");
+  const [deviceTrustChoice, setDeviceTrustChoice] = useState<"trusted" | "ephemeral" | null>(null);
   const [corporateTenantId, setCorporateTenantId] = useState("");
   const [corporateAvatarUrl, setCorporateAvatarUrl] = useState("");
   const [scopeVerifiedToken, setScopeVerifiedToken] = useState("");
   const [isSuperAdminSession, setIsSuperAdminSession] = useState(false);
   const [adminTelemetry, setAdminTelemetry] = useState<AdminTelemetry | null>(null);
-  const [adminTelemetryError, setAdminTelemetryError] = useState("");
   const isSuperAdminVerified =
     isAuthenticated && isSuperAdminSession && scopeVerifiedToken === googleIdToken;
+  const activateLocalDevelopmentSession = useCallback(() => {
+    if (!getLocalDevelopmentToken()) return;
+    const localProfile = {
+      ...userProfileRef.current,
+      name: "Shaji R",
+      email: "rshaji93@gmail.com",
+      avatarUrl: "/avatars/Fixed-brand-Icon.png",
+      googleAvatarUrl: "",
+      role: "admin" as const,
+      is_admin: true,
+      is_vip: 1,
+      isCreator: true,
+      authProvider: "google" as const,
+      providerId: "user-rshaji93",
+      customApiKey: "",
+      totpPasscode: "",
+    };
+    sessionStorage.setItem("genie_google_id_token", "dev-token-local-bypass");
+    sessionStorage.setItem("genie_trust_device", "ephemeral");
+    sessionStorage.setItem("genie_is_authenticated", "true");
+    sessionStorage.setItem("genie_user_profile_ephemeral", JSON.stringify(localProfile));
+    setUserProfile(localProfile);
+    setGoogleIdToken("dev-token-local-bypass");
+    setDeviceTrustChoice("ephemeral");
+    setTrustThisDevice(false);
+    trustThisDeviceRef.current = false;
+    setIsAuthenticated(true);
+    setRegistrationRequired(false);
+    setRegistrationBusy(false);
+    setRegistrationError(null);
+    setRegistrationReauthRequired(false);
+    registrationReauthRequiredRef.current = false;
+    setIsSuperAdminSession(true);
+    setScopeVerifiedToken("dev-token-local-bypass");
+    setAuthenticatorLoginError(null);
+  }, []);
+  const invalidateExpiredSession = useCallback(() => {
+    const priorEmail = userProfileRef.current.email;
+    for (const storage of [localStorage, sessionStorage]) {
+      storage.removeItem("genie_session_token");
+      storage.removeItem("genie_google_id_token");
+      storage.removeItem("genie_is_authenticated");
+      storage.removeItem("genie_user_profile");
+      storage.removeItem("genie_user_profile_ephemeral");
+      storage.removeItem("genie_trust_device");
+    }
+    setGoogleIdToken("");
+    setIsAuthenticated(false);
+    setDeviceTrustChoice(null);
+    setTrustThisDevice(false);
+    trustThisDeviceRef.current = false;
+    setRegistrationBusy(false);
+    setRegistrationRequired(false);
+    setRegistrationReauthRequired(false);
+    setAuthenticatorLoginBusy(false);
+    setAuthenticatorLoginCode("");
+    setAuthenticatorLoginEmail(priorEmail);
+    setUserProfile((previous) => ({
+      ...previous,
+      name: "Guest User",
+      email: "",
+      providerId: "",
+      authProvider: "",
+      googleAvatarUrl: "",
+      avatarUrl: "genie-preset:neutral",
+      customApiKey: "",
+      totpPasscode: "",
+      totpEnabled: false,
+      isCreator: false,
+      isDiscoverable: false,
+      is_admin: false,
+      is_vip: 0,
+      role: "professional",
+    }));
+    setVerifiedArchiveOwner(null);
+    setIsSuperAdminSession(false);
+    setScopeVerifiedToken("");
+    setCorporateTenantId("");
+    setCorporateAvatarUrl("");
+    setSocialInvites([]);
+    setDiscoverableFriends([]);
+    setPendingFriendRequests([]);
+    setSovereignRooms([]);
+    setAdminTelemetry(null);
+    setPendingVipRequests([]);
+    setAdminDrawerOpen(false);
+    setFriendsQueueOpen(false);
+    setAuthenticatorLoginError("Your sign-in expired. Please sign in again.");
+    setRegistrationError(null);
+    setAuthMode("login");
+  }, []);
+
   useEffect(() => {
+    const originalFetch = window.fetch.bind(window);
+    const interceptedFetch: typeof window.fetch = async (...args) => {
+      const response = await originalFetch(...args);
+      if (googleIdToken === "dev-token-local-bypass" && getLocalDevelopmentToken()) {
+        return response;
+      }
+      if (response.status === 401 && googleIdToken) {
+        invalidateExpiredSession();
+      } else if (response.status === 403 && googleIdToken) {
+        void response.clone().json().then((payload: { detail?: unknown }) => {
+          if (typeof payload.detail === "string" && payload.detail.toLowerCase().includes("token_expired")) {
+            invalidateExpiredSession();
+          }
+        }).catch(() => undefined);
+      }
+      return response;
+    };
+    window.fetch = interceptedFetch;
+    return () => {
+      if (window.fetch === interceptedFetch) window.fetch = originalFetch;
+    };
+  }, [googleIdToken, invalidateExpiredSession]);
+  useEffect(() => {
+    if (googleIdToken === "dev-token-local-bypass" && getLocalDevelopmentToken()) {
+      setCorporateTenantId("");
+      setCorporateAvatarUrl("");
+      setIsSuperAdminSession(true);
+      setScopeVerifiedToken(googleIdToken);
+      return;
+    }
     if (!googleIdToken) {
       setCorporateTenantId("");
       setCorporateAvatarUrl("");
@@ -1212,16 +1397,23 @@ function MainChatApp() {
       headers: { Authorization: `Bearer ${googleIdToken}` },
     })
       .then(async (response) => {
-        const result = (await response.json()) as {
+        const result = await response.json().catch(() => ({})) as {
           scope?: "personal" | "workspace";
           tenant_id?: string | null;
           corporate_avatar_url?: string;
           is_super_admin?: boolean;
         };
+        if (!active) return;
         if (!response.ok) {
+          if (response.status === 401 || response.status === 403) {
+            invalidateExpiredSession();
+            setRegistrationReauthRequired(true);
+            registrationReauthRequiredRef.current = true;
+            setRegistrationRequired(true);
+            return;
+          }
           throw new Error(`Session scope could not be verified (HTTP ${response.status}).`);
         }
-        if (!active) return;
         const tenantId = result.scope === "workspace" ? result.tenant_id || "" : "";
         setCorporateTenantId(tenantId);
         setCorporateAvatarUrl(tenantId ? result.corporate_avatar_url || "" : "");
@@ -1241,38 +1433,7 @@ function MainChatApp() {
     return () => {
       active = false;
     };
-  }, [googleIdToken]);
-  useEffect(() => {
-    if (!isSuperAdminVerified || !googleIdToken) return;
-    let active = true;
-    let timer: number | undefined;
-    const refreshTelemetry = async () => {
-      try {
-        const response = await fetch(getBackendApiUrl("/api/admin/telemetry"), {
-          cache: "no-store",
-          headers: { Authorization: `Bearer ${googleIdToken}` },
-        });
-        if (!response.ok) {
-          throw new Error(`Telemetry unavailable (HTTP ${response.status}).`);
-        }
-        const result = (await response.json()) as AdminTelemetry;
-        if (!active) return;
-        setAdminTelemetry(result);
-        setAdminTelemetryError("");
-      } catch (error) {
-        if (!active) return;
-        console.error("Super-admin telemetry refresh failed:", error);
-        setAdminTelemetryError(error instanceof Error ? error.message : "Telemetry could not be loaded.");
-      } finally {
-        if (active) timer = window.setTimeout(() => void refreshTelemetry(), 10000);
-      }
-    };
-    void refreshTelemetry();
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [isSuperAdminVerified, googleIdToken]);
+  }, [googleIdToken, invalidateExpiredSession]);
   const [editProfileOpen, setEditProfileOpen] = useState(false);
   const [profileSaveBusy, setProfileSaveBusy] = useState(false);
   const [profileSaveError, setProfileSaveError] = useState<string | null>(null);
@@ -1345,7 +1506,7 @@ function MainChatApp() {
   const [chatVaultError, setChatVaultError] = useState<string | null>(null);
   const [roomAdminOpen, setRoomAdminOpen] = useState(false);
   const [roomCapacityMode, setRoomCapacityMode] = useState<RoomCapacityMode>("unlimited");
-  const [customRoomCapacity, setCustomRoomCapacity] = useState(10);
+  const [customRoomCapacity, setCustomRoomCapacity] = useState(5);
 
   const [sessions, setSessions] = useState<ChatSession[]>([
     { id: "1", title: "New Session", isPinned: false, messages: [], createdAt: new Date().toISOString() },
@@ -1399,6 +1560,7 @@ function MainChatApp() {
   const [ticketStatus, setTicketStatus] = useState<string | null>(null);
 
   const [prompt, setPrompt] = useState("");
+  const [attachedImageData, setAttachedImageData] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
   const [securityToast, setSecurityToast] = useState<string | null>(null);
   const suppressAuthWarning =
@@ -1409,6 +1571,7 @@ function MainChatApp() {
   const [selectedLang, setSelectedLang] = useState<IndianLanguage>(INDIAN_LANGUAGES[0]);
   const [isVoiceCallOpen, setIsVoiceCallOpen] = useState(false);
   const [voiceCallId, setVoiceCallId] = useState("");
+  const [activeVoiceTransport, setActiveVoiceTransport] = useState<"ai" | "mesh">("ai");
   const [activeRoomVoiceCallId, setActiveRoomVoiceCallId] = useState("");
   const [activeRoomCallOwnerId, setActiveRoomCallOwnerId] = useState("");
   const [joinedRoomVoiceCallId, setJoinedRoomVoiceCallId] = useState("");
@@ -1418,6 +1581,7 @@ function MainChatApp() {
   const voiceSpeakerTimerRef = useRef<number | null>(null);
   const [vipClaimGranted, setVipClaimGranted] = useState(false);
   const [remoteVoiceTurns, setRemoteVoiceTurns] = useState<VoiceCallTurn[]>([]);
+  const [roomRtcEvents, setRoomRtcEvents] = useState<Array<RoomSocketEvent & { local_id: string }>>([]);
   const [pendingCallTranscript, setPendingCallTranscript] = useState<VoiceCallTranscript | null>(null);
   const roomIdentity = userProfile.providerId ? `google:${userProfile.providerId}` : "";
   const setIsObserverActive = useCallback((active: boolean) => {
@@ -1461,9 +1625,42 @@ function MainChatApp() {
   const archivePromptedRef = useRef(false);
   const readReceiptIdsRef = useRef<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageFileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const promptInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const token = googleIdToken || getLocalDevelopmentToken();
+    if (!mounted || !isAuthenticated || !token || !userProfile.providerId) return;
+    const socketUrl = getBackendWebSocketUrl(
+      `/ws/user/${encodeURIComponent(userProfile.providerId)}`,
+    );
+    const socket = new WebSocket(`${socketUrl}?token=${encodeURIComponent(token)}`);
+    socket.onmessage = (event) => {
+      try {
+        const notification = JSON.parse(String(event.data)) as {
+          type?: string;
+          email?: string;
+          duration_days?: number;
+        };
+        if (notification.type === "VIP_PASS_GRANTED") {
+          setVipClaimGranted(true);
+          setSecurityToast(
+            `Your VIP pass is active${notification.duration_days ? ` for ${notification.duration_days} days` : ""}.`,
+          );
+        } else if (notification.type === "VIP_REQUEST_RECEIVED") {
+          setSecurityToast(`VIP pass request received from ${notification.email || "a Genie user"}.`);
+        }
+      } catch (error) {
+        console.warn("A user notification could not be parsed:", error);
+      }
+    };
+    socket.onerror = () => {
+      console.warn("The user notification WebSocket is unavailable.");
+    };
+    return () => socket.close(1000, "User notification listener closed.");
+  }, [googleIdToken, isAuthenticated, mounted, userProfile.providerId]);
 
   useEffect(() => {
     if (realtimeToast?.type !== "call") return;
@@ -1518,6 +1715,52 @@ function MainChatApp() {
   const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID?.trim() || "";
   const FACEBOOK_APP_ID = process.env.NEXT_PUBLIC_FACEBOOK_APP_ID?.trim() || "";
 
+  function persistAuthForDeviceTrust<T extends object>(
+    token: string,
+    profile: T,
+    trustChoice: "trusted" | "ephemeral" | null = deviceTrustChoice,
+  ) {
+    const resolvedTrustChoice = trustChoice ?? deviceTrustChoice;
+    if (resolvedTrustChoice) setDeviceTrustChoice(resolvedTrustChoice);
+    const serializedProfile = JSON.stringify({ ...profile, customApiKey: "", totpPasscode: "" });
+    if (resolvedTrustChoice === "trusted") {
+      localStorage.setItem("genie_trust_device", "trusted");
+      localStorage.setItem("genie_session_token", token);
+      localStorage.setItem("genie_user_profile", serializedProfile);
+      localStorage.setItem("genie_is_authenticated", "true");
+      sessionStorage.removeItem("genie_google_id_token");
+      sessionStorage.removeItem("genie_trust_device");
+      sessionStorage.removeItem("genie_user_profile_ephemeral");
+      sessionStorage.removeItem("genie_is_authenticated");
+    } else {
+      sessionStorage.setItem("genie_google_id_token", token);
+      if (resolvedTrustChoice === "ephemeral") {
+        sessionStorage.setItem("genie_trust_device", "ephemeral");
+      } else {
+        sessionStorage.removeItem("genie_trust_device");
+      }
+      sessionStorage.setItem("genie_user_profile_ephemeral", serializedProfile);
+      sessionStorage.setItem("genie_is_authenticated", "true");
+      localStorage.removeItem("genie_session_token");
+      localStorage.removeItem("genie_user_profile");
+      localStorage.removeItem("genie_is_authenticated");
+      localStorage.removeItem("genie_trust_device");
+    }
+    localStorage.setItem("genie_terms_agreed", "true");
+    localStorage.removeItem("genie_local_registration_fallback");
+    sessionStorage.removeItem("genie_local_registration_fallback");
+  }
+
+  function persistProfileForDeviceTrust<T extends object>(profile: T) {
+    const serializedProfile = JSON.stringify({ ...profile, customApiKey: "", totpPasscode: "" });
+    if (deviceTrustChoice === "trusted") {
+      localStorage.setItem("genie_user_profile", serializedProfile);
+    } else {
+      sessionStorage.setItem("genie_user_profile_ephemeral", serializedProfile);
+      localStorage.removeItem("genie_user_profile");
+    }
+  }
+
   const isCorporateDomain = Boolean(
     googleIdToken && scopeVerifiedToken === googleIdToken && corporateTenantId,
   );
@@ -1542,27 +1785,149 @@ function MainChatApp() {
     };
   }
 
+  const emptySocialResponse = useCallback((url: string, status = 200): Response => {
+    const payload = url.includes("/invites")
+      ? { invites: [] }
+      : url.includes("friend-requests")
+        ? { requests: [] }
+        : url.includes("/rooms")
+          ? { rooms: [] }
+          : { friends: [] };
+    return new Response(JSON.stringify(payload), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }, []);
+
   const socialFetch = useCallback(async (url: string, init: RequestInit = {}): Promise<Response> => {
-    const token = requireSocialAuth();
-    if (!token) throw new Error("Please sign in to send requests");
+    const token = googleIdToken || getLocalDevelopmentToken();
+    const isRead = !init.method || init.method.toUpperCase() === "GET";
+    if (!token || !isAuthenticated || !userProfile.providerId) {
+      return emptySocialResponse(url, isRead ? 200 : 401);
+    }
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${token}`);
     headers.set("X-User-ID", userProfile.providerId);
     const response = await fetch(url, { ...init, credentials: "include", headers });
     if (response.status === 401 || response.status === 403) {
-      const message = "Please sign in to send requests";
-      setAuthenticatorLoginError(message);
-      setFriendsQueueError(message);
-      setSecurityToast(message);
-      setAuthMode("login");
-      throw new Error(message);
+      invalidateExpiredSession();
+      return isRead ? emptySocialResponse(url) : response;
     }
     return response;
-  }, [requireSocialAuth, userProfile.providerId]);
+  }, [emptySocialResponse, googleIdToken, invalidateExpiredSession, isAuthenticated, userProfile.providerId]);
 
   function openFriendsQueue() {
     if (!requireSocialAuth()) return;
     setFriendsQueueOpen(true);
+  }
+
+  async function openAdminDrawer() {
+    const authorizedAdmin =
+      userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" ||
+      Boolean(getLocalDevelopmentToken());
+    if (!authorizedAdmin || !isSuperAdminVerified) return;
+    setAdminDrawerOpen(true);
+    setAdminDrawerError("");
+    try {
+      const headers = { Authorization: `Bearer ${googleIdToken}` };
+      const [telemetryResponse, requestsResponse] = await Promise.all([
+        fetch(getBackendApiUrl("/api/admin/telemetry"), { cache: "no-store", headers }),
+        fetch(getBackendApiUrl("/api/vip/pending-requests"), { cache: "no-store", headers }),
+      ]);
+      const telemetryResult = await telemetryResponse.json().catch(() => ({})) as AdminTelemetry & { detail?: string };
+      const requestResult = await requestsResponse.json().catch(() => ({})) as {
+        requests?: typeof pendingVipRequests;
+        detail?: string;
+      };
+      if (telemetryResponse.status === 401 || telemetryResponse.status === 403 ||
+        requestsResponse.status === 401 || requestsResponse.status === 403) {
+        invalidateExpiredSession();
+      }
+      if (!telemetryResponse.ok) {
+        setAdminTelemetry(EMPTY_ADMIN_TELEMETRY);
+        setAdminDrawerError(telemetryResult.detail || `Telemetry unavailable (HTTP ${telemetryResponse.status}).`);
+      } else {
+        setAdminTelemetry({ ...EMPTY_ADMIN_TELEMETRY, ...telemetryResult });
+      }
+      if (!requestsResponse.ok) {
+        setPendingVipRequests([]);
+        setAdminDrawerError((previous) =>
+          previous || requestResult.detail || `VIP requests unavailable (HTTP ${requestsResponse.status}).`,
+        );
+      } else {
+        setPendingVipRequests(requestResult.requests || []);
+      }
+    } catch (error) {
+      console.error("Admin drawer refresh failed:", error);
+      setAdminTelemetry(EMPTY_ADMIN_TELEMETRY);
+      setPendingVipRequests([]);
+      setAdminDrawerError(error instanceof Error ? error.message : "Admin dashboard could not be loaded.");
+    }
+  }
+
+  async function verifyAdminKnock(code: string) {
+    if (userProfile.email.trim().toLowerCase() !== "rshaji93@gmail.com") {
+      throw new Error("Administrator sign-in is required.");
+    }
+    const token = googleIdToken || getLocalDevelopmentToken();
+    if (!token) throw new Error("Please sign in as the administrator.");
+    const response = await fetch(getBackendApiUrl("/api/admin/totp/verify"), {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ code }),
+    });
+    const result = await response.json().catch(() => ({})) as { detail?: string };
+    if (!response.ok) throw new Error(result.detail || "Administrator Authenticator verification failed.");
+    try {
+      sessionStorage.setItem("admin_verified", "true");
+    } catch (error) {
+      console.error("Administrator verification state could not be stored for this session:", error);
+      throw new Error("Browser session storage is unavailable. Please enable it and try again.");
+    }
+    await openAdminDrawer();
+  }
+
+  async function reviewVipRequest(
+    request: VipApprovalRequest,
+    decision: "approve" | "reject",
+    code: string,
+    durationDays: number,
+  ) {
+    if (!isSuperAdminVerified) throw new Error("Administrator sign-in is required.");
+    try {
+      const response = await fetch(getBackendApiUrl("/api/vip/review"), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${googleIdToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          request_id: request.request_id,
+          email: request.email,
+          action: decision,
+          duration_days: durationDays,
+          code,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { detail?: string };
+      if (response.status === 401 || response.status === 403) invalidateExpiredSession();
+      if (!response.ok) throw new Error(result.detail || `VIP request ${decision} failed (HTTP ${response.status}).`);
+      setPendingVipRequests((previous) => previous.filter((item) => item.request_id !== request.request_id));
+      setVipReviewTarget(null);
+      setSecurityToast(decision === "approve"
+        ? `VIP access granted to ${request.email} for ${durationDays} days.`
+        : `VIP request from ${request.email} rejected.`);
+      window.setTimeout(() => setSecurityToast(null), 5000);
+      await openAdminDrawer();
+    } catch (error) {
+      console.error("VIP request review failed:", error);
+      const message = error instanceof Error ? error.message : "VIP request could not be reviewed.";
+      setAdminDrawerError(message);
+      throw error instanceof Error ? error : new Error(message);
+    }
   }
 
   const effectiveUserAvatar = isMasterAdmin
@@ -1571,15 +1936,8 @@ function MainChatApp() {
       ? corporateAvatarUrl
       : profileAvatar;
   const canAccessVoiceCall = useCallback(() => {
-    if (!isObserverActive) return false;
-    if (userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com") return true;
-    try {
-      return Boolean(localStorage.getItem("genie_user_byok_key")?.trim());
-    } catch (error) {
-      console.warn("BYOK key could not be checked for voice call access:", error);
-      return false;
-    }
-  }, [isObserverActive, userProfile.email]);
+    return true;
+  }, []);
   const hasVoiceCallAccess = canAccessVoiceCall();
   const isPlatformHost = ADMIN_EMAILS.includes(userProfile.email.toLowerCase());
   const isKeyOwner = byokVerified || isPlatformHost;
@@ -1637,12 +1995,10 @@ function MainChatApp() {
   const roomCapacityLimit =
     roomCapacityMode === "pair"
       ? 2
-      : roomCapacityMode === "squad"
-      ? 10
       : roomCapacityMode === "custom"
-      ? customRoomCapacity
-      : null;
-  const roomCapacityLabel = roomCapacityLimit === null ? "Unlimited" : roomCapacityLimit.toString();
+      ? Math.min(5, customRoomCapacity)
+      : 5;
+  const roomCapacityLabel = `${roomCapacityLimit} (max 5)`;
 
   const currentSession = sessions.find((s) => s.id === currentSessionId) || sessions[0];
   const activeTopic = topics.find((topic) => topic.id === activeTopicId) || topics[0];
@@ -1792,14 +2148,27 @@ function MainChatApp() {
     return encryptAndSendRoomEvent(event, members);
   }
 
-  function startVoiceCall(inviteRoomParticipants = false) {
-    if (!canAccessVoiceCall()) {
-      setVoiceCallGateNotice("Live Voice Calls are exclusive to BYOK users. Please add your Gemini API key in Settings > BYOK to start voice calls.");
-      setSettingsTab("developer");
-      setSettingsOpen(true);
+function startVoiceCall(inviteRoomParticipants = false) {
+    setVoiceCallGateNotice("");
+    // inviteRoomParticipants === true means "Start Call" (Friends P2P)
+    // inviteRoomParticipants === false means "Call Genie" (AI Agent)
+    const isFriendsPeerCall = inviteRoomParticipants;
+
+    if (isFriendsPeerCall && !isTeamMode) {
+      setFriendsQueueOpen(true);
+      setSecurityToast("Select an accepted friend from your directory to start a peer-to-peer call, or invite them to a shared room.");
       return;
     }
-    setVoiceCallGateNotice("");
+
+    if (!isFriendsPeerCall) {
+      setIsObserverActiveState(true);
+    }
+
+    const voiceTransport: "ai" | "mesh" =
+      isFriendsPeerCall && !isObserverActive ? "mesh" : "ai";
+
+    setRoomRtcEvents([]);
+    setActiveVoiceTransport(voiceTransport);
     const callId = isTeamMode && activeRoomVoiceCallId
       ? activeRoomVoiceCallId
       : window.crypto.randomUUID();
@@ -1809,6 +2178,8 @@ function MainChatApp() {
         type: "voice_session.start",
         call_id: callId,
         voice_name: voicePreset,
+        language_code: selectedLang.code,
+        transport: voiceTransport,
       })) return;
       setActiveRoomVoiceCallId(callId);
       setActiveRoomCallOwnerId(roomIdentity);
@@ -1819,35 +2190,48 @@ function MainChatApp() {
     if (isTeamMode && activeRoomVoiceCallId && joinedRoomVoiceCallId !== callId) {
       if (!sendRoomEvent({ type: "USER_JOINED_CALL", call_id: callId })) return;
       setJoinedRoomVoiceCallId(callId);
-    } else if (inviteRoomParticipants && isTeamMode && activeRoomMemberCount >= 2) {
+    } else if (isFriendsPeerCall && isTeamMode) {
       if (!sendRoomEvent({ type: "INCOMING_CALL", call_id: callId })) return;
     }
     setVoiceCallId(callId);
     setIsVoiceCallOpen(true);
   }
 
-  async function claimVipSecretPass(code: string, days: number) {
-    if (!googleIdToken) throw new Error("Sign in with Google before claiming VIP access.");
-    const response = await fetch(getBackendApiUrl("/api/vip/claim-secret-pass"), {
+  function changeVoiceDuringCall(voiceName: string) {
+    if (!isVoicePreset(voiceName)) return;
+    setVoicePreset(voiceName);
+    if (isTeamMode && activeRoomVoiceCallId) {
+      sendRoomEvent({
+        type: "ROOM_VOICE_CONFIG_UPDATE",
+        call_id: activeRoomVoiceCallId,
+        voice_name: voiceName,
+        language_code: selectedLang.code,
+      });
+    }
+  }
+
+  const shouldSubmitVoiceTurn = useCallback((transcript: string) => {
+    if (isObserverActive || (isTeamMode && activeRoomMemberCount > 1)) {
+      return checkWakeWordTrigger(transcript);
+    }
+    return true;
+  }, [activeRoomMemberCount, isObserverActive, isTeamMode]);
+
+  async function requestVipPass(message: string) {
+    if (!googleIdToken || !isAuthenticated) throw new Error("Sign in before requesting a VIP pass.");
+    const response = await fetch(getBackendApiUrl("/api/vip/request"), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${googleIdToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ code, days }),
+      body: JSON.stringify({ message }),
     });
-    const result = await response.json().catch(() => ({})) as { detail?: string; status?: string; expires_at?: string };
-    if (!response.ok || result.status !== "SUCCESS") {
-      throw new Error(result.detail || "VIP claim could not be completed.");
+    const result = await response.json().catch(() => ({})) as { detail?: string; status?: string };
+    if (!response.ok || !result.status) {
+      throw new Error(result.detail || "VIP request could not be submitted.");
     }
-    try {
-      localStorage.setItem(`genie_vip_claimed_${userProfile.email.toLowerCase()}`, "true");
-    } catch (error) {
-      console.warn("VIP entitlement is active but could not be cached on this device:", error);
-    }
-    setVipClaimGranted(true);
-    setIsVipSessionActive(true);
-    setSecurityToast(`VIP access activated until ${new Date(result.expires_at || "").toLocaleString()}.`);
+    setSecurityToast("VIP pass request submitted to admin");
     window.setTimeout(() => setSecurityToast(null), 5000);
   }
 
@@ -2122,8 +2506,12 @@ function MainChatApp() {
       return false;
     }
     try {
+      const imageData = typeof event.image_data === "string" ? event.image_data : undefined;
+      const encryptedContent = imageData
+        ? JSON.stringify({ format: "genie.image.v1", content, image_data: imageData })
+        : content;
       const encryptedPayloads = await encryptRoomMessage(
-        content,
+        encryptedContent,
         roomCryptoIdentity,
         roomIdentity,
         roomMembers.map((member) => ({ id: member.id, publicKey: member.publicKey }))
@@ -2133,6 +2521,7 @@ function MainChatApp() {
         encrypted_payloads: encryptedPayloads,
       };
       delete encryptedEvent.content;
+      delete encryptedEvent.image_data;
       return sendRoomEvent(encryptedEvent);
     } catch (error) {
       console.error("Room message encryption failed:", error);
@@ -2220,8 +2609,36 @@ function MainChatApp() {
         console.error("Room voice session summary is malformed:", error);
       }
     }
-    const displayContent = callTranscript ? formatVoiceCallTranscript(callTranscript) : content;
-    return { ...normalized, content: displayContent, text: displayContent, callTranscript };
+    let displayContent = callTranscript ? formatVoiceCallTranscript(callTranscript) : content;
+    let imageData: string | undefined;
+    if (!callTranscript) {
+      try {
+        const imageMessage = JSON.parse(content) as {
+          format?: string;
+          content?: unknown;
+          image_data?: unknown;
+        };
+        if (
+          imageMessage.format === "genie.image.v1" &&
+          typeof imageMessage.content === "string" &&
+          typeof imageMessage.image_data === "string"
+        ) {
+          displayContent = imageMessage.content;
+          imageData = imageMessage.image_data;
+        }
+      } catch {
+        // Regular room messages remain plain text after decryption.
+      }
+    }
+    return {
+      ...normalized,
+      content: displayContent,
+      text: displayContent,
+      image_data: imageData,
+      forceGenieMaster: Boolean(imageData || normalized.forceGenieMaster || normalized.forceAiIntervention),
+      forceAiIntervention: Boolean(imageData || normalized.forceAiIntervention),
+      callTranscript,
+    };
   }
 
   // Restore authenticated session from localStorage on initial load
@@ -2251,6 +2668,7 @@ function MainChatApp() {
           if (initialRoomId.startsWith("share_") || initialRoomId.startsWith("invite_")) setIsRoomUnlocked(true);
         }
         const storedSessions =
+          sessionStorage.getItem("genie_chat_sessions_ephemeral") ||
           localStorage.getItem("genie_chat_sessions_v2") ||
           localStorage.getItem("genie_chat_sessions");
         if (storedSessions) {
@@ -2295,6 +2713,53 @@ function MainChatApp() {
             }
           }
         }
+        const restoreVaultValue = new URLSearchParams(window.location.search).get("restore_vault");
+        if (restoreVaultValue) {
+          try {
+            const storedBackup = sessionStorage.getItem(`genie_vault_${restoreVaultValue}`) ||
+              localStorage.getItem(`genie_vault_${restoreVaultValue}`);
+            let backupText = storedBackup || decodeURIComponent(restoreVaultValue);
+            if (!storedBackup && !backupText.trimStart().startsWith("{") && !backupText.trimStart().startsWith("[")) {
+              const base64 = backupText.replace(/-/g, "+").replace(/_/g, "/");
+              backupText = decodeURIComponent(
+                Array.from(atob(base64), (character) =>
+                  `%${character.charCodeAt(0).toString(16).padStart(2, "0")}`,
+                ).join(""),
+              );
+            }
+            const parsedBackup: unknown = JSON.parse(backupText);
+            const backupSessions = Array.isArray(parsedBackup)
+              ? parsedBackup
+              : (parsedBackup as { sessions?: unknown[]; backup?: { sessions?: unknown[] } }).sessions ||
+                (parsedBackup as { backup?: { sessions?: unknown[] } }).backup?.sessions;
+            const validBackup = Array.isArray(backupSessions)
+              ? backupSessions.filter(
+                  (session): session is ChatSession =>
+                    Boolean(session) &&
+                    typeof session === "object" &&
+                    typeof (session as ChatSession).id === "string" &&
+                    typeof (session as ChatSession).title === "string" &&
+                    Array.isArray((session as ChatSession).messages),
+                )
+              : [];
+            if (!validBackup.length) throw new Error("The supplied vault backup contains no valid sessions.");
+            const restored = validBackup.map((session) => ({
+              ...session,
+              messages: ensureMessageTimestamps(session.messages),
+              createdAt: session.createdAt || session.messages[0]?.timestamp || new Date().toISOString(),
+            }));
+            setSessions(restored);
+            setTrashSessions(restored.filter((session) => session.isDeleted));
+            const activeSession = restored.find((session) => !session.isDeleted) || restored[0];
+            setCurrentSessionId(activeSession.id);
+            setIsTopicConversation(Boolean(activeSession.topicId));
+            window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
+            setSecurityToast("Vault backup restored into this workspace.");
+          } catch (error) {
+            console.error("Vault backup could not be restored:", error);
+            setChatError(error instanceof Error ? error.message : "Vault backup could not be restored.");
+          }
+        }
         setSessionsHydrated(true);
         const savedGuestId = localStorage.getItem("genie_guest_id");
         if (savedGuestId) setGuestId(savedGuestId);
@@ -2303,11 +2768,45 @@ function MainChatApp() {
           localStorage.setItem("genie_guest_id", newGuestId);
           setGuestId(newGuestId);
         }
-        const restoredGoogleToken =
-          localStorage.getItem("genie_session_token") ||
+        let restoredGoogleToken =
           sessionStorage.getItem("genie_google_id_token") ||
+          localStorage.getItem("genie_session_token") ||
           "";
+        if (restoredGoogleToken.split(".").length === 3) {
+          try {
+            const encodedPayload = restoredGoogleToken.split(".")[1]
+              .replace(/-/g, "+")
+              .replace(/_/g, "/");
+            const payload = JSON.parse(atob(encodedPayload.padEnd(Math.ceil(encodedPayload.length / 4) * 4, "="))) as {
+              exp?: number;
+            };
+            if (typeof payload.exp === "number" && Date.now() >= payload.exp * 1000) {
+              for (const storage of [localStorage, sessionStorage]) {
+                storage.removeItem("genie_session_token");
+                storage.removeItem("genie_google_id_token");
+                storage.removeItem("genie_is_authenticated");
+                storage.removeItem("genie_user_profile");
+                storage.removeItem("genie_user_profile_ephemeral");
+                storage.removeItem("genie_trust_device");
+              }
+              restoredGoogleToken = "";
+              setAuthenticatorLoginError("Your sign-in expired. Please sign in again.");
+            }
+          } catch (error) {
+            console.warn("Cached sign-in token could not be checked for expiration:", error);
+          }
+        }
         setGoogleIdToken(restoredGoogleToken);
+        const trustChoice = localStorage.getItem("genie_trust_device") === "trusted"
+          ? "trusted"
+          : sessionStorage.getItem("genie_trust_device") === "ephemeral"
+            ? "ephemeral"
+            : restoredGoogleToken && localStorage.getItem("genie_session_token")
+              ? "trusted"
+              : null;
+        setDeviceTrustChoice(trustChoice);
+        setTrustThisDevice(trustChoice === "trusted");
+        trustThisDeviceRef.current = trustChoice === "trusted";
 
         try {
           const storedThemeId = localStorage.getItem(THEME_STORAGE_KEY);
@@ -2322,16 +2821,19 @@ function MainChatApp() {
         }
 
         try {
-          const savedAuth = localStorage.getItem("genie_is_authenticated");
-          const savedProfile = localStorage.getItem("genie_user_profile");
+          const savedAuth = localStorage.getItem("genie_is_authenticated") ||
+            sessionStorage.getItem("genie_is_authenticated");
+          const savedProfile = localStorage.getItem("genie_user_profile") ||
+            sessionStorage.getItem("genie_user_profile_ephemeral");
           if (savedAuth === "true" && savedProfile) {
             const parsedProfile = JSON.parse(savedProfile);
             setVipClaimGranted(
               localStorage.getItem(`genie_vip_claimed_${String(parsedProfile.email || "").toLowerCase()}`) === "true",
             );
-            const isDevSession = localStorage.getItem("genie_session_token") === "dev-token-local-bypass";
+            const isDevSession = (sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token")) === "dev-token-local-bypass";
             const isLocalRegistrationFallback =
-              localStorage.getItem("genie_local_registration_fallback") === "true";
+              localStorage.getItem("genie_local_registration_fallback") === "true" ||
+              sessionStorage.getItem("genie_local_registration_fallback") === "true";
             setUserProfile((prev) => ({
               ...prev,
               ...parsedProfile,
@@ -2356,9 +2858,10 @@ function MainChatApp() {
         process.env.NODE_ENV !== "production" &&
         ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname)
       );
+      if (getLocalDevelopmentToken()) activateLocalDevelopmentSession();
       setMounted(true);
     }
-  }, []);
+  }, [activateLocalDevelopmentSession]);
 
   useEffect(() => {
     if (!mounted) return;
@@ -2370,7 +2873,7 @@ function MainChatApp() {
       headers: { Authorization: `Bearer ${googleIdToken}` },
     })
       .then(async (response) => {
-        const result = (await response.json()) as {
+        const result = await response.json().catch(() => ({})) as {
           registered?: boolean;
           requires_setup?: boolean;
           email?: string;
@@ -2391,15 +2894,22 @@ function MainChatApp() {
           profile_complete?: boolean;
           detail?: string;
         };
+        if (!active) return;
         if (response.status === 401) {
-          if (localStorage.getItem("genie_local_registration_fallback") === "true") {
-            throw new Error("The registration service could not verify the saved local session.");
+          if (localStorage.getItem("genie_local_registration_fallback") === "true" ||
+            sessionStorage.getItem("genie_local_registration_fallback") === "true") {
+            invalidateExpiredSession();
+            setAuthenticatorLoginError("The registration service could not verify this saved session. Sign in with Google again.");
+            return;
           }
-          registrationReauthRequiredRef.current = true;
-          setRegistrationReauthRequired(true);
-          sessionStorage.removeItem("genie_google_id_token");
-          localStorage.removeItem("genie_session_token");
-          throw new Error("Your Google sign-in expired or could not be verified. Re-authenticate with Google to continue.");
+          invalidateExpiredSession();
+          setAuthenticatorLoginError("Your Google sign-in expired or could not be verified. Sign in with Google again.");
+          return;
+        }
+        if (response.status === 403) {
+          invalidateExpiredSession();
+          setAuthenticatorLoginError("Google could not verify this sign-in. Please sign in again.");
+          return;
         }
         if (response.status === 404) {
           if (!active) return;
@@ -2415,7 +2925,8 @@ function MainChatApp() {
         setAuthenticatorEnabled(Boolean(result.totp_enabled));
         setUserProfile((previous) => ({ ...previous, totpEnabled: Boolean(result.totp_enabled) }));
         const hasLocalRegistrationFallback =
-          localStorage.getItem("genie_local_registration_fallback") === "true";
+          localStorage.getItem("genie_local_registration_fallback") === "true" ||
+          sessionStorage.getItem("genie_local_registration_fallback") === "true";
         if (hasLocalRegistrationFallback && !result.registered) {
           setRegistrationRequired(false);
           setIsAuthenticated(true);
@@ -2462,15 +2973,8 @@ function MainChatApp() {
           return;
         }
         if (sessionToken !== googleIdToken) setGoogleIdToken(sessionToken);
-        sessionStorage.setItem("genie_google_id_token", sessionToken);
-        if (sessionToken.startsWith("genie1.")) {
-          localStorage.setItem("genie_session_token", sessionToken);
-        }
         setUserProfile(profile);
-        localStorage.setItem("genie_user_profile", JSON.stringify({ ...profile, customApiKey: "", totpPasscode: "" }));
-        localStorage.setItem("genie_is_authenticated", "true");
-        localStorage.setItem("genie_terms_agreed", "true");
-        localStorage.removeItem("genie_local_registration_fallback");
+        persistAuthForDeviceTrust(sessionToken, profile, trustThisDeviceRef.current ? "trusted" : "ephemeral");
         if (profile.providerId && profile.email.trim()) {
           setVerifiedArchiveOwner({
             providerId: profile.providerId,
@@ -2483,7 +2987,8 @@ function MainChatApp() {
       .catch((error: unknown) => {
         if (!active) return;
         console.error("Mandatory registration verification failed:", error);
-        if (localStorage.getItem("genie_local_registration_fallback") === "true") {
+        if (localStorage.getItem("genie_local_registration_fallback") === "true" ||
+          sessionStorage.getItem("genie_local_registration_fallback") === "true") {
           setRegistrationRequired(false);
           setIsAuthenticated(true);
           return;
@@ -2498,7 +3003,7 @@ function MainChatApp() {
     return () => {
       active = false;
     };
-  }, [mounted, googleIdToken, userProfile.providerId, userProfile.email, authenticatorLoginEmail, registrationRequired, API_BASE]);
+  }, [mounted, googleIdToken, userProfile.providerId, userProfile.email, authenticatorLoginEmail, registrationRequired, API_BASE, deviceTrustChoice, invalidateExpiredSession]);
 
   useEffect(() => {
     if (!mounted || !registrationRequired || !registrationReauthRequired) return;
@@ -2692,11 +3197,70 @@ if (!response.ok || !Array.isArray(result.topics)) {
   useEffect(() => {
     if (!mounted || !sessionsHydrated) return;
     try {
-      localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(sessions));
+      if (deviceTrustChoice === "trusted") {
+        localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(sessions));
+        sessionStorage.removeItem("genie_chat_sessions_ephemeral");
+      } else {
+        sessionStorage.setItem("genie_chat_sessions_ephemeral", JSON.stringify(sessions));
+      }
     } catch (error) {
       console.error("Chat session persistence failed:", error);
     }
-  }, [mounted, sessionsHydrated, sessions]);
+  }, [mounted, sessionsHydrated, sessions, deviceTrustChoice]);
+
+  useEffect(() => {
+    if (!mounted || deviceTrustChoice !== "ephemeral" || !googleIdToken) return;
+    const dispatchAndPurge = () => {
+      const transcript: Array<Record<string, unknown>> = sessions.flatMap((session) =>
+        session.messages.map((message) => ({
+          session_id: session.id,
+          session_title: session.title,
+          role: message.role,
+          content: message.content,
+          timestamp: message.timestamp || null,
+        })),
+      );
+      const roomTranscript = isTeamMode
+        ? roomMessages.map((message) => ({
+            room_id: roomId,
+            room_title: roomTitle,
+            role: message.role,
+            content: message.content,
+            timestamp: message.timestamp || null,
+          }))
+        : [];
+      const payload = JSON.stringify({
+        session_token: googleIdToken,
+        transcript: [...transcript, ...roomTranscript],
+        backup: {
+          version: 1,
+          exported_at: new Date().toISOString(),
+          sessions,
+          active_topic: isTopicConversation ? activeTopic : null,
+          room: isTeamMode ? { room_id: roomId, title: roomTitle, messages: roomMessages } : null,
+        },
+      });
+      try {
+        const queued = navigator.sendBeacon(
+          "/api/py/chat/auto-dispatch-transcript",
+          new Blob([payload], { type: "application/json" }),
+        );
+        if (!queued) console.warn("The ephemeral session backup exceeded the browser's beacon queue capacity.");
+      } catch (error) {
+        console.error("Ephemeral session backup could not be queued:", error);
+      }
+      for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+        const key = localStorage.key(index);
+        if (key?.startsWith("genie_")) localStorage.removeItem(key);
+      }
+      for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+        const key = sessionStorage.key(index);
+        if (key?.startsWith("genie_")) sessionStorage.removeItem(key);
+      }
+    };
+    window.addEventListener("beforeunload", dispatchAndPurge);
+    return () => window.removeEventListener("beforeunload", dispatchAndPurge);
+  }, [activeTopic, deviceTrustChoice, googleIdToken, isTeamMode, isTopicConversation, mounted, roomId, roomMessages, roomTitle, sessions]);
 
   useEffect(() => {
     if (themeReady) {
@@ -2939,6 +3503,16 @@ if (!response.ok || !Array.isArray(result.topics)) {
         return;
       }
 
+      if (update.type === "ROOM_FULL_ERROR") {
+        setRoomFullError(true);
+        setChatError("Room is Full (5/5).");
+        return;
+      }
+      if (["PEER_JOINED", "PEER_LEFT", "CALL_OFFER", "CALL_ANSWER", "ICE_CANDIDATE"].includes(update.type)) {
+        setRoomRtcEvents((events) => [...events, { ...update, local_id: window.crypto.randomUUID() }].slice(-128));
+        return;
+      }
+
       if (update.type === "FRIEND_REQUEST_RECEIVED" && update.requester?.user_id) {
         setRealtimeToast({
           type: "friend",
@@ -2968,6 +3542,12 @@ if (!response.ok || !Array.isArray(result.topics)) {
           }));
         }
         setActiveRoomVoiceCallId(update.call_id);
+        setActiveVoiceTransport(update.transport || "ai");
+        if (update.voice_name && isVoicePreset(update.voice_name)) setVoicePreset(update.voice_name);
+        if (update.language_code) {
+          const language = INDIAN_LANGUAGES.find((item) => item.code === update.language_code);
+          if (language) setSelectedLang(language);
+        }
         setActiveRoomCallOwnerId(update.started_by || "");
         if (update.is_rejoin || update.started_by === roomIdentity) {
           setJoinedRoomVoiceCallId(update.call_id);
@@ -2982,6 +3562,24 @@ if (!response.ok || !Array.isArray(result.topics)) {
           status: "active",
         })));
         setRemoteVoiceTurns([]);
+        return;
+      }
+
+      if (
+        update.type === "ROOM_VOICE_CONFIG_UPDATE" &&
+        update.call_id
+      ) {
+        setActiveRoomVoiceCallId(update.call_id);
+        if (update.voice_name && isVoicePreset(update.voice_name)) setVoicePreset(update.voice_name);
+        if (update.language_code) {
+          const language = INDIAN_LANGUAGES.find((item) => item.code === update.language_code);
+          if (language) setSelectedLang(language);
+        }
+        return;
+      }
+
+      if (update.type === "voice_session.voice_updated" && update.voice_name) {
+        if (isVoicePreset(update.voice_name)) setVoicePreset(update.voice_name);
         return;
       }
 
@@ -3308,7 +3906,11 @@ if (!response.ok || !Array.isArray(result.topics)) {
 
   // Google OAuth Initializer
   useEffect(() => {
-    if (!mounted || !GOOGLE_CLIENT_ID) return;
+    if (
+      !mounted ||
+      !GOOGLE_CLIENT_ID ||
+      (googleIdToken === "dev-token-local-bypass" && getLocalDevelopmentToken())
+    ) return;
 
     const setupGoogleAuth = () => {
       const google = (window as any).google;
@@ -3367,6 +3969,8 @@ if (!response.ok || !Array.isArray(result.topics)) {
                 : updatedProfile;
               setUserProfile((prev) => ({ ...prev, ...profileToPersist }));
               setGoogleIdToken(response.credential);
+              const savedDeviceTrust = trustThisDeviceRef.current ? "trusted" : "ephemeral";
+              setDeviceTrustChoice(savedDeviceTrust);
               setIsAuthenticated(false);
               setRegistrationRequired(reauthenticating);
               setRegistrationError(null);
@@ -3378,11 +3982,19 @@ if (!response.ok || !Array.isArray(result.topics)) {
               }
 
               if (typeof window !== "undefined") {
-                localStorage.setItem("genie_user_profile", JSON.stringify(profileToPersist));
                 sessionStorage.setItem("genie_google_id_token", response.credential);
+                sessionStorage.setItem(
+                  "genie_user_profile_ephemeral",
+                  JSON.stringify({ ...profileToPersist, customApiKey: "", totpPasscode: "" }),
+                );
               }
             } catch (err) {
-              console.error("Token decoding error", err);
+              if (getLocalDevelopmentToken()) {
+                console.warn("Google token decoding failed on localhost; using the local development session.");
+                activateLocalDevelopmentSession();
+              } else {
+                console.error("Token decoding error", err);
+              }
             }
           },
           auto_select: false,
@@ -3404,7 +4016,12 @@ if (!response.ok || !Array.isArray(result.topics)) {
           }
         }
       } catch (e) {
-        console.error("Google Auth init failed", e);
+        if (getLocalDevelopmentToken()) {
+          console.warn("Google sign-in initialization failed on localhost; using the local development session.");
+          activateLocalDevelopmentSession();
+        } else {
+          console.error("Google Auth init failed", e);
+        }
       }
     };
 
@@ -3419,7 +4036,7 @@ if (!response.ok || !Array.isArray(result.topics)) {
       }, 350);
       return () => clearInterval(timer);
     }
-  }, [mounted, GOOGLE_CLIENT_ID, isAuthenticated]);
+  }, [mounted, GOOGLE_CLIENT_ID, isAuthenticated, googleIdToken, activateLocalDevelopmentSession]);
 
   const initializeMetaSdk = () => {
     if (!FACEBOOK_APP_ID || typeof window === "undefined") return;
@@ -3852,26 +4469,13 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
   }
 
   async function sendOnboardingInviteEmail(email: string) {
-    if (!requireSocialAuth()) return;
-    setInviteEmailBusy(true);
-    setInviteEmailStatus(null);
-    try {
-      const response = await socialFetch(getBackendApiUrl("/api/invite/email"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ google_id_token: googleIdToken, email }),
-      });
-      const result = (await response.json()) as { success?: boolean; simulated?: boolean; detail?: string };
-      if (!response.ok || !result.success) {
-        throw new Error(result.detail || `Invitation could not be dispatched (HTTP ${response.status}).`);
-      }
-      setInviteEmailStatus(`Invitation email dispatched to ${email}!`);
-    } catch (error) {
-      console.error("Registration invitation failed:", error);
-      setOmniSearchError(error instanceof Error ? error.message : "Invitation could not be sent.");
-    } finally {
-      setInviteEmailBusy(false);
-    }
+    const recipient = email.trim();
+    if (!recipient) return;
+    const subject = "Join me on Personal AI Genie";
+    const body = `I'd like to invite you to connect with me on Personal AI Genie. Sign in at ${window.location.origin}.`;
+    const composeUrl = `https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(recipient)}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    window.open(composeUrl, "_blank", "noopener,noreferrer");
+    setInviteEmailStatus(`Gmail compose opened for ${recipient}.`);
   }
 
   async function updateSocialRelationship(friend: DiscoverableFriend, action: "follow" | "friend-request") {
@@ -4102,10 +4706,8 @@ const [friendResult, roomResult, requestsResult] = await Promise.all([
       }
     }
     if (whatsappWindow) {
-      const message = `Join my shared Genie conversation:`;
-      const encodedMessage = encodeURIComponent(message);
-      const encodedInviteUrl = encodeURIComponent(inviteUrl);
-      whatsappWindow.location.href = `https://wa.me/?text=${encodedMessage}%20${encodedInviteUrl}`;
+      const message = `Join my shared Genie conversation: ${inviteUrl}`;
+      whatsappWindow.location.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
     }
     shareTranscriptRef.current = transcript.map((message) => ({ ...message }));
     shareTranscriptOwnerRef.current = roomIdentity;
@@ -4677,6 +5279,8 @@ if (!response.ok) {
       socialAvatarUrl: "",
       socialProfileId: "",
       isDiscoverable: false,
+      is_admin: false,
+      is_vip: 0,
     });
   };
 
@@ -5260,7 +5864,11 @@ if (!response.ok) {
           session.id === currentSession.id ? { ...session, messages: transcript } : session
         );
         setSessions(nextSessions);
-        localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(nextSessions));
+        if (deviceTrustChoice === "trusted") {
+          localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(nextSessions));
+        } else {
+          sessionStorage.setItem("genie_chat_sessions_ephemeral", JSON.stringify(nextSessions));
+        }
       }
     } catch (error) {
       console.error("Active conversation could not be saved before switching modes:", error);
@@ -5439,7 +6047,7 @@ if (!response.ok) {
 ---
 
 ## 2. SOVEREIGN GOVERNANCE & PRIVACY
-- Free Tier: 20 free daily messages per Google account.
+- Free Tier: 10 free daily quota enforcement (first 6 months of account activity).
 - BYOK: Unlimited token execution directly against Google APIs.
 
 ## 3. Selective Archive Backup & Restoration
@@ -5569,30 +6177,27 @@ if (!response.ok) {
     }
   };
 
-  async function submitVoiceCallTurn(transcript: string): Promise<VoiceCallTurnResult | null> {
+async function submitVoiceCallTurn(transcript: string): Promise<VoiceCallTurnResult | null> {
     const isAdmin = isMasterAdmin;
     const userSpeechText = transcript.trim();
     const activeDialect = selectedLang.label;
-    if (!canAccessVoiceCall()) {
-      const errorMessage = !isObserverActive
-        ? "Voice calls are available only while Observer Mode is ON."
-        : "Live Voice Calls are exclusive to BYOK users. Please add your Gemini API key in Settings > BYOK to start voice calls.";
-      console.warn("Voice call turn rejected: access requirements were not met.");
-      setChatError(errorMessage);
-      return null;
-    }
 
     let apiKey = "";
     let requestToken = googleIdToken;
     try {
       apiKey = localStorage.getItem("genie_user_byok_key")?.trim() || "";
-      const storedSessionToken = localStorage.getItem("genie_session_token") || "";
-      requestToken = storedSessionToken === "dev-token-local-bypass"
-        ? storedSessionToken
-        : googleIdToken || storedSessionToken;
+      const storedSessionToken =
+        sessionStorage.getItem("genie_google_id_token") ||
+        localStorage.getItem("genie_session_token") ||
+        "";
+      requestToken =
+        storedSessionToken === "dev-token-local-bypass"
+          ? storedSessionToken
+          : googleIdToken || storedSessionToken;
     } catch (error) {
       console.warn("Saved voice-call credentials could not be read:", error);
     }
+
     const history = (isTeamMode ? roomMessages : messages)
       .filter((message) => !message.is_deleted)
       .slice(-8)
@@ -5600,6 +6205,7 @@ if (!response.ok) {
         role: message.role === "assistant" ? "model" : "user",
         parts: [{ text: message.content }],
       }));
+
     const requestContents = [
       ...history,
       { role: "user", parts: [{ text: userSpeechText }] },
@@ -5628,6 +6234,7 @@ if (!response.ok) {
             system_text: systemText,
             contents: requestContents,
             voice_name: voicePreset,
+            language_code: selectedLang.code,
             workspace_room_id: isCorporateDomain ? roomId : undefined,
           }),
         });
@@ -5635,6 +6242,7 @@ if (!response.ok) {
         console.warn("Voice service request failed:", error);
         return null;
       }
+
       if (!audioResponse.ok) {
         const errorText = await audioResponse.text();
         let detail = errorText;
@@ -5642,27 +6250,27 @@ if (!response.ok) {
           const errorPayload = JSON.parse(errorText) as { detail?: string; error?: string };
           detail = errorPayload.detail || errorPayload.error || errorText;
         } catch {
-          // Keep the backend response text for non-JSON errors.
+          // Keep raw text for non-JSON returns
         }
+
+        // Only enforce BYOK if server explicitly confirms quota exhaustion
         if (
-          audioResponse.status === 401 ||
-          (audioResponse.status === 403 && detail === "BYOK_REQUIRED")
+          (audioResponse.status === 401 || audioResponse.status === 403) &&
+          detail === "BYOK_REQUIRED"
         ) {
           if (!isAdmin) {
             setIsVoiceCallOpen(false);
             setSettingsTab("developer");
-            setVoiceCallGateNotice("Please provide your Gemini API key in Settings to use Live Voice.");
+            setVoiceCallGateNotice("Daily free quota completed. Add a Gemini API key in Settings > BYOK to continue.");
             setSettingsOpen(true);
             return null;
           }
-          console.warn("Admin voice request was rejected; verify the active sign-in session.");
-          return {
-            text: "Your sign-in session needs to be refreshed before Genie can respond. Please sign in again.",
-          };
         }
+
         console.warn(`Voice service returned HTTP ${audioResponse.status}:`, detail.slice(0, 300));
         return null;
       }
+
       const audioData = (await audioResponse.json()) as {
         text?: string;
         audio?: string;
@@ -5673,19 +6281,22 @@ if (!response.ok) {
           };
         }[];
       };
+
       const responseParts = audioData.candidates?.[0]?.content?.parts || [];
       const assistantText =
         audioData.text?.trim() ||
         responseParts.map((part) => part.text || "").join("").trim();
-      if (!assistantText || !audioData.audio) {
-        console.warn("Voice service returned an incomplete text/audio response.");
+
+      if (!assistantText) {
+        console.warn("Voice service returned an empty response.");
         return null;
       }
 
+      // Return valid text even if audio synthesis fails so browser SpeechSynthesis can speak it
       return {
         text: assistantText,
-        audioData: audioData.audio,
-        audioMimeType: audioData.audio_mime_type,
+        audioData: audioData.audio || "",
+        audioMimeType: audioData.audio_mime_type || "audio/mp3",
       };
     } catch (error) {
       console.warn("Voice turn failed:", error);
@@ -5836,10 +6447,7 @@ if (!response.ok) {
         isCreator: result.profile.is_creator,
         totpPasscode: "",
       };
-      localStorage.setItem("genie_session_token", result.session_token);
-      localStorage.setItem("genie_user_profile", JSON.stringify({ ...profile, customApiKey: "" }));
-      localStorage.setItem("genie_is_authenticated", "true");
-      sessionStorage.setItem("genie_google_id_token", result.session_token);
+      persistAuthForDeviceTrust(result.session_token, profile, trustThisDeviceRef.current ? "trusted" : "ephemeral");
       setGoogleIdToken(result.session_token);
       setUserProfile(profile);
       setAuthenticatorLoginCode("");
@@ -5923,10 +6531,7 @@ if (!response.ok) {
         avatarUrl: devUser.avatar_type === "preset_a" ? "genie-preset:guardian" : "genie-preset:neutral",
         totpPasscode: "",
       };
-      localStorage.setItem("genie_session_token", sessionToken);
-      localStorage.setItem("genie_user_profile", JSON.stringify(devUser));
-      localStorage.setItem("genie_is_authenticated", "true");
-      sessionStorage.setItem("genie_google_id_token", sessionToken);
+      persistAuthForDeviceTrust(sessionToken, profile, trustThisDeviceRef.current ? "trusted" : "ephemeral");
       setGoogleIdToken(sessionToken);
       setUserProfile(profile);
       setRegistrationRequired(false);
@@ -5943,7 +6548,7 @@ if (!response.ok) {
   }
 
   async function handleStartAuthenticatorSetup() {
-    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    const token = googleIdToken || sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     if (!token || token === "dev-token-local-bypass") {
       setAuthenticatorSetupError("Sign in with a verified account before enabling Authenticator.");
       return;
@@ -5964,7 +6569,7 @@ if (!response.ok) {
   }
 
   async function handleVerifyAuthenticatorSetup() {
-    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    const token = googleIdToken || sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     if (!token || !authenticatorSetup || authenticatorSetupCode.length !== 6) return;
     setAuthenticatorSetupBusy(true);
     setAuthenticatorSetupError(null);
@@ -6101,12 +6706,12 @@ if (!response.ok) {
         customApiKey: "",
         totpPasscode: "",
       };
-      localStorage.setItem("genie_user_profile", JSON.stringify(localProfile));
-      localStorage.setItem("genie_session_token", fallbackToken);
-      localStorage.setItem("genie_is_authenticated", "true");
-      localStorage.setItem("genie_terms_agreed", "true");
-      localStorage.setItem("genie_local_registration_fallback", "true");
-      sessionStorage.setItem("genie_google_id_token", fallbackToken);
+      persistAuthForDeviceTrust(fallbackToken, localProfile, trustThisDeviceRef.current ? "trusted" : "ephemeral");
+      if (trustThisDeviceRef.current) {
+        localStorage.setItem("genie_local_registration_fallback", "true");
+      } else {
+        sessionStorage.setItem("genie_local_registration_fallback", "true");
+      }
       setGoogleIdToken(fallbackToken);
       setUserProfile(localProfile);
       setRegistrationRequired(false);
@@ -6179,15 +6784,7 @@ if (!response.ok) {
         allowRoomInvites: result.profile.allow_room_invites,
         avatarUrl: result.profile.avatar_url || userProfile.avatarUrl,
       };
-      localStorage.setItem("genie_user_profile", JSON.stringify({
-        ...completedProfile,
-        customApiKey: "",
-        totpPasscode: "",
-      }));
-      localStorage.setItem("genie_is_authenticated", "true");
-      localStorage.setItem("genie_terms_agreed", "true");
-      sessionStorage.setItem("genie_google_id_token", result.session_token);
-      localStorage.setItem("genie_session_token", result.session_token);
+      persistAuthForDeviceTrust(result.session_token, completedProfile, trustThisDeviceRef.current ? "trusted" : "ephemeral");
       setGoogleIdToken(result.session_token);
       setUserProfile(completedProfile);
       setRegistrationRequired(false);
@@ -6224,7 +6821,7 @@ if (!response.ok) {
   }
 
   async function startProfileTotpSetup() {
-    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    const token = googleIdToken || sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     if (!token) {
       setProfileTotpError("Sign in with your verified account before setting up Authenticator.");
       return;
@@ -6245,7 +6842,7 @@ if (!response.ok) {
   }
 
   async function verifyProfileTotpSetup() {
-    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    const token = googleIdToken || sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     if (!token || !profileTotpSetup || profileTotpCode.length !== 6) return;
     setProfileTotpBusy(true);
     setProfileTotpError(null);
@@ -6275,11 +6872,7 @@ if (!response.ok) {
       setProfileTotpCode("");
       setProfileTotpMessage("Google Authenticator is now enabled for your account.");
       try {
-        localStorage.setItem("genie_user_profile", JSON.stringify({
-          ...updatedProfile,
-          customApiKey: "",
-          totpPasscode: "",
-        }));
+        persistProfileForDeviceTrust(updatedProfile);
       } catch (error) {
         console.warn("Authenticator status could not be cached locally:", error);
       }
@@ -6292,7 +6885,7 @@ if (!response.ok) {
   }
 
   async function requestProfileTotpReset() {
-    const token = googleIdToken || localStorage.getItem("genie_session_token") || "";
+    const token = googleIdToken || sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     if (!token || token === "dev-token-local-bypass") {
       setProfileTotpError("A verified account session is required to request an Authenticator reset.");
       return;
@@ -6419,11 +7012,7 @@ if (!response.ok) {
           : member
       ));
       try {
-        localStorage.setItem("genie_user_profile", JSON.stringify({
-          ...updatedProfile,
-          customApiKey: "",
-          totpPasscode: "",
-        }));
+        persistProfileForDeviceTrust(updatedProfile);
       } catch (error) {
         console.warn("Updated profile is saved on the server but could not be cached locally:", error);
       }
@@ -6450,11 +7039,7 @@ if (!response.ok) {
       const result = (await response.json()) as { detail?: string };
       if (!response.ok) throw new Error(result.detail || `Invite privacy could not be updated (HTTP ${response.status}).`);
       const updatedProfile = { ...userProfile, allowRoomInvites: policy };
-      localStorage.setItem("genie_user_profile", JSON.stringify({
-        ...updatedProfile,
-        customApiKey: "",
-        totpPasscode: "",
-      }));
+      persistProfileForDeviceTrust(updatedProfile);
     } catch (error) {
       setUserProfile((previous) => ({ ...previous, allowRoomInvites: previousPolicy }));
       console.error("Invite privacy update failed:", error);
@@ -6521,6 +7106,27 @@ if (!response.ok) {
                   : "Verify your Gmail with Google, then complete your profile. Authenticator is optional and can be enabled later in Workspace Preferences."}
               </p>
             </div>
+            <label className="flex w-full items-start gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-left">
+              <input
+                type="checkbox"
+                checked={trustThisDevice}
+                onChange={(event) => {
+                  const trusted = event.currentTarget.checked;
+                  trustThisDeviceRef.current = trusted;
+                  setTrustThisDevice(trusted);
+                  setDeviceTrustChoice(trusted ? "trusted" : "ephemeral");
+                }}
+                className="mt-0.5 h-4 w-4 accent-cyan-700"
+              />
+              <span>
+                <span className="block text-xs font-semibold text-slate-700">Trust this device</span>
+                <span className="mt-0.5 block text-[10px] leading-relaxed text-slate-500">
+                  {trustThisDevice
+                    ? "Keep this sign-in and chat vault on this device."
+                    : "Use a temporary session; Genie will try to email a backup when this tab closes."}
+                </span>
+              </span>
+            </label>
             {authMode === "login" ? (
             <form onSubmit={(event) => void handleAuthenticatorLogin(event)} className="w-full space-y-3">
               <label className="block space-y-1 text-left">
@@ -7308,7 +7914,11 @@ if (!response.ok) {
                           setIsTopicConversation(Boolean(restoredSessions[0].topicId));
                           setIsTeamMode(false);
                           setPersonalMessages(restoredSessions[0].messages);
-                          localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(restoredSessions));
+                          if (deviceTrustChoice === "trusted") {
+                            localStorage.setItem("genie_chat_sessions_v2", JSON.stringify(restoredSessions));
+                          } else {
+                            sessionStorage.setItem("genie_chat_sessions_ephemeral", JSON.stringify(restoredSessions));
+                          }
                           setChatVaultOpen(false);
                         } catch (error) {
                           setChatVaultError(
@@ -7410,6 +8020,19 @@ if (!response.ok) {
                 Personal AI Genie
               </span>
             </div>
+            <div className={`${sidebarCollapsed ? "md:hidden" : ""} flex shrink-0 items-center gap-1`}>
+              {!isCorporateDomain && (
+                <button type="button" onClick={openFriendsQueue} title="Inbox and social notifications" aria-label="Inbox and social notifications" className="relative rounded-lg p-2 text-slate-600 hover:bg-white/80">
+                  <MessageSquare className="h-4 w-4" />
+                  {pendingFriendRequests.length + socialInvites.length > 0 && <span className="absolute -right-0.5 -top-0.5 min-w-3.5 rounded-full bg-rose-600 px-1 text-center text-[8px] font-bold leading-3.5 text-white">{pendingFriendRequests.length + socialInvites.length > 99 ? "99+" : pendingFriendRequests.length + socialInvites.length}</span>}
+                </button>
+              )}
+              {(userProfile?.email?.trim().toLowerCase() === "rshaji93@gmail.com" || Boolean(getLocalDevelopmentToken())) && (
+                <button type="button" onClick={() => void openAdminDrawer()} title="Admin telemetry" aria-label="Admin telemetry" className="rounded-lg p-2 text-violet-700 hover:bg-white/80">
+                  <ShieldCheck className="h-4 w-4" />
+                </button>
+              )}
+            </div>
           </div>
 
           {sidebarCollapsed && (
@@ -7425,6 +8048,21 @@ if (!response.ok) {
                       {pendingFriendRequests.length > 99 ? "99+" : pendingFriendRequests.length}
                     </span>
                   )}
+                </button>
+              )}
+              {!isCorporateDomain && (
+                <button type="button" onClick={openFriendsQueue} title="Inbox" aria-label="Inbox" className="relative rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
+                  <MessageSquare className="h-5 w-5" />
+                  {pendingFriendRequests.length + socialInvites.length > 0 && (
+                    <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-rose-600 px-1 text-center text-[9px] font-bold leading-4 text-white">
+                      {pendingFriendRequests.length + socialInvites.length > 99 ? "99+" : pendingFriendRequests.length + socialInvites.length}
+                    </span>
+                  )}
+                </button>
+              )}
+              {(userProfile?.email?.trim().toLowerCase() === "rshaji93@gmail.com" || Boolean(getLocalDevelopmentToken())) && (
+                <button type="button" onClick={() => void openAdminDrawer()} title="Admin telemetry" aria-label="Admin telemetry" className="rounded-xl p-2.5 text-violet-700 hover:bg-white/80">
+                  <ShieldCheck className="h-5 w-5" />
                 </button>
               )}
               <button type="button" onClick={() => setTrashOpen((open) => !open)} title="Trash" aria-label="Trash" className="rounded-xl p-2.5 text-slate-600 hover:bg-white/80">
@@ -8031,7 +8669,7 @@ if (!response.ok) {
             isCallActive={isVoiceCallOpen}
             callStartedAt={voiceCallStartedAt}
             onEndActiveCall={endActiveCallFromHeader}
-            onClaimVip={claimVipSecretPass}
+            onRequestVip={requestVipPass}
             canAccessVoiceCall={hasVoiceCallAccess}
             onOpenSettings={() => setSettingsOpen(true)}
             isAuthenticated={isAuthenticated}
@@ -8041,9 +8679,12 @@ if (!response.ok) {
             onCopyInvite={(mode) => void copyHeaderInvite(mode)}
             onLeaveRoom={handleExitRoomToPersonal}
             onEndRoom={() => void endActiveRoom()}
-            isSuperAdmin={isSuperAdminVerified}
-            adminTelemetry={isSuperAdminVerified ? adminTelemetry : null}
-            adminTelemetryError={adminTelemetryError}
+            canSeeAdminTelemetry={
+              userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" ||
+              Boolean(getLocalDevelopmentToken())
+            }
+            onOpenAdminDrawer={() => void openAdminDrawer()}
+            onVerifyAdminKnock={verifyAdminKnock}
           />
           {realtimeToast && (
             <div
@@ -8119,6 +8760,9 @@ if (!response.ok) {
               callId={voiceCallId}
               isTeamMode={isTeamMode}
               contextMode={spaceMode}
+              isObserverActive={isObserverActive}
+              onToggleObserver={() => void handleObserverToggle()}
+              brandLogoSrc="/avatars/Fixed-brand-Icon.png" 
               participants={isTeamMode
                 ? (voiceCallParticipants.length ? voiceCallParticipants : members.filter((member) => member.status === "active"))
                   .map((member) => ({ id: member.id, name: member.name, avatarUrl: member.avatarUrl }))
@@ -8129,8 +8773,15 @@ if (!response.ok) {
                 avatarUrl: effectiveUserAvatar,
               }}
               remoteTurns={remoteVoiceTurns}
+              rtcTransport={activeVoiceTransport}
+              rtcEvents={roomRtcEvents}
+              onRtcSignal={(event) => sendRoomEvent(event)}
               languageCode={selectedLang.code}
               languageLabel={selectedLang.label}
+              isRoomOriginHost={isCurrentRoomOriginAdmin}
+              selectedVoice={voicePreset}
+              onVoiceChange={changeVoiceDuringCall}
+              shouldSubmitTurn={shouldSubmitVoiceTurn}
               onCopyInvite={() => void copyHeaderInvite(spaceMode)}
               onPingFriend={openFriendsQueue}
               onLanguageChange={changeVoiceCallLanguage}
@@ -8153,7 +8804,7 @@ if (!response.ok) {
                     member.status === "different_room" ? "active in another room" : "offline or idle"
                   }`}>
                     <GenieAvatar
-                      src={member.avatarUrl || "/default-avatar.png"}
+                      src={member.avatarUrl || "/avatars/Fixed-brand-Icon.png"}
                       alt={member.name}
                       className={`h-9 w-9 rounded-full border border-slate-200 ${activeVoiceSpeakerId === member.id ? "animate-pulse ring-2 ring-cyan-400 ring-offset-2" : ""}`}
                     />
@@ -8287,9 +8938,9 @@ if (!response.ok) {
                           <BrandAvatar
                             variant={msg.avatarSrc === "/avatars/Genie PRO.png" ? "faceless-weaver" : getAssistantPersona(msg).variant}
                             className="h-5 w-5"
-                            label={msg.isCallRecord || msg.isVoiceSessionSummary ? "Genie Master" : "Genie response"}
+                            label={msg.isCallRecord || msg.isVoiceSessionSummary || msg.forceGenieMaster ? "Genie Master" : "Genie response"}
                           />
-                          {msg.isCallRecord || msg.isVoiceSessionSummary ? "Genie Master" : getAssistantPersona(msg).badge}
+                          {msg.isCallRecord || msg.isVoiceSessionSummary || msg.forceGenieMaster ? "Genie Master" : getAssistantPersona(msg).badge}
                         </span>
                       ) : isTeamMode && msg.senderName ? (
                         <span className="mb-1 max-w-[85%] truncate px-1 text-[10px] font-semibold text-slate-500">
@@ -8336,6 +8987,13 @@ if (!response.ok) {
                                 </span>
                                 <span className="truncate block opacity-90">{msg.replyTo.content}</span>
                               </div>
+                            )}
+                            {(msg.image_data || msg.image_url || msg.imageUrl) && (
+                              <img
+                                src={msg.image_data || msg.image_url || msg.imageUrl}
+                                alt="Attached image"
+                                className="mb-2 max-h-72 max-w-full rounded-xl border border-white/30 object-contain"
+                              />
                             )}
                             {editingMessageId === (msg.id || String(index)) ? (
                               <div id="room-member-roster" className="space-y-2">
@@ -8482,6 +9140,8 @@ if (!response.ok) {
                             />
                           )}
                           <MessageBubble
+                            imageData={msg.image_data}
+                            imageUrl={msg.image_url || msg.imageUrl}
                             className={`group relative max-w-full rounded-2xl rounded-bl-none px-4 py-3 text-sm leading-relaxed border shadow-sm ${
                               selectedMessageIds.has(getMessageSelectionId(msg, index))
                                 ? "ring-2 ring-indigo-500/50 "
@@ -8493,7 +9153,7 @@ if (!response.ok) {
                             }`}
                           >
                             {msg.isForwarded && <p className="mb-1 text-[10px] font-semibold text-slate-500">Forwarded from {msg.forwardedFrom || "another chat"}</p>}
-                            <p className="whitespace-pre-wrap">{msg.content}</p>
+                            <p className="whitespace-pre-wrap">{msg.role === "assistant" ? sanitizeChatText(msg.content) : msg.content}</p>
                             {(msg.source === "local_agent" || msg.source === "platform_engine") && msg.agentOutput && (
                               <div className="mt-3 space-y-2 border-t border-slate-200/80 pt-3 text-xs">
                                 <div className="flex items-center justify-between gap-2">
@@ -8625,7 +9285,7 @@ if (!response.ok) {
                         <MessageBubble
                           className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-bl-none border border-cyan-200 bg-white px-4 py-3 text-sm leading-relaxed text-slate-800 shadow-sm"
                         >
-                          {streamingPreview}
+                          {sanitizeChatText(streamingPreview)}
                         </MessageBubble>
                       </div>
                     ) : (
@@ -9142,22 +9802,59 @@ if (!response.ok) {
                     ))}
                   </div>
                 )}
+                {attachedImageData && (
+                  <div className="mb-2 flex items-center gap-2 rounded-xl border border-purple-200 bg-purple-50 p-2">
+                    <img src={attachedImageData} alt="Image attachment preview" className="h-12 w-12 rounded-lg object-cover" />
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700">Image attached — Genie Master will analyze it</span>
+                    <button
+                      type="button"
+                      onClick={() => setAttachedImageData(null)}
+                      aria-label="Remove attached image"
+                      className="rounded-full p-1 text-slate-500 hover:bg-white"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
                 <form
-                  onSubmit={(e) => handleSendMessage(e, false)}
+                  onSubmit={(e) => void handleSendMessage(e, false, undefined, false, false, undefined, false, false, false, attachedImageData || undefined)}
                   className="w-full flex items-center bg-white border border-slate-200 shadow-md rounded-2xl sm:rounded-full px-2 sm:px-4 py-1.5 sm:py-2 hover:shadow-lg focus-within:border-purple-400 focus-within:ring-2 focus-within:ring-purple-100 transition-all gap-1 sm:gap-2"
                 >
+                  <input
+                    type="file"
+                    ref={imageFileInputRef}
+                    accept="image/*"
+                    capture="environment"
+                    onChange={(event) => {
+                      const file = event.currentTarget.files?.[0];
+                      if (file) attachImageFile(file);
+                      event.currentTarget.value = "";
+                    }}
+                    className="hidden"
+                  />
                   <input
                     type="file"
                     ref={fileInputRef}
                     onChange={(e) => {
                       const f = e.target.files?.[0];
-                      if (f)
+                      if (f?.type.startsWith("image/")) {
+                        attachImageFile(f);
+                      } else if (f) {
                         setPrompt((prev) =>
                           prev ? `${prev} [Attached File: ${f.name}]` : `[Attached File: ${f.name}] `
                         );
+                      }
                     }}
                     className="hidden"
                   />
+                  <button
+                    type="button"
+                    onClick={() => imageFileInputRef.current?.click()}
+                    className="p-1 sm:p-2 text-slate-400 hover:text-purple-600 transition-colors shrink-0"
+                    title="Attach an image"
+                  >
+                    <ImagePlus className="w-4 h-4 sm:w-5 sm:h-5" />
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -9167,7 +9864,7 @@ if (!response.ok) {
                     className="p-1 sm:p-2 text-slate-400 hover:text-purple-600 transition-colors shrink-0"
                     title="Productivity Boosters & File Upload"
                   >
-                    <Plus className="w-4 h-4 sm:w-5 sm:h-5" />
+                    <MoreHorizontal className="w-4 h-4 sm:w-5 sm:h-5" />
                   </button>
 
                   <button
@@ -9187,6 +9884,15 @@ if (!response.ok) {
                     ref={promptInputRef}
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
+                    onPaste={(event) => {
+                      const imageFile = Array.from(event.clipboardData.items)
+                        .find((item) => item.type.startsWith("image/"))
+                        ?.getAsFile();
+                      if (imageFile) {
+                        event.preventDefault();
+                        attachImageFile(imageFile);
+                      }
+                    }}
                     placeholder={
                       isListening
                         ? `Listening in ${selectedLang.label}...`
@@ -9267,7 +9973,7 @@ if (!response.ok) {
                     ) : (
                       <button
                         type="submit"
-                        disabled={!prompt.trim() || (isObserverActive && isQuotaEnforced && remainingDailyChats === 0)}
+                        disabled={(!prompt.trim() && !attachedImageData) || (isObserverActive && isQuotaEnforced && remainingDailyChats === 0)}
                         className={`p-1.5 sm:p-2 bg-gradient-to-r ${selectedTheme.gradientClass} text-white rounded-full disabled:opacity-40 transition-all shadow-xs shrink-0`}
                         title="Send message"
                       >
@@ -9348,7 +10054,7 @@ if (!response.ok) {
               <div>
                 <h4 className="font-bold text-slate-800 text-sm mb-1">3. Quota Limits, Sovereign Rooms & BYOK</h4>
                 <p>
-                  - <strong>Free Quota</strong>: Standard consumer accounts receive twenty (20) interactions per rolling 24-hour cycle.
+                  - <strong>Free Quota</strong>: 10 free daily quota enforcement (first 6 months of account activity).
                   <br />
                   - <strong>Bring Your Own Key (BYOK)</strong>: When supplying your own Gemini API keys, token billing and quota terms are directly between you and the respective model provider.
                   <br />
@@ -9426,9 +10132,9 @@ if (!response.ok) {
             </div>
 
             <div className="text-center">
-              <h3 className="text-base font-bold text-slate-800">Daily Free Limit Reached (20/20)</h3>
+              <h3 className="text-base font-bold text-slate-800">Daily Free Limit Reached (10/10)</h3>
               <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-                You have used all 20 free messages for today. Your free quota resets every 24 hours. Want unlimited access right now?
+                You have used all 10 free messages for today. The daily quota is available during the first 6 months of account activity. Add your own Gemini key after that period.
               </p>
             </div>
 
@@ -9486,15 +10192,15 @@ if (!response.ok) {
             <section className="grid gap-2 sm:grid-cols-2">
               <button
                 type="button"
-                disabled={!isAuthenticated || !canManageRoomPolicy || (spaceMode === "personal" && activeRoomMemberCount >= 5)}
+                disabled={!isAuthenticated || !canManageRoomPolicy || activeRoomMemberCount >= 5}
                 onClick={() => {
                   setRoomAdminOpen(false);
                   void copyHeaderInvite(spaceMode);
                 }}
-                title={spaceMode === "personal" && activeRoomMemberCount >= 5 ? "Personal Room Full (Max 5)" : undefined}
+                title={activeRoomMemberCount >= 5 ? "Room Capacity Full (5/5)" : undefined}
                 className="rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2.5 text-left text-xs font-semibold text-cyan-900 hover:bg-cyan-100 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Copy 1-on-1 Named Invite Link
+                {activeRoomMemberCount >= 5 ? "Room Capacity Full (5/5)" : "Copy Private Room Link"}
               </button>
               <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5">
                 <button
@@ -9799,6 +10505,78 @@ if (!response.ok) {
             </div>
           </section>
         </div>
+      )}
+
+      {roomFullError && (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm" role="alertdialog" aria-modal="true" aria-labelledby="room-full-title">
+          <section className="w-full max-w-sm rounded-2xl border border-amber-200 bg-white p-6 text-center shadow-2xl">
+            <p className="text-3xl" aria-hidden="true">👥</p>
+            <h2 id="room-full-title" className="mt-3 text-lg font-bold text-slate-900">Room is Full (5/5)</h2>
+            <p className="mt-2 text-sm text-slate-600">This room has reached its five-member limit. Ask the host to make space before joining.</p>
+            <button type="button" onClick={() => setRoomFullError(false)} className="mt-5 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-700">Close</button>
+          </section>
+        </div>
+      )}
+
+      {adminDrawerOpen && isSuperAdminVerified && userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" && (
+        <div
+          className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setAdminDrawerOpen(false);
+          }}
+        >
+          <section role="dialog" aria-modal="true" aria-labelledby="admin-dashboard-title" className="max-h-[88vh] w-full max-w-2xl overflow-y-auto rounded-3xl border border-violet-200 bg-slate-950 p-5 text-white shadow-2xl">
+            <div className="mb-5 flex items-center justify-between gap-3">
+              <div>
+                <h2 id="admin-dashboard-title" className="flex items-center gap-2 text-lg font-bold"><ShieldCheck className="h-5 w-5 text-violet-300" /> Admin Telemetry</h2>
+                <p className="mt-1 text-xs text-slate-400">Aggregate service and VIP-request status.</p>
+              </div>
+              <div className="flex gap-2">
+                <button type="button" onClick={() => void openAdminDrawer()} className="rounded-lg border border-slate-700 px-3 py-2 text-xs font-semibold hover:bg-slate-800">Refresh</button>
+                <button type="button" onClick={() => setAdminDrawerOpen(false)} aria-label="Close admin telemetry" className="rounded-lg p-2 text-slate-400 hover:bg-slate-800"><X className="h-4 w-4" /></button>
+              </div>
+            </div>
+            {adminDrawerError && <p role="alert" className="mb-4 rounded-xl border border-rose-900 bg-rose-950/60 px-3 py-2 text-xs text-rose-200">{adminDrawerError}</p>}
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="rounded-xl border border-slate-800 bg-slate-900 p-4"><p className="text-xs text-slate-400">Registered accounts</p><p className="mt-2 text-2xl font-bold">{adminTelemetry?.total_registered ?? "—"}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900 p-4"><p className="text-xs text-slate-400">Live WebSocket connections</p><p className="mt-2 text-2xl font-bold">{adminTelemetry?.live_active ?? "—"}</p></div>
+              <div className="rounded-xl border border-slate-800 bg-slate-900 p-4"><p className="text-xs text-slate-400">Offline accounts</p><p className="mt-2 text-2xl font-bold">{adminTelemetry?.offline_users ?? (adminTelemetry ? Math.max(0, adminTelemetry.total_registered - (adminTelemetry.online_users ?? adminTelemetry.live_active)) : "—")}</p></div>
+            </div>
+            <div className="mt-3 rounded-xl border border-violet-900/70 bg-violet-950/30 p-4">
+              <div className="flex flex-wrap justify-between gap-2 text-sm"><span>VIP seats claimed</span><strong>{adminTelemetry?.active_vips ?? "—"} / 20</strong></div>
+              <div className="mt-1 flex flex-wrap justify-between gap-2 text-xs text-violet-200"><span>Remaining VIP pool</span><strong>{adminTelemetry?.vip_pool_remaining ?? "—"}</strong></div>
+            </div>
+            <div className="mt-6">
+              <h3 className="mb-3 text-xs font-bold uppercase tracking-wide text-slate-300">Pending VIP requests</h3>
+              {pendingVipRequests.length ? (
+                <div className="space-y-2">
+                  {pendingVipRequests.map((request) => (
+                    <article key={request.request_id} className="flex flex-wrap items-center gap-3 rounded-xl border border-slate-800 bg-slate-900 p-3">
+                      <div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{request.email}</p>{request.message && <p className="mt-1 text-xs text-slate-400">{request.message}</p>}</div>
+                      <button type="button" onClick={() => setVipReviewTarget({ request, action: "approve" })} className="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold hover:bg-emerald-600">Approve</button>
+                      <button type="button" onClick={() => setVipReviewTarget({ request, action: "reject" })} className="rounded-lg border border-rose-900 px-3 py-2 text-xs font-bold text-rose-300 hover:bg-rose-950">Reject</button>
+                    </article>
+                  ))}
+                </div>
+              ) : <p className="rounded-xl border border-slate-800 bg-slate-900 p-3 text-xs text-slate-400">No pending VIP requests.</p>}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {vipReviewTarget && userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" && (
+        <StealthVipModal
+          request={vipReviewTarget.request}
+          action={vipReviewTarget.action}
+          onClose={() => setVipReviewTarget(null)}
+          onSubmit={(code, durationDays) => reviewVipRequest(
+            vipReviewTarget.request,
+            vipReviewTarget.action,
+            code,
+            durationDays,
+          )}
+        />
       )}
 
       {!isCorporateDomain && friendsQueueOpen && (
@@ -10362,7 +11140,7 @@ if (!response.ok) {
                           </>
                         ) : (
                           <>
-                            <ShieldCheck className="w-3 h-3" /> Free Tier ({remainingDailyChats}/20 Left Today)
+                            <ShieldCheck className="w-3 h-3" /> Free Tier ({remainingDailyChats}/{DAILY_FREE_LIMIT} Left Today)
                           </>
                         )}
                       </span>
@@ -10652,6 +11430,20 @@ if (!response.ok) {
                           : "★ BYOK Unlimited"}
                   </p>
                 </div>
+                {isMasterAdmin ? (
+                  <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-xs font-bold text-emerald-800">
+                    <ShieldCheck className="h-4 w-4" />
+                    Unlimited Admin Active
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setVipRequestModalOpen(true)}
+                    className="w-full rounded-xl border border-violet-200 bg-violet-50 px-3 py-2.5 text-left text-xs font-bold text-violet-800 transition-colors hover:bg-violet-100"
+                  >
+                    Get VIP Pass
+                  </button>
+                )}
                 <StudentBanner onSelectPrompt={(text) => {
                   setPrompt(text);
                   setSettingsOpen(false);
@@ -10970,7 +11762,7 @@ if (!response.ok) {
                   <p className="font-semibold text-slate-800">Active Multi-Model Failover Highlights:</p>
                   <ul className="list-disc pl-4 space-y-1 text-[11px]">
                     <li>Active cascade across authorized Google Gemini endpoints.</li>
-                    <li>RFC 6238 TOTP two-tier authentication and 10 free daily quota enforcement.</li>
+                    <li>10 free daily quota enforcement (first 6 months of account activity).</li>
                     <li>Non-professional algorithmic output: verify all code and technical data.</li>
                   </ul>
                   <button
@@ -11038,6 +11830,12 @@ if (!response.ok) {
             </div>
           </div>
         </div>
+      )}
+      {vipRequestModalOpen && (
+        <RequestVIPModal
+          onClose={() => setVipRequestModalOpen(false)}
+          onRequest={requestVipPass}
+        />
       )}
     </>
   );
@@ -11363,6 +12161,62 @@ if (!response.ok) {
     );
   }
 
+  function attachImageFile(file: File) {
+    if (!file.type.startsWith("image/")) {
+      setChatError("Choose an image file to attach.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setChatError("Images must be 5 MB or smaller.");
+      return;
+    }
+    const source = new window.Image();
+    const objectUrl = URL.createObjectURL(file);
+    source.onload = async () => {
+      URL.revokeObjectURL(objectUrl);
+      const maxDimension = 1600;
+      const scale = Math.min(1, maxDimension / Math.max(source.naturalWidth, source.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(source.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(source.naturalHeight * scale));
+      const context = canvas.getContext("2d");
+      if (!context) {
+        setChatError("This browser could not prepare the selected image.");
+        return;
+      }
+      context.drawImage(source, 0, 0, canvas.width, canvas.height);
+      const maxBytes = isTeamMode ? 800 * 1024 : 5 * 1024 * 1024;
+      for (const quality of [0.82, 0.68, 0.52, 0.4]) {
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob(resolve, "image/webp", quality),
+        );
+        if (!blob) break;
+        if (blob.size <= maxBytes) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (typeof reader.result === "string") {
+              setAttachedImageData(reader.result);
+              setChatError(null);
+            }
+          };
+          reader.onerror = () => setChatError("The selected image could not be prepared.");
+          reader.readAsDataURL(blob);
+          return;
+        }
+      }
+      setChatError(
+        isTeamMode
+          ? "This image could not be compressed enough for secure room sharing."
+          : "This image could not be compressed to the supported size.",
+      );
+    };
+    source.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      setChatError("The selected image could not be decoded.");
+    };
+    source.src = objectUrl;
+  }
+
   async function handleSendMessage(
     e?: React.FormEvent,
     forceRainbowTrigger = false,
@@ -11372,7 +12226,8 @@ if (!response.ok) {
     onResponseGenerated?: (content: string) => void,
     forceGenieResponse = false,
     forceBackendVoice = false,
-    forceVoiceRecord = false
+    forceVoiceRecord = false,
+    imageData?: string
   ) {
     if (e) e.preventDefault();
     if (!isTeamMode && currentSession?.isArchived) {
@@ -11393,7 +12248,8 @@ if (!response.ok) {
     const byokKey = storedByokKey.trim() || (byokVerified ? byokApiKey.trim() : "");
     const observerModeForRequest = forceObserverMode || isObserverActive;
     const textToSend = scrubSensitiveClientTokens(customText !== undefined ? customText : prompt);
-    if (!textToSend.trim() && !forceRainbowTrigger) return;
+    const imageDataForRequest = imageData || undefined;
+    if (!textToSend.trim() && !forceRainbowTrigger && !imageDataForRequest) return;
     if (isStreaming) return;
     const topicIdForRequest = activeTopic?.id || "topic_1";
     const sessionArchiveForRequest = !isTeamMode && Boolean(currentSession?.isSharedArchive);
@@ -11405,12 +12261,23 @@ if (!response.ok) {
     isAuthenticated &&
     Boolean(googleIdToken && userProfile.providerId);
 
-    const actualText = textToSend.trim() || (forceRainbowTrigger ? "Genie, please analyze the conversation and assist." : "");
-    const shouldWakeGenie =
-      !isTeamMode ||
-      forceRainbowTrigger ||
-      forceGenieResponse ||
-      checkWakeWordTrigger(actualText);
+    const actualText = textToSend.trim() || (
+      imageDataForRequest
+        ? "Please analyze the attached image and respond as Genie Master."
+        : forceRainbowTrigger
+        ? "Genie, please analyze the conversation and assist."
+        : ""
+    );
+    const shouldWakeGenie = isTeamMode
+      ? Boolean(
+          isObserverActive ||
+          forceObserverMode ||
+          forceRainbowTrigger ||
+          forceGenieResponse ||
+          imageDataForRequest ||
+          checkWakeWordTrigger(actualText)
+        )
+      : true; // Individual chat: Observer OFF -> Genie Pro; Observer ON -> Genie Master
     if (shouldWakeGenie && observerModeForRequest && isQuotaEnforced && dailyUsageCount >= DAILY_FREE_LIMIT) {
       setQuotaExceededModalOpen(true);
       return;
@@ -11422,12 +12289,16 @@ if (!response.ok) {
       !(await sendEncryptedRoomEvent({
         type: "message.send",
         content: actualText,
+        image_data: imageDataForRequest,
+        force_ai_intervention: Boolean(imageDataForRequest),
+        force_genie_master: Boolean(imageDataForRequest || observerModeForRequest || forceRainbowTrigger),
         sender_name: userProfile.socialHandle || userProfile.name,
         is_voice_record: forceVoiceRecord,
       }))
     ) return;
 
     setPrompt("");
+    if (imageDataForRequest) setAttachedImageData(null);
     setReplyTarget(null);
     setEmojiPickerOpen(false);
     setAttachmentMenuOpen(false);
@@ -11435,6 +12306,9 @@ if (!response.ok) {
     const userMsg: Message = {
       role: "user",
       content: actualText,
+      image_data: imageDataForRequest,
+      forceGenieMaster: Boolean(imageDataForRequest),
+      forceAiIntervention: Boolean(imageDataForRequest),
       id: window.crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       text: actualText,
@@ -11484,13 +12358,15 @@ if (!response.ok) {
     let finalAgentOutput: Message["agentOutput"];
     let finalProvider: string | undefined;
     let finalProviderModel: string | undefined;
+    let finalSpeaker: string | undefined;
+    let finalForceGenieMaster = Boolean(imageDataForRequest);
     let finalAutoFallback = false;
-    const storedSessionToken = localStorage.getItem("genie_session_token") || "";
+    const storedSessionToken = sessionStorage.getItem("genie_google_id_token") || localStorage.getItem("genie_session_token") || "";
     const requestToken = storedSessionToken === "dev-token-local-bypass"
       ? storedSessionToken
       : googleIdToken || storedSessionToken;
     const isLocalDevSession = requestToken === "dev-token-local-bypass";
-    const useChatStream = observerModeForRequest && !routedPersonalTopic && !isLocalDevSession;
+    const useChatStream = observerModeForRequest && !routedPersonalTopic && !isLocalDevSession && !imageDataForRequest;
     setStreamingPreview("");
     setStreamingAutoFallback(false);
 
@@ -11498,7 +12374,7 @@ if (!response.ok) {
     activeChatAbortControllerRef.current = controller;
 
     try {
-      if (byokKey && routedPersonalTopic) {
+      if (byokKey && routedPersonalTopic && !imageDataForRequest) {
         const directResult = await callActiveGeminiCascade(
           actualText,
           isTeamMode
@@ -11519,7 +12395,7 @@ if (!response.ok) {
       let historyForRequest = isTeamMode
         ? [...roomMessages, userMsg].filter((message) => !message.is_deleted).slice(-20)
         : updatedMessages;
-      if (isTeamMode && observerModeForRequest && updatedMessages.length > 0) {
+      if (isTeamMode && observerModeForRequest && updatedMessages.length > 0 && !imageDataForRequest) {
         const reviewResponse = await fetch(getBackendApiUrl("/api/team/summarize-review"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -11564,6 +12440,9 @@ if (!response.ok) {
             message_id: userMsg.id,
             observer_mode: observerModeForRequest,
             byok_key: byokKey || undefined,
+            image_data: imageDataForRequest,
+            force_genie_master: Boolean(imageDataForRequest || observerModeForRequest || forceRainbowTrigger),
+            force_ai_intervention: Boolean(imageDataForRequest),
           }
         : {
             user_email: userProfile.email,
@@ -11585,6 +12464,9 @@ if (!response.ok) {
               ? { author: sentReplyTarget.author, content: sentReplyTarget.content }
               : undefined,
             byok_key: byokKey || undefined,
+            image_data: imageDataForRequest,
+            force_genie_master: Boolean(imageDataForRequest || observerModeForRequest || forceRainbowTrigger),
+            force_ai_intervention: Boolean(imageDataForRequest),
           };
       const authHeaders: Record<string, string> = { "Content-Type": "application/json" };
       if (byokKey) authHeaders["x-byok-key"] = byokKey;
@@ -11612,13 +12494,23 @@ if (!response.ok) {
         const errText = await res.text();
         console.error("AI turn response error:", errText);
         let responseMessage = errText;
+        let requiresByok = false;
         try {
-          const errorPayload = JSON.parse(errText) as { detail?: string; error?: string };
-          responseMessage = errorPayload.detail || errorPayload.error || errText;
+          const errorPayload = JSON.parse(errText) as {
+            detail?: string;
+            error?: string;
+            code?: string;
+            message?: string;
+          };
+          requiresByok = errorPayload.code === "BYOK_REQUIRED";
+          responseMessage = errorPayload.message ||
+            (typeof errorPayload.detail === "string" ? errorPayload.detail : "") ||
+            errorPayload.error ||
+            errText;
         } catch {
           responseMessage = errText;
         }
-        throw new Error(`AI turn failed (HTTP ${res.status}): ${responseMessage.slice(0, 300)}`);
+        throw new Error(`${requiresByok ? "BYOK_REQUIRED: " : ""}AI turn failed (HTTP ${res.status}): ${responseMessage.slice(0, 300)}`);
       }
       if (useChatStream) {
         if (!res.body) throw new Error("Chat backend did not provide a readable event stream.");
@@ -11637,6 +12529,8 @@ if (!response.ok) {
             provider?: string;
             model?: string;
             source?: Message["source"];
+            speaker?: string;
+            persona?: string;
             text?: string;
             failed?: string;
             message?: string;
@@ -11645,6 +12539,8 @@ if (!response.ok) {
             finalProvider = eventData.provider;
             finalProviderModel = eventData.model;
             finalModel = eventData.model;
+            finalSpeaker = eventData.speaker;
+            finalForceGenieMaster = eventData.persona === "Genie-Master";
             if (eventData.source) finalSource = eventData.source;
           } else if (eventName === "fallback") {
             finalAutoFallback = true;
@@ -11682,6 +12578,8 @@ if (!response.ok) {
         finalModel = "Genie";
         setActiveModelName("Genie");
         finalAgentOutput = data.agent_output;
+        finalSpeaker = typeof data.speaker === "string" ? data.speaker : undefined;
+        finalForceGenieMaster = data.persona === "Genie-Master" || data.force_genie_master === true;
         finalProvider = data.provider_source === "openrouter-fallback"
           ? "OpenRouter"
           : data.provider_source === "gemini"
@@ -11708,6 +12606,13 @@ if (!response.ok) {
         (primaryError instanceof Error && primaryError.name === "AbortError")
       ) {
         setChatError(null);
+      } else if (primaryError instanceof Error && primaryError.message.includes("BYOK_REQUIRED")) {
+        setSettingsOpen(true);
+        setSettingsTab("developer");
+        setChatError(primaryError.message.replace(/^BYOK_REQUIRED:\s*/, ""));
+      } else if (imageDataForRequest) {
+        const diagnostic = primaryError instanceof Error ? primaryError.message : "Image analysis failed.";
+        setChatError(`Genie Master image analysis failed: ${diagnostic}`);
       } else if (routedPersonalTopic || !observerModeForRequest) {
         const diagnostic = primaryError instanceof Error ? primaryError.message : "Topic chat request failed.";
         console.error("Personal topic chat request failed:", primaryError);
@@ -11772,10 +12677,16 @@ if (!response.ok) {
           avatarSrc: "/avatars/Genie PRO.png",
           senderName: interventionResponse
             ? "Personal AI Genie • In-chat Intervention"
-            : "Personal AI Genie",
+            : imageDataForRequest
+            ? "Genie Master"
+            : finalSpeaker || "Personal AI Genie",
           sender_name: interventionResponse
             ? "Personal AI Genie • In-chat Intervention"
-            : "Personal AI Genie",
+            : imageDataForRequest
+            ? "Genie Master"
+            : finalSpeaker || "Personal AI Genie",
+          forceGenieMaster: finalForceGenieMaster,
+          forceAiIntervention: Boolean(interventionResponse || imageDataForRequest),
           modelUsed: finalModel,
           source: finalSource,
           provider: finalProvider,
@@ -11795,6 +12706,8 @@ if (!response.ok) {
             sender_name: responseMessage.sender_name,
             source: responseMessage.source,
             agent_name: responseMessage.agentName,
+            force_genie_master: responseMessage.forceGenieMaster,
+            force_ai_intervention: responseMessage.forceAiIntervention,
             is_voice_record: forceVoiceRecord,
           });
         } else {

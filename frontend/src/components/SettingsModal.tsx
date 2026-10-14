@@ -59,12 +59,14 @@ export default function SettingsModal({
   } | null>(null);
   const [telemetryBusy, setTelemetryBusy] = useState(false);
   const [telemetryError, setTelemetryError] = useState<string | null>(null);
+  const isLocalDevelopment =
+    process.env.NODE_ENV !== "production" &&
+    typeof window !== "undefined" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
   const canViewTelemetry =
     user?.email?.trim().toLowerCase() === "rshaji93@gmail.com" ||
     userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" ||
-    user?.is_vip === 1 ||
-    userProfile.is_vip === 1 ||
-    Boolean(user?.is_admin);
+    isLocalDevelopment;
   const isAdminAvatarLocked =
     userProfile.email.trim().toLowerCase() === "rshaji93@gmail.com" ||
     user?.email?.trim().toLowerCase() === "rshaji93@gmail.com" ||
@@ -452,6 +454,7 @@ export default function SettingsModal({
                 <aside className="rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-[10px] leading-relaxed text-slate-700" aria-label="BYOK privacy guidance">
                   <h4 className="mb-1 font-bold text-slate-900">Personal Mode</h4>
                   <ul className="list-disc space-y-1 pl-4">
+                    <li>10 free daily quota enforcement (first 6 months of account activity).</li>
                     <li>Your key is stored in this browser and is not included in profile sync or Genie application logs. It is transmitted over HTTPS to Genie for request processing and forwarded to Google; Google bills usage and applies its quota/terms. Genie is not responsible for provider charges.</li>
                     <li>Room owners control whether invitees see earlier history. Export is unavailable to invited guests in multi-user Personal Mode.</li>
                     <li>Only the Room Owner may save a Personal Mode voice-call log.</li>

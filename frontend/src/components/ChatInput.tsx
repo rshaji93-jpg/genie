@@ -1,6 +1,6 @@
 "use client";
 import React, { useState, useRef } from "react";
-import { Plus, Mic, MicOff, ChevronDown, Send, Globe, ShieldCheck } from "lucide-react";
+import { Plus, Mic, MicOff, ChevronDown, Send, Globe, ShieldCheck, X } from "lucide-react";
 import { StudentQuotesTicker, StudyRoomPresetGrid } from "./StudentSection";
 
 const INDIAN_LANGUAGES = [
@@ -36,22 +36,54 @@ interface SpeechRecognitionWindow extends Window {
 
 export default function ChatInput({
   onSendMessage,
+  onImageAttach,
   isStreaming,
 }: {
-  onSendMessage: (msg: string, model: string) => void;
+  onSendMessage: (msg: string, model: string, imageData?: string) => void;
+  onImageAttach?: (imageData: string | null) => void;
   isStreaming: boolean;
 }) {
   const [prompt, setPrompt] = useState("");
+  const [attachedImage, setAttachedImage] = useState<string | null>(null);
   const [model, setModel] = useState("Flash");
   const [selectedLang, setSelectedLang] = useState(INDIAN_LANGUAGES[0]);
   const [langMenuOpen, setLangMenuOpen] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
   const scrubSensitiveTokens = (text: string) =>
     text.replace(
       /AIza[0-9A-Za-z_-]{20,}|sk-or-(?:v1-)?[0-9A-Za-z_-]{16,}|\bsk-[0-9A-Za-z_-]{20,}|\bgh[pousr]_[0-9A-Za-z]{20,}\b|\bAKIA[0-9A-Z]{16}\b|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/gi,
       "[PROTECTED_CREDENTIAL]",
     );
+
+  const attachImage = (file: File) => {
+    if (!file.type.startsWith("image/")) {
+      alert("Choose an image file to attach.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      alert("Images must be 5 MB or smaller.");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== "string") return;
+      setAttachedImage(reader.result);
+      onImageAttach?.(reader.result);
+    };
+    reader.onerror = () => alert("The selected image could not be read.");
+    reader.readAsDataURL(file);
+  };
+
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const image = Array.from(event.clipboardData.items)
+      .find((item) => item.type.startsWith("image/"))
+      ?.getAsFile();
+    if (!image) return;
+    event.preventDefault();
+    attachImage(image);
+  };
 
   const toggleListening = () => {
     if (isListening) {
@@ -93,13 +125,15 @@ export default function ChatInput({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!prompt.trim() || isStreaming) return;
+    if ((!prompt.trim() && !attachedImage) || isStreaming) return;
     if (isListening && recognitionRef.current) {
       recognitionRef.current.stop();
       setIsListening(false);
     }
-    onSendMessage(scrubSensitiveTokens(prompt), model);
+    onSendMessage(scrubSensitiveTokens(prompt), model, attachedImage || undefined);
     setPrompt("");
+    setAttachedImage(null);
+    onImageAttach?.(null);
   };
 
   return (
@@ -114,28 +148,59 @@ export default function ChatInput({
         />
       </div>
 
+      {attachedImage && (
+        <div className="mb-2 flex items-center gap-2 rounded-xl border border-purple-200 bg-purple-50 p-2">
+          <img src={attachedImage} alt="Image attachment preview" className="h-12 w-12 rounded-lg object-cover" />
+          <span className="min-w-0 flex-1 truncate text-xs font-medium text-slate-700">Image attached</span>
+          <button
+            type="button"
+            onClick={() => {
+              setAttachedImage(null);
+              onImageAttach?.(null);
+            }}
+            aria-label="Remove attached image"
+            className="rounded-full p-1 text-slate-500 hover:bg-white"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
       <form
         onSubmit={handleSubmit}
-        className="w-full flex items-center bg-white border border-slate-200/90 shadow-md rounded-full px-4 py-2 hover:shadow-lg focus-within:border-purple-400 focus-within:ring-2 focus-within:ring-purple-100 transition-all"
+        className="w-full flex items-center bg-white border border-slate-200/90 shadow-md rounded-2xl px-3 py-2 hover:shadow-lg focus-within:border-purple-400 focus-within:ring-2 focus-within:ring-purple-100 transition-all"
       >
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          className="hidden"
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0];
+            if (file) attachImage(file);
+            event.currentTarget.value = "";
+          }}
+        />
         <button
           type="button"
+          onClick={() => imageInputRef.current?.click()}
           className="p-2 text-slate-400 hover:text-slate-700 transition-colors"
-          title="Attach files"
+          title="Attach an image"
         >
           <Plus className="w-5 h-5" />
         </button>
 
-        <input
-          type="text"
+        <textarea
+          rows={1}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
+          onPaste={handlePaste}
           placeholder={
             isListening
               ? `Listening in ${selectedLang.label}... Speak now`
               : "Ask Genie anything..."
           }
-          className={`flex-1 bg-transparent px-3 text-slate-900 placeholder-slate-400 text-sm sm:text-base focus:outline-none ${
+          className={`flex-1 resize-none bg-transparent px-3 py-2 text-slate-900 placeholder-slate-400 text-sm sm:text-base focus:outline-none ${
             isListening ? "placeholder-rose-500 font-medium" : ""
           }`}
         />
@@ -214,7 +279,7 @@ export default function ChatInput({
           {/* Submit */}
           <button
             type="submit"
-            disabled={!prompt.trim() || isStreaming}
+            disabled={(!prompt.trim() && !attachedImage) || isStreaming}
             className="p-2 bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-full hover:from-purple-700 hover:to-indigo-700 disabled:opacity-40 transition-all shadow-sm ml-1"
           >
             <Send className="w-4 h-4" />

@@ -14,12 +14,47 @@ class GlobalErrorBoundary extends Component<
 > {
   state: GlobalErrorBoundaryState = { hasError: false, error: null };
 
+  private chunkRetryTimer: number | null = null;
+
+  componentDidMount() {
+    this.chunkRetryTimer = window.setTimeout(() => {
+      try {
+        sessionStorage.removeItem("genie_chunk_retry");
+      } catch (error) {
+        console.warn("Chunk-recovery marker could not be cleared:", error);
+      }
+    }, 15000);
+  }
+
+  componentWillUnmount() {
+    if (this.chunkRetryTimer !== null) {
+      window.clearTimeout(this.chunkRetryTimer);
+    }
+  }
+
   static getDerivedStateFromError(error: Error): GlobalErrorBoundaryState {
     return { hasError: true, error };
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error("Global workspace render error:", error, errorInfo);
+    const isLocalDevelopment =
+      process.env.NODE_ENV !== "production" &&
+      ["localhost", "127.0.0.1", "[::1]"].includes(window.location.hostname);
+    const isChunkLoadFailure =
+      /chunkloaderror|loading chunk [\d]+ failed|failed to fetch dynamically imported module|importing a module script failed/i.test(
+        error.message,
+      );
+    if (isLocalDevelopment && isChunkLoadFailure) {
+      try {
+        if (sessionStorage.getItem("genie_chunk_retry") !== "used") {
+          sessionStorage.setItem("genie_chunk_retry", "used");
+          window.location.reload();
+        }
+      } catch (recoveryError) {
+        console.warn("Automatic local chunk recovery could not be started:", recoveryError);
+      }
+    }
   }
 
   private resetWorkspaceStorage = () => {

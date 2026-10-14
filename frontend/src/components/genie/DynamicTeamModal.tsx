@@ -30,9 +30,9 @@ const CAPACITY_OPTIONS: {
   detail: string;
 }[] = [
   { mode: "pair", title: "Pair", detail: "2 people" },
-  { mode: "squad", title: "Squad", detail: "Up to 10 people" },
-  { mode: "custom", title: "Custom", detail: "Set a room limit" },
-  { mode: "unlimited", title: "Unlimited", detail: "No member cap" },
+  { mode: "squad", title: "Squad", detail: "Up to 5 people" },
+  { mode: "custom", title: "Custom", detail: "Set a 2-5 limit" },
+  { mode: "unlimited", title: "Room maximum", detail: "Up to 5 people" },
 ];
 
 export default function DynamicTeamModal({
@@ -54,8 +54,8 @@ export default function DynamicTeamModal({
   onMemberExportChange,
   onAddMember,
 }: DynamicTeamModalProps) {
-  const capacity = mode === "pair" ? 2 : mode === "squad" ? 10 : mode === "custom" ? customCapacity : null;
-  const capacityLabel = capacity === null ? "Unlimited" : capacity.toString();
+  const capacity = mode === "pair" ? 2 : mode === "custom" ? Math.min(5, customCapacity) : 5;
+  const capacityLabel = `${capacity} (max 5)`;
 
   return (
     <section className={`space-y-2 rounded-2xl border ${borderClass} ${panelClass} ${textClass} p-3`}>
@@ -96,11 +96,11 @@ export default function DynamicTeamModal({
           <input
             type="number"
             min={2}
-            max={500}
+            max={5}
             value={customCapacity}
             onChange={(event) => {
               const value = Number(event.target.value);
-              if (Number.isInteger(value) && value >= 2 && value <= 500) {
+              if (Number.isInteger(value) && value >= 2 && value <= 5) {
                 onCustomCapacityChange(value);
               }
             }}
