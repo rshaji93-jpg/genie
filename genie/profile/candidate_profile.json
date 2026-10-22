@@ -1,0 +1,35 @@
+{
+  "name": "Shaji R",
+  "first_name": "Shaji",
+  "last_name": "R",
+  "email": "rshaji93@gmail.com",
+  "phone": "+91 9941692622",
+  "current_city": "Chennai",
+  "experience_years": "11+",
+  "notice_period": "30 Days",
+  "current_role": "Senior Denial Management / AR Specialist",
+  "domain": "US Healthcare RCM",
+  "specialties": [
+    "Accounts Receivable (AR)",
+    "Denial Management",
+    "Claim Adjudication",
+    "Aging AR Reduction"
+  ],
+  "billing_coding": [
+    "UB-04",
+    "CMS-1500",
+    "CPT",
+    "ICD-10",
+    "HCPCS",
+    "CARC/RARC Codes"
+  ],
+  "tools": [
+    "TriZetto Facets",
+    "Epic",
+    "Cerner"
+  ],
+  "target_locations": [
+    "Chennai",
+    "Remote"
+  ]
+}
