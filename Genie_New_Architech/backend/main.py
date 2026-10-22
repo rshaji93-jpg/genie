@@ -1204,7 +1204,7 @@ def agentic_gemini_reply(
                 if not isinstance(reply, str) or not reply.strip():
                     raise RuntimeError("Provider returned an empty response.")
                 return reply
-            except RuntimeError as error:
+            except Exception as error:
                 errors.append(f"{provider_name}: {type(error).__name__}")
                 LOGGER.warning(
                     "Agent stage %s failed on %s (%s)",
@@ -1843,20 +1843,20 @@ async def chat(
             agentic_gemini_reply, request, messages, identity,
             use_free_pool=use_free_pool,
         )
-    except RuntimeError as error:
+    except Exception as error:
         _refund_user_tokens(identity["sub"], cost, room_id=request.room_id, created_at=charged_at)
-        LOGGER.warning("Gemini pool unavailable; returning local fallback (%s)", error)
+        LOGGER.warning(
+            "AI provider waterfall exhausted; returning transparent local fallback (%s)",
+            type(error).__name__,
+        )
         return {
             "reply": local_service_fallback(messages),
             "tick_status": "read_no_ai",
             "tokens_burned": 0,
             "source": "local-fallback",
+            "provider_status": "unavailable",
             "sub_agents": [],
         }
-    except Exception as error:
-        _refund_user_tokens(identity["sub"], cost, room_id=request.room_id, created_at=charged_at)
-        LOGGER.warning("Native Gemini chat request failed (%s)", type(error).__name__)
-        raise HTTPException(status_code=502, detail="Native Gemini provider request failed.") from error
     _set_general_cache(cache_key, reply)
     return {
         "reply": reply,
@@ -1985,19 +1985,23 @@ async def chat_stream(
             yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
             _set_general_cache(cache_key, reply)
             yield "event: done\ndata: {}\n\n"
-        except RuntimeError as error:
-            _refund_user_tokens(
-                identity["sub"], cost, room_id=request.room_id, created_at=charged_at
-            )
-            LOGGER.warning("Agentic chat stream failed (%s)", type(error).__name__)
-            yield f"event: token\ndata: {json.dumps({'text': local_service_fallback(messages)})}\n\n"
-            yield "event: done\ndata: {}\n\n"
         except Exception as error:
             _refund_user_tokens(
                 identity["sub"], cost, room_id=request.room_id, created_at=charged_at
             )
-            LOGGER.warning("Agentic chat stream failed (%s)", type(error).__name__)
-            yield f"event: error\ndata: {json.dumps({'detail': 'AI provider request failed.'})}\n\n"
+            LOGGER.warning(
+                "AI provider waterfall exhausted during streaming; returning transparent local fallback (%s)",
+                type(error).__name__,
+            )
+            yield (
+                "event: metadata\ndata: "
+                f"{json.dumps({'sub_agents': [], 'source': 'local-fallback', 'provider_status': 'unavailable'})}\n\n"
+            )
+            yield (
+                f"event: confirmation\ndata: "
+                f"{json.dumps({'reply': local_service_fallback(messages), 'tokens_burned': 0, 'source': 'local-fallback', 'provider_status': 'unavailable'})}\n\n"
+            )
+            yield "event: done\ndata: {}\n\n"
 
     return StreamingResponse(
         events(),

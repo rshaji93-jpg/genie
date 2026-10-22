@@ -185,6 +185,71 @@ class BackendApiTests(unittest.TestCase):
         fallback.assert_called_once()
         self.assertIn("Current date and time:", fallback.call_args.args[0][0]["content"])
 
+    def test_chat_waterfall_continues_after_unexpected_provider_exception(self):
+        with (
+            patch.object(main.agent_router, "chat", side_effect=ValueError("malformed provider response")),
+            patch.object(
+                main.multi_provider_pool,
+                "chat",
+                return_value="Recovered live AI answer",
+            ) as fallback,
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "Explain a resilient distributed database architecture.",
+                    "model_tier": "genie-lite",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["reply"], "Recovered live AI answer")
+        fallback.assert_called_once()
+
+    def test_chat_provider_exhaustion_returns_transparent_fallback_and_refunds(self):
+        with (
+            patch.object(main.agent_router, "chat", side_effect=ValueError("invalid provider output")),
+            patch.object(main.multi_provider_pool, "chat", side_effect=TypeError("provider transport error")),
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "Explain a resilient distributed database architecture.",
+                    "model_tier": "genie-lite",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["source"], "local-fallback")
+        self.assertEqual(payload["provider_status"], "unavailable")
+        self.assertEqual(payload["tokens_burned"], 0)
+        self.assertIn("Live AI providers are temporarily unavailable", payload["reply"])
+        with closing(main.database()) as connection:
+            ledger = connection.execute(
+                "SELECT event_type, amount FROM user_token_ledger WHERE user_sub = ? ORDER BY rowid DESC LIMIT 2",
+                ("local-development",),
+            ).fetchall()
+        self.assertEqual([(row["event_type"], row["amount"]) for row in ledger], [("refund", 1), ("spend", -1)])
+
+    def test_stream_provider_exhaustion_returns_transparent_fallback(self):
+        with (
+            patch.object(main.agent_router, "chat", side_effect=ValueError("invalid provider output")),
+            patch.object(main.multi_provider_pool, "chat", side_effect=TypeError("provider transport error")),
+        ):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={
+                    "message": "Explain a resilient distributed database architecture.",
+                    "model_tier": "genie-lite",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('"source": "local-fallback"', response.text)
+        self.assertIn("Live AI providers are temporarily unavailable", response.text)
+        self.assertIn("event: done", response.text)
+
     def test_agent_router_keeps_dynamic_instruction_as_system_context(self):
         prompt = [
             {"role": "system", "content": "Current date and time: Thursday, 22 October 2026, 04:55 PM IST."},
