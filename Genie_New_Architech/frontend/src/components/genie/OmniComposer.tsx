@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUp, ImagePlus, ShieldCheck, X } from "lucide-react";
+import { ArrowUp, ImagePlus, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import EmojiPicker from "@/modules/composer/EmojiPicker";
 import StagedAudioPill from "@/modules/composer/StagedAudioPill";
@@ -15,13 +15,14 @@ export interface Attachment {
 }
 
 export type SubmitTarget = "agent" | "peers";
+export type ChatMode = "ai_room" | "friends_only" | "private_ai";
 
 interface OmniComposerProps {
   isMultiUserRoom: boolean;
   memberCount: number;
   participants: string[];
   model: string;
-  secretMode: boolean;
+  chatMode: ChatMode;
   sending: boolean;
   availabilityError?: string;
   aiAvailability?: {
@@ -37,7 +38,6 @@ interface OmniComposerProps {
     thinkingLevel?: string,
     target?: SubmitTarget,
   ) => void;
-  onSecretModeChange: (secretMode: boolean) => void;
   onPdfScanned?: (pdfBase64: string) => void;
   onAttachmentFile: (file: File) => void;
   onThinkHarder: () => void;
@@ -51,6 +51,7 @@ interface OmniComposerProps {
   recentContext?: string;
   wakeWordActive?: boolean;
   onWakeWordPrompt?: (text: string, dialect: string) => void;
+  externalTranscription?: string;
 }
 
 export default function OmniComposer(props: OmniComposerProps) {
@@ -66,6 +67,9 @@ export default function OmniComposer(props: OmniComposerProps) {
   }
   const multi = props.isMultiUserRoom && props.memberCount > 1;
   useEffect(() => setDialect(props.defaultDialect || "en-IN"), [props.defaultDialect]);
+  useEffect(() => {
+    if (props.externalTranscription) setText(props.externalTranscription);
+  }, [props.externalTranscription]);
   useEffect(() => {
     const input = inputRef.current;
     if (!input) return;
@@ -85,10 +89,9 @@ export default function OmniComposer(props: OmniComposerProps) {
     const outgoing = props.quoteText
       ? `${props.quoteText}\n\n${text.trim()}`.trim()
       : text.trim();
-    props.onSubmit(outgoing, props.secretMode, attachment, props.model, thinkingLevel, "agent");
+    props.onSubmit(outgoing, false, attachment, props.model, thinkingLevel, props.chatMode === "friends_only" ? "peers" : "agent");
     props.onActivity?.("idle");
     setText("");
-    props.onSecretModeChange(false);
     setAttachment(undefined);
     props.onClearQuote?.();
   }
@@ -98,10 +101,9 @@ export default function OmniComposer(props: OmniComposerProps) {
     const outgoing = props.quoteText
       ? `${props.quoteText}\n\n${text.trim()}`.trim()
       : text.trim();
-    props.onSubmit(outgoing, props.secretMode, attachment, props.model, thinkingLevel, "peers");
+    props.onSubmit(outgoing, false, attachment, props.model, thinkingLevel, "peers");
     props.onActivity?.("idle");
     setText("");
-    props.onSecretModeChange(false);
     setAttachment(undefined);
     props.onClearQuote?.();
   }
@@ -135,7 +137,7 @@ export default function OmniComposer(props: OmniComposerProps) {
         <div className="attachment-chip"><ImagePlus size={14} /><span>{attachment.name}</span><button type="button" onClick={() => setAttachment(undefined)} aria-label="Remove attachment"><X size={14} /></button></div>
       )}
       {props.quoteText && <div className="quote-context-pill"><span>{props.quoteText}</span><button onClick={props.onClearQuote} type="button" aria-label="Remove quoted context"><X size={13} /></button></div>}
-      <form className="omni-composer" onSubmit={submit}>
+      <form className={`omni-composer composer-mode-${props.chatMode}`} onSubmit={submit}>
         <PlusAttachmentMenu
           onFile={props.onAttachmentFile}
           onScan={() => setScannerOpen(true)}
@@ -164,7 +166,11 @@ export default function OmniComposer(props: OmniComposerProps) {
             if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
           }}
           className="flex-1 min-w-0"
-          placeholder={props.secretMode ? "Write privately — this never goes to AI…" : "Message Genie or your room…"}
+          placeholder={props.chatMode === "friends_only"
+            ? "👥 Encrypted Friends Chat — AI is paused, only friends see this..."
+            : props.chatMode === "private_ai"
+              ? "🔒 Private AI Whisper — Hidden from friends in this room..."
+              : "Message Genie or your room..."}
           rows={1}
           maxLength={20_000}
           aria-label="Message Genie"
@@ -192,11 +198,6 @@ export default function OmniComposer(props: OmniComposerProps) {
             ? "Genie Master is available."
             : `Genie Master available in about ${props.aiAvailability.genie_master_retry_seconds}s.`}
       </p>}
-      <div className="composer-hint">{props.secretMode ? "Secret mode is local-only or encrypted peer relay." : "Enter sends to AI · open + for encrypted peer relay."}</div>
-      <p className="composer-privacy">End-to-end encrypted for AI analysis · AI can make mistakes.</p>
-      <button className="composer-trust" onClick={props.onOpenPrivacy} type="button">
-        <ShieldCheck size={16} /> Trust &amp; privacy
-      </button>
       <SmartScannerModal
         open={scannerOpen}
         onClose={() => setScannerOpen(false)}

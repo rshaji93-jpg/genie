@@ -1,9 +1,22 @@
 "use client";
 
+import { Mic, Square } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { apiUrl } from "@/lib/api";
+import { apiRequest } from "@/lib/api";
 
 export type GenieVoiceId = "genie-assistant" | "genie-master";
+
+type DictationRecognition = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: { results: ArrayLike<(ArrayLike<{ transcript: string }> & { isFinal?: boolean })>; resultIndex?: number }) => void) | null;
+  onend: (() => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  start(): void;
+  stop(): void;
+};
+type DictationRecognitionConstructor = new () => DictationRecognition;
 
 interface VoiceStudioModalProps {
   open: boolean;
@@ -11,6 +24,7 @@ interface VoiceStudioModalProps {
   selectedVoiceId: GenieVoiceId;
   onClose: () => void;
   onSelect: (voiceId: GenieVoiceId) => void;
+  onTranscription?: (text: string) => void;
 }
 
 const VOICES: Array<{
@@ -48,10 +62,21 @@ export default function VoiceStudioModal({
   selectedVoiceId,
   onClose,
   onSelect,
+  onTranscription,
 }: VoiceStudioModalProps) {
   const [previewing, setPreviewing] = useState<GenieVoiceId | null>(null);
+  const [dictationActive, setDictationActive] = useState(false);
+  const [dictationText, setDictationText] = useState("");
+  const [dictationSeconds, setDictationSeconds] = useState(90);
+  const [dictationError, setDictationError] = useState("");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const timerRef = useRef<number | undefined>(undefined);
+  const dictationRef = useRef<DictationRecognition | null>(null);
+  const dictationActiveRef = useRef(false);
+  const accumulatedTranscriptRef = useRef("");
+  const dictationTimerRef = useRef<number | undefined>(undefined);
+  const dictationIntervalRef = useRef<number | undefined>(undefined);
+  const dictationDeadlineRef = useRef(0);
 
   function stopPreview() {
     if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
@@ -64,9 +89,112 @@ export default function VoiceStudioModal({
 
   useEffect(() => () => {
     if (timerRef.current !== undefined) window.clearTimeout(timerRef.current);
+    dictationActiveRef.current = false;
+    if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+    if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    dictationRef.current?.stop();
     audioRef.current?.pause();
     window.speechSynthesis?.cancel();
   }, []);
+
+  useEffect(() => {
+    if (!open && dictationActiveRef.current) {
+      dictationActiveRef.current = false;
+      if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+      if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+      dictationRef.current?.stop();
+      dictationRef.current = null;
+      setDictationActive(false);
+      setDictationSeconds(0);
+    }
+  }, [open]);
+
+  function finishDictation() {
+    dictationActiveRef.current = false;
+    if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+    if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    dictationTimerRef.current = undefined;
+    dictationIntervalRef.current = undefined;
+    dictationRef.current?.stop();
+    dictationRef.current = null;
+    setDictationActive(false);
+    setDictationSeconds(0);
+  }
+
+  function startDictation() {
+    const candidate = window as typeof window & {
+      SpeechRecognition?: DictationRecognitionConstructor;
+      webkitSpeechRecognition?: DictationRecognitionConstructor;
+    };
+    const Speech = candidate.SpeechRecognition || candidate.webkitSpeechRecognition;
+    if (!Speech) {
+      setDictationError("Speech recognition is unavailable in this browser.");
+      return;
+    }
+    setDictationError("");
+    accumulatedTranscriptRef.current = dictationText.trim();
+    const recognition = new Speech();
+    dictationRef.current = recognition;
+    dictationActiveRef.current = true;
+    dictationDeadlineRef.current = Date.now() + 90_000;
+    setDictationSeconds(90);
+    setDictationActive(true);
+    recognition.lang = "en-IN";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      let interim = "";
+      for (let index = event.resultIndex ?? 0; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        if (!result) continue;
+        const spoken = result[0]?.transcript || "";
+        if (result.isFinal) {
+          accumulatedTranscriptRef.current = `${accumulatedTranscriptRef.current} ${spoken}`.trim();
+        } else {
+          interim += `${spoken} `;
+        }
+      }
+      const value = [accumulatedTranscriptRef.current, interim.trim()].filter(Boolean).join(" ");
+      setDictationText(value);
+      onTranscription?.(value);
+    };
+    recognition.onerror = (event) => {
+      if (event.error === "no-speech" || event.error === "aborted") return;
+      if (dictationActiveRef.current) {
+        setDictationError("Speech recognition stopped. Your captured text is preserved.");
+        finishDictation();
+      }
+    };
+    recognition.onend = () => {
+      if (!dictationActiveRef.current || Date.now() >= dictationDeadlineRef.current) {
+        finishDictation();
+        return;
+      }
+      window.setTimeout(() => {
+        if (!dictationActiveRef.current || Date.now() >= dictationDeadlineRef.current) return;
+        try {
+          recognition.start();
+        } catch {
+          finishDictation();
+          setDictationError("Speech recognition could not resume. Your captured text is preserved.");
+        }
+      }, 40);
+    };
+    try {
+      recognition.start();
+    } catch {
+      dictationActiveRef.current = false;
+      setDictationActive(false);
+      setDictationError("Speech recognition could not start. Check microphone permissions.");
+      return;
+    }
+    dictationTimerRef.current = window.setTimeout(finishDictation, 90_000);
+    dictationIntervalRef.current = window.setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((dictationDeadlineRef.current - Date.now()) / 1000));
+      setDictationSeconds(remaining);
+      if (remaining === 0) finishDictation();
+    }, 1000);
+  }
 
   async function playPreview(voice: (typeof VOICES)[number]) {
     if (previewing === voice.id) {
@@ -76,7 +204,7 @@ export default function VoiceStudioModal({
     stopPreview();
     setPreviewing(voice.id);
     try {
-      const response = await fetch(apiUrl("/api/tts"), {
+      const response = await apiRequest("/api/tts", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -152,6 +280,28 @@ export default function VoiceStudioModal({
             </div>
           ))}
         </div>
+        <section className="voice-studio-dictation" aria-label="Voice dictation">
+          <div className="voice-studio-dictation-header">
+            <strong>Pause-safe dictation</strong>
+            <button className="utility-trigger" onClick={() => dictationActive ? finishDictation() : startDictation()} type="button">
+              {dictationActive ? <><Square size={14} /> Stop ({dictationSeconds}s)</> : <><Mic size={14} /> Dictate</>}
+            </button>
+          </div>
+          {dictationActive && <p className="dictation-live-pill voice-studio-live-pill" role="status">
+            🔴 Listening ({dictationSeconds}s left) · Pause-safe — Tap Mic to finish
+          </p>}
+          <textarea
+            aria-label="Dictated text"
+            onChange={(event) => {
+              accumulatedTranscriptRef.current = event.target.value;
+              setDictationText(event.target.value);
+            }}
+            placeholder="Your dictated text will appear here. You can edit it before copying."
+            rows={4}
+            value={dictationText}
+          />
+          {dictationError && <p className="mic-error" role="alert">{dictationError}</p>}
+        </section>
       </section>
     </div>
   );

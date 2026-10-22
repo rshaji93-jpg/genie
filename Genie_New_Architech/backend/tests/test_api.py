@@ -45,11 +45,76 @@ class BackendApiTests(unittest.TestCase):
         self.assertTrue(
             {
                 "/api/ai/status",
+                "/api/py/ai/status",
+                "/health",
+                "/api/health",
                 "/api/chat",
                 "/api/py/chat",
                 "/api/auth/register",
             }.issubset(registered_routes)
         )
+
+    def test_health_aliases_and_status_proxy_return_success(self):
+        for path in ("/health", "/api/health", "/api/py/ai/status"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertIsInstance(response.json(), dict)
+
+    def test_friends_only_chat_skips_ai_inference(self):
+        with patch.object(main.agent_router, "chat") as provider:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "Please relay this privately to my friends.",
+                    "chat_mode": "friends_only",
+                    "model_tier": "genie-master",
+                    "history": [{"role": "user", "content": "Earlier context"}],
+                    "room_mode": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["chat_mode"], "friends_only")
+        self.assertTrue(response.json()["inference_skipped"])
+        self.assertEqual(response.json()["tokens_burned"], 0)
+        provider.assert_not_called()
+
+    def test_private_ai_chat_omits_prior_history_from_inference(self):
+        with patch.object(main.agent_router, "chat", return_value="Private answer") as provider:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "messages": [
+                        {"role": "user", "content": "Earlier room-visible question"},
+                        {"role": "assistant", "content": "Earlier room-visible answer"},
+                        {"role": "user", "content": "Analyze this private request carefully."},
+                    ],
+                    "chat_mode": "private_ai",
+                    "model_tier": "genie-pro",
+                    "room_mode": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["reply"], "Private answer")
+        inference_messages = provider.call_args.args[0]
+        self.assertEqual(inference_messages[-1]["content"], "Analyze this private request carefully.")
+        self.assertNotIn("Earlier room-visible question", str(inference_messages))
+        self.assertNotIn("Earlier room-visible answer", str(inference_messages))
+
+    def test_cors_allows_cloudflare_pages_origins_and_methods(self):
+        response = self.client.options(
+            "/api/chat",
+            headers={
+                "Origin": "https://example.pages.dev",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,authorization",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
 
     def test_chat_accepts_optional_session_id_on_frontend_proxy_alias(self):
         response = self.client.post(

@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { apiUrl } from "@/lib/api";
+import { apiRequest } from "@/lib/api";
 
 export default function SmartScannerModal({ open, onClose, onPdf }: {
   open: boolean;
@@ -29,7 +29,7 @@ export default function SmartScannerModal({ open, onClose, onPdf }: {
     });
     if (!dataUrl) return;
     try {
-      const response = await fetch(apiUrl("/api/scan-to-pdf"), {
+      const response = await apiRequest("/api/scan-to-pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionStorage.getItem("genie_google_credential") || ""}` },
         body: JSON.stringify({ image_base64: dataUrl.split(",", 2)[1] }),

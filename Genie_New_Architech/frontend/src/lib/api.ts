@@ -1,4 +1,19 @@
-export const API_URL = (process.env.NEXT_PUBLIC_GENIE_API_URL || "").replace(/\/$/, "");
+const CLOUD_API_URL = (
+  process.env.NEXT_PUBLIC_API_URL
+  || "https://personalaigenie-767453349146.asia-south1.run.app"
+).replace(/\/$/, "");
+const API_URL_OVERRIDE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
+const LEGACY_API_URL = (process.env.NEXT_PUBLIC_GENIE_API_URL || "").replace(/\/$/, "");
+let localBackendUnavailable = false;
+
+function isLocalApiUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname;
+    return hostname === "localhost" || hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
 
 function proxyPath(path: string): string {
   if (path.startsWith("/api/py/")) return path;
@@ -7,7 +22,36 @@ function proxyPath(path: string): string {
 
 export function apiUrl(path: string): string {
   const requestPath = proxyPath(path);
-  return API_URL ? `${API_URL}${requestPath}` : requestPath;
+  if (typeof window === "undefined") return requestPath;
+  const isLocalhost = window.location.hostname === "localhost";
+  if (!isLocalhost) return `${CLOUD_API_URL}${requestPath}`;
+  if (API_URL_OVERRIDE && !(localBackendUnavailable && isLocalApiUrl(API_URL_OVERRIDE))) {
+    return `${API_URL_OVERRIDE}${requestPath}`;
+  }
+  if (LEGACY_API_URL && !(localBackendUnavailable && isLocalApiUrl(LEGACY_API_URL))) {
+    return `${LEGACY_API_URL}${requestPath}`;
+  }
+  if (localBackendUnavailable) return `${CLOUD_API_URL}${requestPath}`;
+  return `http://localhost:8000${requestPath}`;
+}
+
+export async function apiRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  try {
+    return await fetch(apiUrl(path), init);
+  } catch (error) {
+    if (
+      !(error instanceof TypeError)
+      || typeof window === "undefined"
+      || window.location.hostname !== "localhost"
+      || (API_URL_OVERRIDE && !isLocalApiUrl(API_URL_OVERRIDE))
+      || (LEGACY_API_URL && !isLocalApiUrl(LEGACY_API_URL))
+      || localBackendUnavailable
+    ) {
+      throw error;
+    }
+    localBackendUnavailable = true;
+    return fetch(`${CLOUD_API_URL}${proxyPath(path)}`, init);
+  }
 }
 
 export async function apiFetch<T>(
@@ -15,7 +59,7 @@ export async function apiFetch<T>(
   credential = "",
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(apiUrl(path), {
+  const response = await apiRequest(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
@@ -62,7 +106,12 @@ export async function apiFetchWithFallback<T>(
 }
 
 export function websocketUrl(path: string): string {
-  const url = new URL(API_URL || window.location.origin);
+  const baseUrl = window.location.hostname !== "localhost"
+    ? CLOUD_API_URL
+    : localBackendUnavailable && (isLocalApiUrl(API_URL_OVERRIDE) || isLocalApiUrl(LEGACY_API_URL))
+      ? CLOUD_API_URL
+      : API_URL_OVERRIDE || LEGACY_API_URL || "http://localhost:8000";
+  const url = new URL(baseUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = path;
   return url.toString();

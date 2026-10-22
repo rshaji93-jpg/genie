@@ -1,18 +1,18 @@
 "use client";
 
-import { ArrowUpRight, AudioLines, Check, ChevronDown, Clock3, Menu, MoreHorizontal, Search, Settings2, ShieldCheck, Trash2, UsersRound } from "lucide-react";
+import { ArrowUpRight, AudioLines, Check, ChevronDown, LockKeyhole, Menu, MoreHorizontal, Search, Settings2, ShieldCheck, Trash2, UsersRound } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import AdminDashboard from "@/components/genie/AdminDashboard";
 import AdminPasskey from "@/components/genie/AdminPasskey";
 import ChatCanvas, { type ChatMessage } from "@/components/genie/ChatCanvas";
 import CommandSearchModal from "@/components/genie/CommandSearchModal";
-import OmniComposer, { type Attachment, type SubmitTarget } from "@/modules/composer/OptionAComposer";
+import OmniComposer, { type Attachment, type ChatMode, type SubmitTarget } from "@/modules/composer/OptionAComposer";
 import RightSideRail, { type CallSignal, type RoomPerson } from "@/components/genie/RightSideRail";
 import SettingsDialog from "@/components/genie/SettingsDialog";
 import RoomInviteModal from "@/components/genie/RoomInviteModal";
 import Sidebar, { type DeletedThreadItem, type ThreadItem, type WorkspaceView } from "@/components/genie/Sidebar";
 import WorkspacePanel from "@/components/genie/WorkspacePanel";
-import { apiFetch, apiFetchWithFallback, apiUrl, randomToken, websocketUrl } from "@/lib/api";
+import { apiFetch, apiFetchWithFallback, apiRequest, randomToken, websocketUrl } from "@/lib/api";
 import { decryptRoomMessage, encryptRoomMessage } from "@/lib/roomCrypto";
 import PdfArtifactPreview from "@/modules/scanner_pdf/PdfArtifactPreview";
 import ForwardToRoomModal from "@/modules/messages_arrows/ForwardToRoomModal";
@@ -300,7 +300,11 @@ function roomInviteUrl(roomId: string, key: string, invite: string): string {
 
 function fromWire(message: WireMessage, decrypted: unknown): ChatMessage {
   const data = typeof decrypted === "object" && decrypted !== null
-    ? decrypted as { content?: unknown; attachment?: { mime_type?: unknown; data?: unknown } }
+    ? decrypted as {
+      content?: unknown;
+      chat_mode?: unknown;
+      attachment?: { mime_type?: unknown; data?: unknown };
+    }
     : {};
   const attachment = data.attachment && typeof data.attachment.mime_type === "string" && typeof data.attachment.data === "string"
     ? { mime_type: data.attachment.mime_type, data: data.attachment.data }
@@ -309,6 +313,7 @@ function fromWire(message: WireMessage, decrypted: unknown): ChatMessage {
     id: message.id,
     role: "user",
     content: typeof data.content === "string" ? data.content.replace(SECRET_MARKER, "") : "",
+    chat_mode: data.chat_mode === "friends_only" ? "friends_only" : "ai_room",
     attachment,
     is_secret: message.is_secret,
     tick_status: message.tick_status || "sent",
@@ -345,7 +350,6 @@ export default function Home() {
   const [isMounted, setIsMounted] = useState(false);
   const [credential, setCredential] = useState("");
   const [identity, setIdentity] = useState<Identity | null>(null);
-  const [localChatMode, setLocalChatMode] = useState(false);
   const [authError, setAuthError] = useState("");
   const [accountStatus, setAccountStatus] = useState<"checking" | "registration" | "passkey-setup" | "ready">("checking");
   const [loginEmail, setLoginEmail] = useState("");
@@ -358,14 +362,15 @@ export default function Home() {
   const registrationCompleted = useRef(false);
   const [selectedVoiceId, setSelectedVoiceId] = useState<GenieVoiceId>("genie-assistant");
   const [voiceStudioOpen, setVoiceStudioOpen] = useState(false);
+  const [studioDictationText, setStudioDictationText] = useState("");
   const [previewingVoiceId, setPreviewingVoiceId] = useState("");
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewTimerRef = useRef<number | undefined>(undefined);
   const replyAudioRef = useRef<HTMLAudioElement | null>(null);
-  const [temporaryChatOpen, setTemporaryChatOpen] = useState(false);
   const [temporaryChatActive, setTemporaryChatActive] = useState(false);
   const [temporaryChatMode, setTemporaryChatMode] = useState<TemporaryChatMode>(null);
-  const [secretMode, setSecretMode] = useState(false);
+  const [chatMode, setChatMode] = useState<ChatMode>("ai_room");
+  const [privacyMenuOpen, setPrivacyMenuOpen] = useState(false);
   const [forceMaster, setForceMaster] = useState(false);
   const wakeMessageIdsRef = useRef(new Set<string>());
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -478,9 +483,12 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
   useEffect(() => {
-    const closeHeaderMenu = () => setHeaderMenuOpen(false);
+    const closeHeaderMenu = () => {
+      setHeaderMenuOpen(false);
+      setPrivacyMenuOpen(false);
+    };
     const closeIfOutside = (event: Event) => {
-      if (event.target instanceof Element && event.target.closest(".header-actions-menu, .model-selector")) return;
+      if (event.target instanceof Element && event.target.closest(".header-actions-menu, .model-selector, .privacy-mode-selector")) return;
       closeHeaderMenu();
       setModelMenuOpen(false);
     };
@@ -488,6 +496,7 @@ export default function Home() {
       if (event.key === "Escape") {
         closeHeaderMenu();
         setModelMenuOpen(false);
+        setPrivacyMenuOpen(false);
         setMobileSidebarOpen(false);
       }
       if (event.target instanceof Element && event.target.closest(".omni-composer")) {
@@ -681,7 +690,6 @@ export default function Home() {
   useEffect(() => {
     if (!credential?.trim() || !identity?.sub) return;
     if (identity.sub === "local-development") {
-      setLocalChatMode(true);
       setThreads([]);
       setDeletedThreads([]);
       setLibrary([]);
@@ -819,15 +827,15 @@ export default function Home() {
             setAIAvailabilityError("");
           }
         })
-        .catch((error: unknown) => {
+        .catch(() => {
           if (!disposed) {
             setAIAvailability(null);
-            setAIAvailabilityError(error instanceof Error ? error.message : "Could not load provider status.");
+            setAIAvailabilityError("");
           }
         });
     };
     refresh();
-    const timer = window.setInterval(refresh, 15_000);
+    const timer = window.setInterval(refresh, 60_000);
     return () => {
       disposed = true;
       window.clearInterval(timer);
@@ -1146,7 +1154,7 @@ export default function Home() {
   useEffect(() => {
     if (!temporaryChatActive || !temporaryChatMode || !identity?.sub) return;
     const localMessages = messages
-      .filter((message) => !message.is_secret && !message.content.includes(SECRET_MARKER))
+      .filter((message) => !message.is_secret && message.chat_mode !== "private_ai" && !message.content.includes(SECRET_MARKER))
       .slice(-40)
       .map(({ attachment: _attachment, ...message }) => message);
     try {
@@ -1162,9 +1170,10 @@ export default function Home() {
   useEffect(() => {
     if (temporaryChatActive || !threadId || room || !messages.length) return;
     const archivedMessages = messages
-      .filter((message) => !message.is_secret && !message.content.includes(SECRET_MARKER))
+      .filter((message) => !message.is_secret && message.chat_mode !== "private_ai" && !message.content.includes(SECRET_MARKER))
       .slice(-60)
       .map(({ attachment: _attachment, ...message }) => message);
+    if (!archivedMessages.length) return;
     const firstUser = archivedMessages.find((message) => message.role === "user");
     const title = firstUser?.content.trim().slice(0, 48) || "Image conversation";
     setThreads((current) => {
@@ -1179,6 +1188,7 @@ export default function Home() {
   function startNewChat() {
     setTemporaryChatActive(false);
     setTemporaryChatMode(null);
+    setChatMode("ai_room");
     setRoom(null);
     setRoomKey("");
     setView("chat");
@@ -1192,6 +1202,7 @@ export default function Home() {
     if (!selected) return;
     setTemporaryChatActive(false);
     setTemporaryChatMode(null);
+    setChatMode("ai_room");
     setRoom(null);
     setRoomKey("");
     setThreadId(id);
@@ -1343,24 +1354,6 @@ export default function Home() {
       setMessages((current) => sortMessages([...current, ...snapshot.active_messages as ChatMessage[]]));
     }
     setToast("Backup messages merged into your local chat history.");
-  }
-
-  function startTemporaryChat(mode: Exclude<TemporaryChatMode, null>) {
-    if (identity) {
-      try {
-        sessionStorage.removeItem(`genie_temporary_chat_${encodeURIComponent(identity.sub)}`);
-      } catch {
-        setToast("Temporary chat storage is unavailable in this browser.");
-      }
-    }
-    setRoom(null);
-    setRoomKey("");
-    setThreadId("");
-    setMessages([]);
-    setTemporaryChatMode(mode);
-    setTemporaryChatActive(true);
-    setTemporaryChatOpen(false);
-    setView("chat");
   }
 
   function endTemporaryChat() {
@@ -1550,13 +1543,15 @@ export default function Home() {
     voiceReply = false,
     voiceDialect?: string,
     regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] },
+    requestChatMode: ChatMode = "ai_room",
   ) {
     if (!identity || !credential) return;
     const content = secret ? `${SECRET_MARKER}${text}` : text;
     const timestamp = new Date().toISOString();
-    if (!room && !threadId && !temporaryChatActive) setThreadId(crypto.randomUUID());
+    if (!room && !threadId && !temporaryChatActive && requestChatMode !== "private_ai") setThreadId(crypto.randomUUID());
     const userMessage: ChatMessage = regenerate?.prompt || {
       id: crypto.randomUUID(), role: "user", content: text, is_secret: secret,
+      chat_mode: requestChatMode,
       sender_sub: identity.sub,
       attachment: attachment ? { mime_type: attachment.mime_type, data: attachment.data } : undefined,
       tick_status: "sent", sent_at: timestamp,
@@ -1573,6 +1568,7 @@ export default function Home() {
       try {
         const ciphertext = await encryptRoomMessage(roomKeyRef.current, {
           content,
+          chat_mode: requestChatMode,
           attachment: attachment ? { mime_type: attachment.mime_type, data: attachment.data } : undefined,
         });
         socket.send(JSON.stringify({ type: "message.send", ciphertext, is_secret: secret, client_id: userMessage.id }));
@@ -1610,6 +1606,7 @@ export default function Home() {
       ...(regenerate ? [] : [userMessage]),
     ]
       .filter((message) => message.role === "user" || message.role === "assistant")
+      .filter((message) => message.chat_mode !== "private_ai")
       .filter((message) => !room || message.role === "user" || message.is_group_shared_ai_response)
       .filter((message) => !message.is_secret && !message.content.includes(SECRET_MARKER))
       .slice(-39)
@@ -1628,11 +1625,14 @@ export default function Home() {
       ? current.map((message) => message.id === assistantId
         ? { ...message, content: "", is_group_shared_ai_response: false }
         : message)
-      : [...current, { id: assistantId, role: "assistant", content: "", sender_sub: identity.sub }]);
+      : [...current, {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        sender_sub: identity.sub,
+        chat_mode: requestChatMode,
+      }]);
     setSending(true);
-    const localDevelopmentRequest = localChatMode && identity.sub === "local-development";
-
-    const endpoint = localDevelopmentRequest ? "http://localhost:8000/api/chat" : apiUrl("/api/chat");
     const modelTier: ModelTier = model === "genie-master"
       ? "genie-master"
       : model === "genie-lite"
@@ -1650,6 +1650,7 @@ export default function Home() {
       model: modelTier,
       model_tier: modelTier,
       room_mode: Boolean(room),
+      chat_mode: requestChatMode,
       thinking_level: thinkingLevel,
       response_visibility: regenerate?.visibility || "private",
       is_secret: false,
@@ -1657,7 +1658,7 @@ export default function Home() {
     };
 
     try {
-      const response = await fetch(endpoint, {
+      const response = await apiRequest("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
         body: JSON.stringify(requestBody),
@@ -1749,9 +1750,20 @@ export default function Home() {
             const dataLine = frame.match(/^data:\s*(.+)$/m)?.[1];
             if (!dataLine) continue;
             try {
-              const payload = JSON.parse(dataLine) as { text?: string; detail?: string; reply?: string; response?: string; content?: string };
+              const payload = JSON.parse(dataLine) as {
+                text?: string;
+                detail?: string;
+                reply?: string;
+                response?: string;
+                content?: string;
+                sub_agents?: string[];
+              };
               const textVal = payload.text || payload.reply || payload.response || payload.content;
-              if ((eventType === "token" || eventType === "message") && textVal) {
+              if (eventType === "metadata" && payload.sub_agents) {
+                setMessages((current) => current.map((message) => message.id === assistantId
+                  ? { ...message, sub_agents: payload.sub_agents }
+                  : message));
+              } else if ((eventType === "token" || eventType === "message") && textVal) {
                 streamReceivedReply = true;
                 spokenReply += textVal;
                 setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: message.content + textVal } : message));
@@ -1788,7 +1800,7 @@ export default function Home() {
       }
     } catch {
       try {
-        const fallbackResponse = await fetch(endpoint, {
+        const fallbackResponse = await apiRequest("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
           body: JSON.stringify(requestBody),
@@ -2061,7 +2073,6 @@ export default function Home() {
     window.google?.accounts.id.disableAutoSelect();
     setCredential("");
     setIdentity(null);
-    setLocalChatMode(false);
     registrationCompleted.current = false;
     setAccountStatus("checking");
     setLoadedThreadsFor("");
@@ -2084,7 +2095,6 @@ export default function Home() {
       email: "local@localhost",
       name: "Local user",
     });
-    setLocalChatMode(true);
     setAccountStatus("ready");
     setAuthError("");
   }
@@ -2281,7 +2291,19 @@ export default function Home() {
       setDocumentName(attachment.name);
       return;
     }
-    void sendMessage(text, secret, attachment, selectedModel, forceMaster ? "deep" : thinkingLevel, target);
+    void sendMessage(
+      text,
+      secret,
+      attachment,
+      selectedModel,
+      forceMaster ? "deep" : thinkingLevel,
+      target,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      chatMode,
+    );
   }
 
   function downloadScannedPdf() {
@@ -2379,6 +2401,7 @@ export default function Home() {
         visibility: message.is_group_shared_ai_response ? "group" : "private",
         context,
       },
+      message.chat_mode || "ai_room",
     );
   }
 
@@ -2585,7 +2608,7 @@ export default function Home() {
     setPreviewingVoiceId(voice.id);
     try {
       if (credential) {
-        const response = await fetch(apiUrl("/api/tts"), {
+        const response = await apiRequest("/api/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
           body: JSON.stringify({ text: voice.sample, dialect: voice.lang }),
@@ -2634,7 +2657,7 @@ export default function Home() {
     if (!speech) return;
     const voice = GENIE_VOICES.find((candidate) => candidate.lang === dialect) || selectedVoice();
     try {
-      const response = await fetch(apiUrl("/api/tts"), {
+      const response = await apiRequest("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + credential },
         body: JSON.stringify({
@@ -2810,6 +2833,16 @@ export default function Home() {
   }
 
   const sectionView = view === "chat" ? null : view;
+  const privacyModeLabel = chatMode === "friends_only"
+    ? "👥 Friends Only"
+    : chatMode === "private_ai"
+      ? "🔒 Private AI"
+      : "🔓 AI + Room";
+  const privacyModeOptions: Array<{ mode: ChatMode; label: string; description: string }> = [
+    { mode: "ai_room", label: "🔓 AI + Room", description: "Standard AI and room chat" },
+    { mode: "friends_only", label: "👥 Friends Only", description: "Encrypted human chat; AI is paused" },
+    { mode: "private_ai", label: "🔒 Private AI", description: "Private AI whisper, not shared with the room" },
+  ];
   return (
     <main className="application-shell h-dvh max-h-dvh overflow-hidden flex flex-col">
       <Sidebar
@@ -2896,14 +2929,45 @@ export default function Home() {
                   </div>
                 )}
               </div>
-              <button
-                aria-label="Private response mode"
-                aria-pressed={secretMode}
-                className={`top-secret-toggle ${secretMode ? "top-secret-toggle-active" : ""}`}
-                onClick={() => setSecretMode((current) => !current)}
-                title="Private response mode"
-                type="button"
-              ><span aria-hidden="true">{secretMode ? "🔒" : "🔓"}</span></button>
+              <div className="privacy-mode-selector">
+                <button
+                  aria-expanded={privacyMenuOpen}
+                  aria-haspopup="listbox"
+                  aria-label={`Privacy mode: ${privacyModeLabel}`}
+                  className={`privacy-mode-trigger privacy-mode-${chatMode}`}
+                  onClick={() => setPrivacyMenuOpen((open) => !open)}
+                  type="button"
+                >
+                  <LockKeyhole size={14} aria-hidden="true" />
+                  <span>{privacyModeLabel}</span>
+                  <ChevronDown size={13} aria-hidden="true" />
+                </button>
+                {privacyMenuOpen && (
+                  <div className="privacy-mode-popover" role="listbox" aria-label="Choose chat privacy mode">
+                    {privacyModeOptions.map((option) => (
+                      <button
+                        aria-selected={chatMode === option.mode}
+                        className={`privacy-mode-option privacy-mode-option-${option.mode}`}
+                        key={option.mode}
+                        onClick={() => {
+                          if (option.mode === "friends_only" && !room) {
+                            setToast("Join an encrypted room before switching to Friends Only.");
+                            setPrivacyMenuOpen(false);
+                            return;
+                          }
+                          setChatMode(option.mode);
+                          setPrivacyMenuOpen(false);
+                        }}
+                        role="option"
+                        type="button"
+                      >
+                        <span><strong>{option.label}</strong><small>{option.description}</small></span>
+                        {chatMode === option.mode && <Check size={16} aria-hidden="true" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
           <div className="workspace-top-actions">
@@ -2934,14 +2998,6 @@ export default function Home() {
               setRosterOpen(false);
               setRailOpen((open) => !open);
             }} aria-label="Open workspace utilities" aria-expanded={railOpen}><Settings2 size={15} /><span>Utilities</span></button>
-            <button className={`utility-trigger ${temporaryChatActive ? "border-cyan-500 text-cyan-700" : ""}`} onClick={() => {
-              setHeaderMenuOpen(false);
-              setRosterOpen(false);
-              setRailOpen(false);
-              setTemporaryChatOpen(true);
-            }} aria-label="Temporary chat settings" aria-pressed={temporaryChatActive} title="Temporary chat">
-              <Clock3 size={15} /><span>{temporaryChatActive ? "Temporary" : "Temporary chat"}</span>
-            </button>
             <div className="header-actions-menu">
               <button className="utility-trigger header-menu-trigger" onClick={() => {
                 setRailOpen(false);
@@ -2951,7 +3007,6 @@ export default function Home() {
               }} aria-label="Open workspace actions" aria-expanded={headerMenuOpen}><MoreHorizontal size={16} /></button>
               {headerMenuOpen && <div className="header-actions-popover" role="menu">
                 <button role="menuitem" onClick={() => { setRailOpen(true); setHeaderMenuOpen(false); }}><Settings2 size={15} /> Utilities</button>
-                <button role="menuitem" onClick={() => { setTemporaryChatOpen(true); setHeaderMenuOpen(false); }}><Clock3 size={15} /> Temporary chat</button>
                 <button role="menuitem" onClick={() => { setSearchOpen(true); setHeaderMenuOpen(false); }}><Search size={15} /> Search chats</button>
                 <button className="header-danger-menu-item" role="menuitem" onClick={() => {
                   setHeaderMenuOpen(false);
@@ -2960,7 +3015,7 @@ export default function Home() {
                 }}><Trash2 size={15} /> Delete Chat</button>
                 <button role="menuitem" onClick={() => { setSettingsOpen(true); setHeaderMenuOpen(false); }}><span aria-hidden="true">☁</span> Cloud Backup Vault</button>
                 <button role="menuitem" onClick={() => { setView("friends"); setHeaderMenuOpen(false); }}><UsersRound size={15} /> Friend Requests</button>
-                <button role="menuitem" onClick={() => { setSettingsOpen(true); setHeaderMenuOpen(false); }}><span aria-hidden="true">🔒</span> Privacy Settings</button>
+                <button role="menuitem" onClick={() => { setSettingsOpen(true); setHeaderMenuOpen(false); }}><ShieldCheck size={15} /> Trust &amp; privacy</button>
               </div>}
             </div>
           </div>
@@ -3088,7 +3143,7 @@ export default function Home() {
               memberCount={room ? members.length : 1}
               participants={members.filter((member) => member.user_sub !== identity.sub).map((member) => member.user_name)}
               model={tierForModel(activeModel)}
-              secretMode={secretMode}
+              chatMode={chatMode}
               sending={sending}
               aiAvailability={aiAvailability || undefined}
               availabilityError={aiAvailabilityError || undefined}
@@ -3120,8 +3175,7 @@ export default function Home() {
               }}
               stagedVoiceNote={stagedVoiceNote}
               transcribeRequest={transcribeRequest}
-              onOpenPrivacy={() => setSettingsOpen(true)}
-              onSecretModeChange={setSecretMode}
+              externalTranscription={studioDictationText}
               onSubmit={submitComposerMessage}
             />
           </ChatCanvas>
@@ -3160,7 +3214,7 @@ export default function Home() {
         onRemoveAccount={removeAccount}
         onPurgeLocalCache={purgeLocalRoomKeys}
         threads={threads}
-        activeMessages={messages}
+        activeMessages={messages.filter((message) => message.chat_mode !== "private_ai")}
         gmailAddress={identity.email}
         onImportBackup={importChatBackup}
         onOpenVoiceStudio={() => setVoiceStudioOpen(true)}
@@ -3171,34 +3225,8 @@ export default function Home() {
         selectedVoiceId={selectedVoiceId}
         onClose={() => setVoiceStudioOpen(false)}
         onSelect={(voiceId) => chooseVoice(GENIE_VOICES.find((voice) => voice.id === voiceId) || GENIE_VOICES[0])}
+        onTranscription={setStudioDictationText}
       />
-      {temporaryChatOpen && (
-        <div
-          className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-950/50 p-4"
-          onMouseDown={(event) => { if (event.target === event.currentTarget) setTemporaryChatOpen(false); }}
-          role="presentation"
-        >
-          <section aria-labelledby="temporary-chat-title" aria-modal="true" className="w-full max-w-md rounded-2xl border border-stone-200 bg-[#FAF9F5] p-5 shadow-2xl" role="dialog">
-            <div className="mb-4 flex items-start justify-between gap-3">
-              <div>
-                <span className="eyebrow">PRIVATE SESSION</span>
-                <h2 className="mt-1 text-xl font-semibold" id="temporary-chat-title">Temporary Chat Settings</h2>
-                <p className="mt-2 text-sm text-stone-600">Temporary history stays in this browser session and is not added to your saved chat library.</p>
-              </div>
-              <button className="utility-trigger" onClick={() => setTemporaryChatOpen(false)} type="button">Close</button>
-            </div>
-            <div className="grid gap-2">
-              <button className="utility-trigger justify-start" onClick={() => startTemporaryChat("personalized")} type="button">
-                Personalized <span className="ml-2 text-xs text-stone-500">Uses your selected workspace preferences</span>
-              </button>
-              <button className="utility-trigger justify-start" onClick={() => startTemporaryChat("unpersonalized")} type="button">
-                Unpersonalized <span className="ml-2 text-xs text-stone-500">Starts without saved chat history</span>
-              </button>
-              {temporaryChatActive && <button className="utility-trigger justify-start text-rose-700" onClick={endTemporaryChat} type="button">End temporary chat</button>}
-            </div>
-          </section>
-        </div>
-      )}
       <RoomInviteModal
         open={inviteOpen}
         link={inviteLink}

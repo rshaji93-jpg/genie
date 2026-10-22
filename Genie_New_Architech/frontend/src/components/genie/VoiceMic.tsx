@@ -23,7 +23,7 @@ type RecognitionConstructor = new () => {
   lang: string;
   continuous: boolean;
   interimResults: boolean;
-  onresult: ((event: { results: ArrayLike<RecognitionResultLike> }) => void) | null;
+  onresult: ((event: { results: ArrayLike<RecognitionResultLike>; resultIndex?: number }) => void) | null;
   onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
   start(): void;
@@ -32,6 +32,7 @@ type RecognitionConstructor = new () => {
 
 export default function VoiceMic(props: VoiceMicProps) {
   const [recording, setRecording] = useState(false);
+  const [secondsRemaining, setSecondsRemaining] = useState(90);
   const [error, setError] = useState("");
   const recognition = useRef<InstanceType<RecognitionConstructor> | null>(null);
   const manualStop = useRef(false);
@@ -43,6 +44,11 @@ export default function VoiceMic(props: VoiceMicProps) {
   const wakeCallback = useRef(props.onWakeWordPrompt);
   const dictationBaseText = useRef("");
   const recognitionLocale = useRef("en-IN");
+  const dictationActive = useRef(false);
+  const dictationDeadline = useRef(0);
+  const accumulatedTranscriptRef = useRef("");
+  const dictationTimerRef = useRef<number | undefined>(undefined);
+  const dictationIntervalRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     wakeCallback.current = props.onWakeWordPrompt;
@@ -149,10 +155,27 @@ export default function VoiceMic(props: VoiceMicProps) {
 
   useEffect(() => () => {
     manualStop.current = true;
+    dictationActive.current = false;
+    if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+    if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
     recognition.current?.stop();
     recorder.current?.stop();
     stream.current?.getTracks().forEach((track) => track.stop());
   }, []);
+
+  function finishDictation(stopRecognition = true) {
+    dictationActive.current = false;
+    manualStop.current = true;
+    if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+    if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    dictationTimerRef.current = undefined;
+    dictationIntervalRef.current = undefined;
+    if (stopRecognition) recognition.current?.stop();
+    recognition.current = null;
+    setRecording(false);
+    setSecondsRemaining(0);
+    props.onActivity?.("idle");
+  }
 
   async function start(transcribeOnly = false) {
     setError("");
@@ -167,32 +190,77 @@ export default function VoiceMic(props: VoiceMicProps) {
       if (Speech) {
         const instance = new Speech();
         dictationBaseText.current = props.currentText || "";
+        accumulatedTranscriptRef.current = "";
+        dictationActive.current = true;
+        dictationDeadline.current = Date.now() + 90_000;
+        manualStop.current = false;
+        setSecondsRemaining(90);
+        dictationTimerRef.current = window.setTimeout(() => finishDictation(), 90_000);
+        dictationIntervalRef.current = window.setInterval(() => {
+          const remaining = Math.max(0, Math.ceil((dictationDeadline.current - Date.now()) / 1000));
+          setSecondsRemaining(remaining);
+          if (remaining === 0) finishDictation();
+        }, 1000);
         instance.lang = recognitionLocale.current;
-        instance.continuous = false;
+        instance.continuous = true;
         instance.interimResults = true;
         instance.onresult = (event) => {
-          const latestResult = event.results[event.results.length - 1];
-          const isFinal = latestResult?.isFinal ?? true;
-          let text = professionalizeTranscript(
-            Array.from(event.results).map((result) => result[0]?.transcript || "").join(" "),
-          );
+          let interimText = "";
+          const resultIndex = event.resultIndex ?? 0;
+          for (let index = resultIndex; index < event.results.length; index += 1) {
+            const result = event.results[index];
+            if (!result) continue;
+            const transcript = result[0]?.transcript || "";
+            if (result.isFinal) {
+              accumulatedTranscriptRef.current = `${accumulatedTranscriptRef.current} ${transcript}`.trim();
+            } else {
+              interimText += `${transcript} `;
+            }
+          }
+          let finalText = professionalizeTranscript(accumulatedTranscriptRef.current);
+          if (finalText && !/[.!?]$/.test(finalText)) finalText += ".";
+          const interim = professionalizeTranscript(interimText);
+          const text = [finalText, interim].filter(Boolean).join(" ");
           if (!text) return;
-          if (isFinal && !/[.!?]$/.test(text)) text += ".";
           const base = dictationBaseText.current;
           props.onTranscription(
             `${base}${base && !/\s$/.test(base) ? " " : ""}${text}`,
-            !isFinal,
+            Boolean(interim),
           );
         };
         instance.onerror = (event) => {
-          if (event.error === "no-speech") return;
+          if (event.error === "no-speech" || event.error === "aborted") return;
           manualStop.current = true;
+          finishDictation(false);
           setError("Speech recognition failed. Check microphone permissions.");
         };
         instance.onend = () => {
+          if (dictationActive.current && !manualStop.current && Date.now() < dictationDeadline.current) {
+            window.setTimeout(() => {
+              if (!dictationActive.current || manualStop.current || Date.now() >= dictationDeadline.current) return;
+              try {
+                instance.start();
+                recognition.current = instance;
+                setRecording(true);
+              } catch {
+                if (dictationActive.current) {
+                  window.setTimeout(() => {
+                    if (!dictationActive.current || manualStop.current) return;
+                    try {
+                      instance.start();
+                      recognition.current = instance;
+                    } catch {
+                      finishDictation(false);
+                      setError("Speech recognition could not resume. Your captured text is preserved.");
+                    }
+                  }, 50);
+                }
+              }
+            }, 40);
+            return;
+          }
           if (recognition.current === instance) recognition.current = null;
-          setRecording(false);
-          props.onActivity?.("idle");
+          if (dictationActive.current) finishDictation(false);
         };
         recognition.current = instance;
         instance.start();
@@ -254,6 +322,10 @@ export default function VoiceMic(props: VoiceMicProps) {
   }, [props.wakeWordActive, props.dialect]);
 
   function stop() {
+    if (dictationActive.current) {
+      finishDictation();
+      return;
+    }
     manualStop.current = true;
     recognition.current?.stop();
     recognition.current = null;
@@ -284,6 +356,11 @@ export default function VoiceMic(props: VoiceMicProps) {
         {recording ? <Square size={15} fill="currentColor" /> : <Mic size={18} />}
       </button>
       {recording && <span className="voice-waveform" aria-label={props.wakeWordActive ? "Listening for Genie wake word" : "Listening"}>{Array.from({ length: 9 }, (_, index) => <i key={index} />)}</span>}
+      {dictationActive.current && recording && (
+        <span className="dictation-live-pill" role="status">
+          🔴 Listening ({secondsRemaining}s left) · Pause-safe — Tap Mic to finish
+        </span>
+      )}
       {error && <span className="mic-error" role="status">{error}</span>}
     </div>
   );

@@ -111,6 +111,18 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }, [props.stats, refresh]);
 
   if (!props.stats) return null;
+  const systemStatus = error
+    ? "Error"
+    : telemetry && (!telemetry.gemini_free_pool_enabled || telemetry.free_keys_active === 0)
+      ? "Fallback"
+      : telemetry
+        ? "Operational"
+        : null;
+  const fallbackReason = telemetry && !telemetry.gemini_free_pool_enabled
+    ? "Gemini free-pool routing is disabled; requests use the primary provider chain."
+    : telemetry?.free_keys_active === 0
+      ? "No free-pool keys are available; requests use the configured provider fallback chain."
+      : "";
 
   async function saveLimit() {
     setBusy(true);
@@ -207,6 +219,18 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         <span className="eyebrow">PASSKEY-VERIFIED · EXPIRES {new Date(props.stats.expires_at * 1000).toLocaleTimeString()}</span>
         <h2 id="dashboard-title">Admin Telemetry</h2>
         <p>Operational aggregates only. Encrypted room content and provider credentials are never shown.</p>
+        {systemStatus && (
+          <div className="admin-system-status" role="status">
+            <span className={`admin-status-badge admin-status-${systemStatus.toLowerCase()}`}>
+              {systemStatus === "Operational" ? "🟢 Operational" : systemStatus === "Fallback" ? "🟡 Fallback" : "🔴 Error"}
+            </span>
+            {systemStatus === "Fallback" && <span>{fallbackReason}</span>}
+            {error && <details className="admin-diagnostic">
+              <summary>View diagnostic trace</summary>
+              <pre>{error}</pre>
+            </details>}
+          </div>
+        )}
         <div className="admin-stats-grid">
           <div><Users size={16} /><strong>{props.stats.users}</strong><small>Registered users</small></div>
           <div><LockKeyhole size={16} /><strong>{props.stats.rooms}</strong><small>Encrypted rooms</small></div>

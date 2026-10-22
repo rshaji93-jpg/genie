@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ElementTree
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from zoneinfo import ZoneInfo
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -100,11 +100,6 @@ VIP_CODE_PEPPER = os.getenv("GENIE_VIP_CODE_PEPPER", "").encode("utf-8")
 SOVEREIGN_TOTP_FERNET_KEY = os.getenv("GENIE_SOVEREIGN_TOTP_FERNET_KEY", "")
 SESSION_SIGNING_KEY = os.getenv("SESSION_SIGNING_KEY", "")
 GENIE_SESSION_SIGNING_KEY = os.getenv("GENIE_SESSION_SIGNING_KEY", "")
-FRONTEND_ORIGINS = {
-    origin.strip().rstrip("/")
-    for origin in os.getenv("GENIE_FRONTEND_ORIGINS", "http://localhost:3000").split(",")
-    if origin.strip()
-}
 WEBAUTHN_RP_ID = os.getenv("GENIE_WEBAUTHN_RP_ID", "localhost").strip()
 WEBAUTHN_RP_NAME = os.getenv("GENIE_WEBAUTHN_RP_NAME", "Personal AI Genie").strip()
 WEBAUTHN_ORIGIN = os.getenv("GENIE_WEBAUTHN_ORIGIN", "http://localhost:3000").strip()
@@ -468,10 +463,10 @@ initialize_database()
 app = FastAPI(title="Personal AI Genie — Isolated Architecture", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=sorted(FRONTEND_ORIGINS),
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Genie-Admin-Session"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -575,6 +570,7 @@ class ChatRequest(StrictModel):
     response_visibility: str = Field(default="private", pattern="^(private|group)$")
     room_id: str | None = Field(default=None, max_length=100)
     room_mode: bool = False
+    chat_mode: Literal["ai_room", "friends_only", "private_ai"] = "ai_room"
 
     @model_validator(mode="after")
     def validate_chat_input(self) -> ChatRequest:
@@ -1602,11 +1598,14 @@ def is_prohibited_photo_request(messages: list[dict[str, Any]]) -> bool:
 
 
 @app.get("/healthz")
+@app.get("/health")
+@app.get("/api/health")
 async def healthz():
     return {"status": "ok", "service": "genie-new-architecture"}
 
 
 @app.get("/api/ai/status")
+@app.get("/api/py/ai/status")
 async def ai_status(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer ") or not authorization[7:].strip():
         return {
@@ -1746,6 +1745,21 @@ async def chat(
     request.messages = effective_chat_messages(request)
     if request.room_id:
         room_member(request.room_id, identity)
+    if request.chat_mode == "friends_only":
+        return {
+            "reply": "Friends-only mode is active. The message is ready for encrypted peer relay; AI inference was skipped.",
+            "chat_mode": "friends_only",
+            "inference_skipped": True,
+            "tick_status": "read_no_ai",
+            "tokens_burned": 0,
+            "sub_agents": [],
+        }
+    if request.chat_mode == "private_ai":
+        latest_user_message = next(
+            (item for item in reversed(request.messages) if item.role == "user"),
+            None,
+        )
+        request.messages = [latest_user_message] if latest_user_message else []
     if request.is_secret or any(
         is_zero_knowledge_secret(item.content, item.is_secret) for item in request.messages
     ):
@@ -1861,6 +1875,27 @@ async def chat_stream(
     request.messages = effective_chat_messages(request)
     if request.room_id:
         room_member(request.room_id, identity)
+    if request.chat_mode == "friends_only":
+        confirmation = {
+            "reply": "Friends-only mode is active. The message is ready for encrypted peer relay; AI inference was skipped.",
+            "chat_mode": "friends_only",
+            "inference_skipped": True,
+            "tick_status": "read_no_ai",
+            "tokens_burned": 0,
+            "sub_agents": [],
+        }
+
+        def friends_only_events():
+            yield f"event: confirmation\ndata: {json.dumps(confirmation)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+
+        return StreamingResponse(friends_only_events(), media_type="text/event-stream")
+    if request.chat_mode == "private_ai":
+        latest_user_message = next(
+            (item for item in reversed(request.messages) if item.role == "user"),
+            None,
+        )
+        request.messages = [latest_user_message] if latest_user_message else []
     if request.is_secret or any(
         is_zero_knowledge_secret(item.content, item.is_secret) for item in request.messages
     ):
