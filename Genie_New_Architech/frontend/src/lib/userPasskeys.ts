@@ -60,7 +60,10 @@ export async function enrollUserPasskey(credential: string): Promise<void> {
   }>;
   const publicKey: PublicKeyCredentialCreationOptions = {
     challenge: decodeBase64Url(String(options.challenge)),
-    rp: options.rp as PublicKeyCredentialRpEntity,
+    rp: {
+      ...(options.rp as PublicKeyCredentialRpEntity),
+      id: window.location.hostname,
+    },
     user: { ...user, id: decodeBase64Url(user.id) },
     pubKeyCredParams: options.pubKeyCredParams as PublicKeyCredentialParameters[],
     timeout: typeof options.timeout === "number" ? options.timeout : undefined,
