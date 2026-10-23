@@ -1,6 +1,6 @@
 const CLOUD_API_URL = (
   process.env.NEXT_PUBLIC_API_URL
-  || "https://personalaigenie-767453349146.asia-south1.run.app"
+  || "https://genie-backend-481849166496.asia-south1.run.app"
 ).replace(/\/$/, "");
 const API_URL_OVERRIDE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 const LEGACY_API_URL = (process.env.NEXT_PUBLIC_GENIE_API_URL || "").replace(/\/$/, "");
