@@ -1,6 +1,8 @@
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
+httpx>=0.28,<1
 pydantic>=2.10,<3
+python-multipart>=0.0.20,<1
 requests>=2.32,<3
 google-adk>=1.28,<2
 litellm>=1.84,<2
@@ -17,3 +19,5 @@ pypdf>=5,<7
 gTTS>=2.5,<3
 pywebpush>=2.0,<3
 pytesseract>=0.3.13,<1
+edge-tts>=7.0,<8
+tzdata>=2025.1

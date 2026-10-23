@@ -1,6 +1,6 @@
 "use client";
 
-import { AudioLines, Mic, PhoneCall, Settings2, ShieldCheck, Square, X } from "lucide-react";
+import { AudioLines, PhoneCall, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 export interface RoomPerson {
@@ -11,58 +11,35 @@ export interface RoomPerson {
 
 export interface CallSignal {
   from_sub: string;
-  payload: RTCSessionDescriptionInit | RTCIceCandidateInit;
+  payload: RTCSessionDescriptionInit | RTCIceCandidateInit | { type: "decline"; message: string };
 }
 
 interface RightSideRailProps {
   open: boolean;
   roomId?: string;
-  isRoomHost: boolean;
-  voiceDialect: string;
   mySub: string;
   members: RoomPerson[];
   onlineSubs: string[];
   incomingSignal?: CallSignal;
   onClose: () => void;
   onCallGenie: () => void;
-  onSendVoiceNote: (dataUrl: string, durationSeconds: number) => void;
-  onStageVoiceNote: (dataUrl: string, durationSeconds: number) => void;
-  onTranscribeLive: () => void;
-  onOpenSettings: () => void;
   onVoiceParticipantsChange: (userSubs: string[]) => void;
-  onVoiceDialectChange: (dialect: string) => void;
-  onSendSignal: (toSub: string, payload: RTCSessionDescriptionInit | RTCIceCandidateInit) => void;
+  onLocalStreamChange?: (stream: MediaStream | null) => void;
+  onSendSignal: (toSub: string, payload: CallSignal["payload"]) => void;
 }
-
-const VOICE_DIALECTS = [
-  ["en-IN", "Indian English"],
-  ["ta-IN", "Tamil"],
-  ["ml-IN", "Malayalam"],
-  ["hi-IN", "Hindi"],
-  ["te-IN", "Telugu"],
-  ["kn-IN", "Kannada"],
-  ["bn-IN", "Bengali"],
-  ["mr-IN", "Marathi"],
-  ["gu-IN", "Gujarati"],
-  ["pa-IN", "Punjabi"],
-  ["or-IN", "Odia"],
-  ["as-IN", "Assamese"],
-  ["ur-IN", "Urdu"],
-  ["kok-IN", "Konkani"],
-];
 
 export default function RightSideRail(props: RightSideRailProps) {
   const [inCall, setInCall] = useState(false);
-  const [recordingVoiceNote, setRecordingVoiceNote] = useState(false);
-  const [pendingVoiceNote, setPendingVoiceNote] = useState<{ dataUrl: string; durationSeconds: number } | null>(null);
+  const [selectedCallMembers, setSelectedCallMembers] = useState<string[]>([]);
+  const [pendingIncoming, setPendingIncoming] = useState<CallSignal | null>(null);
   const [callError, setCallError] = useState("");
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+  const [localVideoEnabled, setLocalVideoEnabled] = useState(false);
+  const [localMicEnabled, setLocalMicEnabled] = useState(true);
+  const [genieSummoned, setGenieSummoned] = useState(false);
+  const [callPickerOpen, setCallPickerOpen] = useState(false);
   const localStream = useRef<MediaStream | null>(null);
   const peers = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const noteRecorder = useRef<MediaRecorder | null>(null);
-  const noteStream = useRef<MediaStream | null>(null);
-  const noteChunks = useRef<Blob[]>([]);
-  const noteStartedAt = useRef(0);
 
   useEffect(() => {
     props.onVoiceParticipantsChange(Object.keys(remoteStreams));
@@ -99,29 +76,135 @@ export default function RightSideRail(props: RightSideRailProps) {
     return peer;
   }
 
-  async function startCall() {
-    if (!props.roomId) {
-      setCallError("Open an encrypted room before starting a peer call.");
+  async function inviteCallMembers(userSubs: string[]) {
+    const participants = props.members.filter((member) =>
+      userSubs.includes(member.user_sub)
+      && member.user_sub !== props.mySub
+      && props.onlineSubs.includes(member.user_sub)
+      && !peers.current.has(member.user_sub),
+    );
+    if (!localStream.current) {
+      setCallError("Start a room call before adding another member.");
+      return;
+    }
+    if (!participants.length) {
+      setCallError("Select an online room member who is not already in the call.");
       return;
     }
     try {
       setCallError("");
-      const media = await navigator.mediaDevices.getUserMedia({ audio: true });
-      localStream.current = media;
-      setInCall(true);
-      const participants = props.members.filter(
-        (member) => member.user_sub !== props.mySub && props.onlineSubs.includes(member.user_sub),
-      );
       for (const participant of participants) {
         const peer = getPeer(participant.user_sub);
         const offer = await peer.createOffer();
         await peer.setLocalDescription(offer);
         props.onSendSignal(participant.user_sub, offer);
       }
-      if (!participants.length) setCallError("Waiting for another room member to come online.");
+      setSelectedCallMembers((current) => current.filter((sub) => !participants.some((member) => member.user_sub === sub)));
+      setCallPickerOpen(false);
+    } catch {
+      setCallError("Could not add the selected member to the call.");
+    }
+  }
+
+  async function startCall() {
+    if (inCall) {
+      setCallError("Use + Add member in the live call dock to invite more people.");
+      return;
+    }
+    if (!props.roomId) {
+      setCallError("Open an encrypted room before starting a peer call.");
+      return;
+    }
+    const participants = props.members.filter((member) =>
+      member.user_sub !== props.mySub
+      && selectedCallMembers.includes(member.user_sub)
+      && props.onlineSubs.includes(member.user_sub),
+    );
+    if (!participants.length) {
+      setCallError("Select at least one online room member to call.");
+      return;
+    }
+    try {
+      setCallError("");
+      const media = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      localStream.current = media;
+      props.onLocalStreamChange?.(media);
+      setInCall(true);
+      await inviteCallMembers(participants.map((participant) => participant.user_sub));
     } catch {
       setCallError("Microphone permission or peer call setup failed.");
     }
+  }
+
+  async function acceptIncomingCall() {
+    const incoming = pendingIncoming;
+    if (!incoming || !("type" in incoming.payload) || incoming.payload.type !== "offer") return;
+    try {
+      const media = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      localStream.current = media;
+      props.onLocalStreamChange?.(media);
+      setInCall(true);
+      setPendingIncoming(null);
+      const peer = getPeer(incoming.from_sub);
+      await peer.setRemoteDescription(incoming.payload);
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      props.onSendSignal(incoming.from_sub, answer);
+    } catch {
+      setCallError("Could not accept the incoming call. Check microphone permission.");
+    }
+  }
+
+  function toggleLocalMic() {
+    const enabled = !localMicEnabled;
+    localStream.current?.getAudioTracks().forEach((track) => { track.enabled = enabled; });
+    setLocalMicEnabled(enabled);
+  }
+
+  async function toggleLocalVideo() {
+    if (localVideoEnabled) {
+      const tracks = localStream.current?.getVideoTracks() || [];
+      for (const track of tracks) {
+        for (const peer of peers.current.values()) {
+          const sender = peer.getSenders().find((candidate) => candidate.track?.id === track.id);
+          if (sender) await sender.replaceTrack(null);
+        }
+        localStream.current?.removeTrack(track);
+        track.stop();
+      }
+      setLocalVideoEnabled(false);
+      return;
+    }
+    try {
+      const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (!localStream.current) {
+        videoStream.getTracks().forEach((track) => track.stop());
+        setCallError("Start a room call before enabling video.");
+        return;
+      }
+      for (const track of videoStream.getVideoTracks()) {
+        localStream.current.addTrack(track);
+        for (const [userSub, peer] of peers.current) {
+          peer.addTrack(track, localStream.current);
+          const offer = await peer.createOffer();
+          await peer.setLocalDescription(offer);
+          props.onSendSignal(userSub, offer);
+        }
+      }
+      setLocalVideoEnabled(true);
+    } catch {
+      setCallError("Camera access is unavailable.");
+    }
+  }
+
+  function declineIncomingCall(message: string) {
+    if (!pendingIncoming) return;
+    props.onSendSignal(pendingIncoming.from_sub, { type: "decline", message });
+    setPendingIncoming(null);
   }
 
   function endCall() {
@@ -129,58 +212,36 @@ export default function RightSideRail(props: RightSideRailProps) {
     peers.current.clear();
     localStream.current?.getTracks().forEach((track) => track.stop());
     localStream.current = null;
+    props.onLocalStreamChange?.(null);
     setRemoteStreams({});
+    setLocalVideoEnabled(false);
+    setLocalMicEnabled(true);
     setInCall(false);
+    setGenieSummoned(false);
   }
 
-  async function startVoiceNote() {
-    try {
-      setCallError("");
-      const media = await navigator.mediaDevices.getUserMedia({ audio: true });
-      noteStream.current = media;
-      noteChunks.current = [];
-      noteStartedAt.current = Date.now();
-      const recorder = new MediaRecorder(media);
-      noteRecorder.current = recorder;
-      recorder.ondataavailable = (event) => {
-        if (event.data.size) noteChunks.current.push(event.data);
-      };
-      recorder.onstop = () => {
-        const blob = new Blob(noteChunks.current, { type: recorder.mimeType || "audio/webm" });
-        if (blob.size > 8_000_000) {
-          setCallError("Voice note is larger than 8 MB. Record a shorter note.");
-        } else {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            if (typeof reader.result === "string") {
-              setPendingVoiceNote({
-                dataUrl: reader.result,
-                durationSeconds: Math.max(1, Math.round((Date.now() - noteStartedAt.current) / 1000)),
-              });
-            }
-          };
-          reader.onerror = () => setCallError("The recorded voice note could not be read.");
-          reader.readAsDataURL(blob);
-        }
-        media.getTracks().forEach((track) => track.stop());
-        noteStream.current = null;
-        noteRecorder.current = null;
-        setRecordingVoiceNote(false);
-      };
-      recorder.start();
-      setRecordingVoiceNote(true);
-    } catch {
-      setCallError("Microphone access for voice notes is unavailable.");
-    }
-  }
-
-  function stopVoiceNote() {
-    if (noteRecorder.current?.state === "recording") noteRecorder.current.stop();
+  function summonGenie() {
+    setGenieSummoned(true);
+    props.onCallGenie();
   }
 
   useEffect(() => {
     const incoming = props.incomingSignal;
     if (!incoming) return;
+    if ("type" in incoming.payload && incoming.payload.type === "decline") {
+      setCallError(incoming.payload.message);
+      return;
+    }
+    if ("type" in incoming.payload && incoming.payload.type === "offer" && !inCall) {
+      setPendingIncoming(incoming);
+      if ("serviceWorker" in navigator && "Notification" in window && Notification.permission === "granted") {
+        void navigator.serviceWorker.ready.then((registration) => registration.showNotification("Incoming Genie room call", {
+          body: "A room member is calling you.",
+          tag: `genie-call-${incoming.from_sub}`,
+        }));
+      }
+      return;
+    }
     void (async () => {
       try {
         if (!localStream.current && "type" in incoming.payload && incoming.payload.type === "offer") {
@@ -190,6 +251,7 @@ export default function RightSideRail(props: RightSideRailProps) {
         if (!localStream.current) return;
         const peer = getPeer(incoming.from_sub);
         const signal = incoming.payload;
+        if ("type" in signal && signal.type === "decline") return;
         if ("type" in signal && signal.type) {
           await peer.setRemoteDescription(signal);
           if (signal.type === "offer") {
@@ -204,74 +266,142 @@ export default function RightSideRail(props: RightSideRailProps) {
         setCallError("Could not establish the incoming peer connection.");
       }
     })();
-  }, [props.incomingSignal]);
+  }, [props.incomingSignal, inCall]);
 
   useEffect(() => () => {
     endCall();
-    stopVoiceNote();
-    noteStream.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
   return (
     <>
-      {props.open && <button className="rail-backdrop" onClick={props.onClose} aria-label="Close utility drawer" />}
-      <aside className={`utility-rail ${props.open ? "utility-rail-open" : ""}`} aria-label="Workspace utilities">
-        <div className="rail-heading">
-          <div><span className="eyebrow">WORKSPACE TOOLS</span><h2>Utilities</h2></div>
-          <button className="icon-button" onClick={props.onClose} aria-label="Close utilities"><X size={17} /></button>
-        </div>
-        <div className="rail-actions">
-          <button className="rail-action" onClick={props.onCallGenie}><span className="utility-icon lilac"><AudioLines size={18} /></span><span><strong>Call Genie</strong><small>Start a voice conversation</small></span></button>
-          <button className="rail-action" onClick={() => void (inCall ? endCall() : startCall())}><span className="utility-icon peach"><PhoneCall size={18} /></span><span><strong>{inCall ? "End call with friends" : "Call Friends"}</strong><small>Private audio · WebRTC</small></span><span className={`presence-light ${inCall ? "yellow" : "green"}`} /></button>
-          <button className="rail-action" disabled={!props.roomId} onClick={() => recordingVoiceNote ? stopVoiceNote() : void startVoiceNote()}><span className="utility-icon stone">{recordingVoiceNote ? <Square size={17} /> : <Mic size={18} />}</span><span><strong>{recordingVoiceNote ? "Stop voice note" : "Record a voice note"}</strong><small>{props.roomId ? "Send encrypted to this room" : "Open a room to record"}</small></span></button>
-        </div>
-        {props.roomId && props.isRoomHost && <label className="voice-dialect-control">
-          <span>Host voice for this room</span>
-          <select
-            className="thinking-select"
-            value={props.voiceDialect}
-            onChange={(event) => props.onVoiceDialectChange(event.target.value)}
-          >
-            {VOICE_DIALECTS.map(([value, label]) => (
-              <option key={value} value={value}>{label}</option>
-            ))}
-          </select>
-        </label>}
-        {pendingVoiceNote && <div className="voice-note-actions">
-          <audio controls src={pendingVoiceNote.dataUrl} />
-          <button type="button" onClick={() => {
-            props.onSendVoiceNote(pendingVoiceNote.dataUrl, pendingVoiceNote.durationSeconds);
-            setPendingVoiceNote(null);
-          }}>Send as encrypted voice note</button>
-          <button type="button" onClick={() => {
-            props.onStageVoiceNote(pendingVoiceNote.dataUrl, pendingVoiceNote.durationSeconds);
-            setPendingVoiceNote(null);
-          }}>Stage in composer · ↑ to Genie, people button to room</button>
-          <button type="button" onClick={() => props.onTranscribeLive()}>Start live transcription in composer</button>
-          <button type="button" onClick={() => setPendingVoiceNote(null)}>Discard recording</button>
-        </div>}
-        {callError && <p className="rail-error" role="status">{callError}</p>}
-        <section className="call-stage">
-          <div className="stage-heading"><span>Teams audio cluster</span><span>{Math.min(5, Object.keys(remoteStreams).length + (inCall ? 1 : 0))}/5</span></div>
-          <div className="stage-grid">
-            <div className="stage-person local-stage"><span className={`presence-light ${inCall ? "yellow" : "green"}`} /><strong>You</strong><small>{inCall ? "On call" : "Ready"}</small></div>
-            {props.members.filter((member) => member.user_sub !== props.mySub).slice(0, 4).map((member) => {
-              const online = props.onlineSubs.includes(member.user_sub);
-              const connected = Boolean(remoteStreams[member.user_sub]);
+      {inCall && (
+        <section className="active-call-dock" aria-label="Active room call">
+          <div className="active-call-dock-heading">
+            <strong>Live room call</strong>
+            <span>{Math.min(5, Object.keys(remoteStreams).length + 1)}/5</span>
+            <button type="button" className="call-dock-end" onClick={endCall}>End call</button>
+          </div>
+          {genieSummoned && (
+            <div className="call-dock-genie-participant" role="status">
+              <span aria-hidden="true">✨</span>
+              <span><strong>Genie</strong><small>AI participant · shared responses appear in this room</small></span>
+              <span className="call-dock-genie-status">Summoned</span>
+            </div>
+          )}
+          <div className="active-call-dock-controls">
+            <button type="button" onClick={toggleLocalMic}>🎤 Mic {localMicEnabled ? "On" : "Off"}</button>
+            <button type="button" onClick={() => void toggleLocalVideo()}>📹 Video {localVideoEnabled ? "On" : "Off"}</button>
+            {Object.entries(remoteStreams).map(([userSub, media]) => {
+              const name = props.members.find((member) => member.user_sub === userSub)?.user_name || "Member";
+              const audioEnabled = media.getAudioTracks().some((track) => track.enabled);
+              const videoEnabled = media.getVideoTracks().some((track) => track.enabled);
               return (
-                <div className="stage-person" key={member.user_sub}>
-                  <span className={`presence-light ${connected ? "yellow" : online ? "green" : "red"}`} />
-                  <strong>{member.user_name}</strong><small>{connected ? "On call" : online ? "Online" : "Offline"}</small>
-                  {remoteStreams[member.user_sub] && <audio autoPlay ref={(element) => { if (element && remoteStreams[member.user_sub]) element.srcObject = remoteStreams[member.user_sub]; }} />}
-                </div>
+                <span className="call-dock-member" key={userSub}>
+                  <strong>{name}</strong>
+                  <button type="button" onClick={() => {
+                    media.getAudioTracks().forEach((track) => { track.enabled = !audioEnabled; });
+                    setRemoteStreams((current) => ({ ...current }));
+                  }}>🎤 {audioEnabled ? "On" : "Off"}</button>
+                  <button type="button" onClick={() => {
+                    media.getVideoTracks().forEach((track) => { track.enabled = !videoEnabled; });
+                    setRemoteStreams((current) => ({ ...current }));
+                  }}>📹 {videoEnabled ? "On" : "Off"}</button>
+                </span>
               );
             })}
-            {!props.members.some((member) => member.user_sub !== props.mySub) && <div className="stage-empty">Invite people to your room to start a P2P call.</div>}
+            <button type="button" onClick={() => setCallPickerOpen((open) => !open)}>+ Add member</button>
+            <button type="button" onClick={summonGenie}>✨ Summon Genie</button>
           </div>
+          {(localVideoEnabled || Object.values(remoteStreams).some((media) => media.getVideoTracks().length > 0)) && (
+            <div className="call-dock-media">
+              {localVideoEnabled && localStream.current && (
+                <video autoPlay muted playsInline ref={(element) => {
+                  if (element && localStream.current) element.srcObject = localStream.current;
+                }} />
+              )}
+              {Object.entries(remoteStreams).map(([userSub, media]) => (
+                <div key={userSub}>
+                  <audio autoPlay ref={(element) => { if (element) element.srcObject = media; }} />
+                  {media.getVideoTracks().length > 0 && (
+                    <video autoPlay playsInline ref={(element) => { if (element) element.srcObject = media; }} />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {Object.values(remoteStreams).length > 0 && !Object.values(remoteStreams).some((media) => media.getVideoTracks().length > 0) && (
+            <div className="call-dock-audio">
+              {Object.entries(remoteStreams).map(([userSub, media]) => (
+                <audio key={userSub} autoPlay ref={(element) => { if (element) element.srcObject = media; }} />
+              ))}
+            </div>
+          )}
+          {callPickerOpen && (
+            <div className="call-dock-picker" role="dialog" aria-label="Add room members to call">
+              {props.members.filter((member) =>
+                member.user_sub !== props.mySub
+                && props.onlineSubs.includes(member.user_sub)
+                && !peers.current.has(member.user_sub),
+              ).map((member) => (
+                <label key={member.user_sub}>
+                  <input
+                    checked={selectedCallMembers.includes(member.user_sub)}
+                    onChange={(event) => setSelectedCallMembers((current) => event.target.checked
+                      ? [...current, member.user_sub]
+                      : current.filter((sub) => sub !== member.user_sub))}
+                    type="checkbox"
+                  />
+                  {member.user_name}
+                </label>
+              ))}
+              <button type="button" onClick={() => void inviteCallMembers(selectedCallMembers)}>Ring selected</button>
+            </div>
+          )}
         </section>
-        <button className="rail-action preferences-action" onClick={props.onOpenSettings}><span className="utility-icon stone"><Settings2 size={18} /></span><span><strong>Workspace preferences</strong><small>Privacy, security, and platform terms</small></span></button>
-        <div className="rail-security-note"><ShieldCheck size={15} /><span>Audio is peer-to-peer. Use HTTPS and configure TURN for reliable calls across restrictive networks.</span></div>
-      </aside>
+      )}
+      {pendingIncoming && (
+        <div className="incoming-call-backdrop" role="presentation">
+          <section className="incoming-call-card" role="dialog" aria-modal="true" aria-label="Incoming room call">
+            <span className="eyebrow">INCOMING ROOM CALL</span>
+            <h2>{props.members.find((member) => member.user_sub === pendingIncoming.from_sub)?.user_name || "A room member"} is calling</h2>
+            <button className="primary-button" onClick={() => void acceptIncomingCall()} type="button">✓ Accept</button>
+            <button className="subtle-button" onClick={() => declineIncomingCall("In a meeting, will call back soon 🙏")} type="button">In a meeting, will call back soon 🙏</button>
+            <button className="subtle-button" onClick={() => declineIncomingCall("Busy right now, message in the room 🚗")} type="button">Busy right now, message in the room 🚗</button>
+          </section>
+        </div>
+      )}
+      {props.open && <button className="call-picker-backdrop" onClick={props.onClose} aria-label="Close call picker" />}
+      {props.open && <aside className="call-picker-popover" aria-label="Selective room call">
+        <div className="rail-heading">
+          <div><span className="eyebrow">LIVE ROOM</span><h2>Call room members</h2></div>
+          <button className="icon-button" onClick={props.onClose} aria-label="Close call picker"><X size={17} /></button>
+        </div>
+        <div className="call-member-picker" aria-label="Choose room members to call">
+          <strong>Choose who to ring</strong>
+          {props.members.filter((member) => member.user_sub !== props.mySub).map((member) => (
+            <label key={member.user_sub}>
+              <input
+                checked={selectedCallMembers.includes(member.user_sub)}
+                disabled={!props.onlineSubs.includes(member.user_sub)}
+                onChange={(event) => setSelectedCallMembers((current) => event.target.checked
+                  ? [...current, member.user_sub]
+                  : current.filter((sub) => sub !== member.user_sub))}
+                type="checkbox"
+              />
+              <span>{member.user_name}</span>
+              <small>{props.onlineSubs.includes(member.user_sub) ? "Online" : "Offline"}</small>
+            </label>
+          ))}
+        </div>
+        <div className="call-picker-actions">
+          <button type="button" onClick={() => void startCall()} disabled={!props.roomId || selectedCallMembers.length === 0}>
+            <PhoneCall size={16} /> Call selected members
+          </button>
+          <button type="button" onClick={summonGenie}><AudioLines size={16} /> Summon Genie
+          </button>
+        </div>
+        {callError && <p className="rail-error" role="status">{callError}</p>}
+      </aside>}
     </>
   );
 }

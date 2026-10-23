@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUpRight, AudioLines, Check, ChevronDown, LockKeyhole, Menu, MoreHorizontal, Search, Settings2, ShieldCheck, Trash2, UsersRound } from "lucide-react";
+import { ArrowUpRight, AudioLines, Check, ChevronDown, LockKeyhole, Menu, MoreHorizontal, Search, ShieldCheck, Trash2, UsersRound } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import AdminDashboard from "@/components/genie/AdminDashboard";
 import AdminPasskey from "@/components/genie/AdminPasskey";
@@ -12,7 +12,17 @@ import SettingsDialog from "@/components/genie/SettingsDialog";
 import RoomInviteModal from "@/components/genie/RoomInviteModal";
 import Sidebar, { type DeletedThreadItem, type ThreadItem, type WorkspaceView } from "@/components/genie/Sidebar";
 import WorkspacePanel from "@/components/genie/WorkspacePanel";
-import { apiFetch, apiFetchWithFallback, apiRequest, randomToken, websocketUrl } from "@/lib/api";
+import {
+  apiFetch,
+  apiFetchWithFallback,
+  apiRequest,
+  approveProposedMemory,
+  createFutureSelfEntry,
+  randomToken,
+  requestVoiceTts,
+  saveLibraryItem,
+  websocketUrl,
+} from "@/lib/api";
 import { decryptRoomMessage, encryptRoomMessage } from "@/lib/roomCrypto";
 import PdfArtifactPreview from "@/modules/scanner_pdf/PdfArtifactPreview";
 import ForwardToRoomModal from "@/modules/messages_arrows/ForwardToRoomModal";
@@ -34,13 +44,16 @@ interface Room {
   owner_sub?: string;
   voice_dialect?: string;
   member_count?: number;
+  group_slot?: number | null;
+  auto_saved?: boolean;
 }
 interface ThreadRecord extends ThreadItem {
   messages: ChatMessage[];
 }
 type DeletedThreadRecord = ThreadRecord & DeletedThreadItem;
 interface SavedItem { id: string; content: string; createdAt: string }
-interface FriendRequestItem { id: string; sender_name: string; sender_username: string }
+interface FriendRequestItem { id: string; sender_name: string; sender_username: string; sender_sub?: string; receiver_sub?: string }
+interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string; sender_sub?: string; receiver_sub?: string }
 interface FriendItem { user_sub: string; user_name: string; username: string }
 interface AIAvailability {
   genie_pro_configured: boolean;
@@ -291,10 +304,12 @@ function parseRoomFragment(hash: string): { key: string; invite: string } {
   return { key, invite };
 }
 
-function roomInviteUrl(roomId: string, key: string, invite: string): string {
+function roomInviteUrl(roomId: string, key: string, invite: string, groupSlot?: number | null): string {
   const url = new URL(window.location.href);
   url.search = "";
-  url.hash = new URLSearchParams({ room: roomId, key, invite }).toString();
+  const fragment = new URLSearchParams({ room: roomId, key, invite });
+  if (groupSlot) fragment.set("group", String(groupSlot));
+  url.hash = fragment.toString();
   return url.toString();
 }
 
@@ -377,7 +392,6 @@ export default function Home() {
   const voiceSubsRef = useRef<string[]>([]);
   const sendMessageRef = useRef<(text: string, secret: boolean, attachment?: Attachment, model?: string, thinkingLevel?: string, target?: SubmitTarget, transcriptContext?: ChatMessage, voiceReply?: boolean, voiceDialect?: string, regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] }) => Promise<void>>(async () => {});
   const [queuedAttachment, setQueuedAttachment] = useState<QueuedAttachment | null>(null);
-  const [documentName, setDocumentName] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [view, setView] = useState<WorkspaceView>("chat");
@@ -397,8 +411,8 @@ export default function Home() {
   const [roomCooldownNotice, setRoomCooldownNotice] = useState<{
     userSub: string; userName: string; cooldownUntil: string;
   } | null>(null);
-  const [stagedVoiceNote, setStagedVoiceNote] = useState<{ id: string; dataUrl: string; durationSeconds: number }>();
   const [transcribeRequest, setTranscribeRequest] = useState(0);
+  const callSummonTranscript = useRef("");
   const [room, setRoom] = useState<Room | null>(null);
   const [roomVoiceDialect, setRoomVoiceDialect] = useState("en-IN");
   const [roomKey, setRoomKey] = useState("");
@@ -410,15 +424,17 @@ export default function Home() {
   const [onlineSubs, setOnlineSubs] = useState<string[]>([]);
   const [voiceSubs, setVoiceSubs] = useState<string[]>([]);
   const [callSignal, setCallSignal] = useState<CallSignal>();
+  const [callAudioStream, setCallAudioStream] = useState<MediaStream | null>(null);
   const [threads, setThreads] = useState<ThreadRecord[]>([]);
   const [deletedThreads, setDeletedThreads] = useState<DeletedThreadRecord[]>([]);
   const [loadedThreadsFor, setLoadedThreadsFor] = useState("");
-  const [archivedRoomIds, setArchivedRoomIds] = useState<string[]>([]);
-  const [archivedRoomsFor, setArchivedRoomsFor] = useState("");
   const [threadId, setThreadId] = useState("");
   const threadsRef = useRef(threads);
   const [library, setLibrary] = useState<SavedItem[]>([]);
   const [friendRequests, setFriendRequests] = useState<FriendRequestItem[]>([]);
+  const [outgoingFriendRequests, setOutgoingFriendRequests] = useState<OutgoingFriendRequestItem[]>([]);
+  const friendRequestNoticeInitialized = useRef(false);
+  const friendRequestIdsRef = useRef(new Set<string>());
   const [friends, setFriends] = useState<FriendItem[]>([]);
   const [aiAvailability, setAIAvailability] = useState<AIAvailability | null>(null);
   const [aiAvailabilityError, setAIAvailabilityError] = useState("");
@@ -695,9 +711,10 @@ export default function Home() {
       setLibrary([]);
       setRooms([]);
       setFriendRequests([]);
+      setOutgoingFriendRequests([]);
+      setOutgoingFriendRequests([]);
       setFriends([]);
       setLoadedThreadsFor(identity.sub);
-      setArchivedRoomsFor(identity.sub);
       setAccountStatus("ready");
       return;
     }
@@ -709,19 +726,20 @@ export default function Home() {
     setThreads(readStored<ThreadRecord[]>(userStorageKey(THREAD_STORAGE, identity.sub), []));
     setDeletedThreads(readStored<DeletedThreadRecord[]>(userStorageKey(TRASH_STORAGE, identity.sub), []));
     setLibrary(readStored<SavedItem[]>(userStorageKey(LIBRARY_STORAGE, identity.sub), []));
-    setArchivedRoomIds(readStored<string[]>(userStorageKey("genie_archived_rooms", identity.sub), []));
     const localRooms = readStored<Room[]>(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), []);
     const localRequests = readStored<FriendRequestItem[]>(userStorageKey(LOCAL_REQUESTS_STORAGE, identity.sub), []);
+    const localOutgoingRequests = readStored<OutgoingFriendRequestItem[]>(userStorageKey("genie_local_outgoing_friend_requests", identity.sub), []);
     const localFriends = readStored<FriendItem[]>(userStorageKey(LOCAL_FRIENDS_STORAGE, identity.sub), []);
     const localProfile = readStored<Partial<ProfileResponse>>(userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub), {});
     setRooms(localRooms);
     setFriendRequests(localRequests);
+    setOutgoingFriendRequests(localOutgoingRequests);
     setFriends(localFriends);
-    setArchivedRoomsFor(identity.sub);
     setLoadedThreadsFor(identity.sub);
     void Promise.all([
       apiFetch<Room[]>("/api/rooms", credential).catch(() => [] as Room[]),
       apiFetch<FriendRequestItem[]>("/api/social/requests", credential).catch(() => [] as FriendRequestItem[]),
+      apiFetch<OutgoingFriendRequestItem[]>("/api/social/requests/outgoing", credential).catch(() => [] as OutgoingFriendRequestItem[]),
       apiFetch<FriendItem[]>("/api/social/friends", credential).catch(() => [] as FriendItem[]),
       apiFetch<ProfileResponse>("/api/profile", credential).catch(() => ({
         email: identity.email, user_name: identity.name, display_name: identity.name,
@@ -731,7 +749,7 @@ export default function Home() {
         bio: "", city_region: "", custom_picture_data: null, profile_visibility: "mutuals",
         presence_visibility: "mutuals", directory_visibility: "mutuals", preview_profile: false,
       } satisfies ProfileResponse)),
-    ]).then(([roomList, requests, friendList, profile]) => {
+    ]).then(([roomList, requests, outgoingRequests, friendList, profile]) => {
       const mergedProfile = { ...profile, ...localProfile };
       const profileVoice = mergedProfile.selected_voice_id;
       if (isGenieVoiceId(profileVoice)) {
@@ -740,6 +758,7 @@ export default function Home() {
       }
       setRooms(Array.from(new Map([...localRooms, ...roomList].map((item) => [item.id, item] as const)).values()));
       setFriendRequests(Array.from(new Map([...localRequests, ...requests].map((item) => [item.id, item] as const)).values()));
+      setOutgoingFriendRequests(Array.from(new Map([...localOutgoingRequests, ...outgoingRequests].map((item) => [item.id, item] as const)).values()));
       setFriends(Array.from(new Map([...localFriends, ...friendList].map((item) => [item.user_sub, item] as const)).values()));
       setProfilePreferences({
         ...mergedProfile,
@@ -858,16 +877,12 @@ export default function Home() {
     }
   }, [identity?.sub, loadedThreadsFor, library]);
   useEffect(() => {
-    if (identity?.sub && archivedRoomsFor === identity.sub) {
-      localStorage.setItem(userStorageKey("genie_archived_rooms", identity.sub), JSON.stringify(archivedRoomIds));
-    }
-  }, [identity?.sub, archivedRoomsFor, archivedRoomIds]);
-  useEffect(() => {
     if (!identity?.sub || loadedThreadsFor !== identity.sub) return;
     localStorage.setItem(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), JSON.stringify(rooms));
     localStorage.setItem(userStorageKey(LOCAL_REQUESTS_STORAGE, identity.sub), JSON.stringify(friendRequests));
+    localStorage.setItem(userStorageKey("genie_local_outgoing_friend_requests", identity.sub), JSON.stringify(outgoingFriendRequests));
     localStorage.setItem(userStorageKey(LOCAL_FRIENDS_STORAGE, identity.sub), JSON.stringify(friends));
-  }, [identity?.sub, loadedThreadsFor, rooms, friendRequests, friends]);
+  }, [identity?.sub, loadedThreadsFor, rooms, friendRequests, outgoingFriendRequests, friends]);
 
   useEffect(() => {
     if (!room || !credential || !roomKey) return;
@@ -901,16 +916,23 @@ export default function Home() {
             }
             for (const response of incoming.ai_responses || []) {
               try {
-                const payload = await decryptRoomMessage(roomKeyRef.current, response.ciphertext) as { content?: unknown };
+                const payload = await decryptRoomMessage(roomKeyRef.current, response.ciphertext) as {
+                  content?: unknown;
+                  response_type?: unknown;
+                };
                 if (typeof payload.content !== "string") continue;
+                const isLiveCallResponse = payload.response_type === "live_call";
                 decoded.push({
                   id: response.id,
                   role: "assistant",
                   content: payload.content,
                   sender_sub: response.owner_sub,
-                  sender_name: response.owner_sub === identity?.sub ? "You · Genie" : "Room member · Genie",
+                  sender_name: isLiveCallResponse
+                    ? "Genie · Live call"
+                    : response.owner_sub === identity?.sub ? "You · Genie" : "Room member · Genie",
                   sent_at: response.ai_responded_at || response.created_at,
                   is_group_shared_ai_response: true,
+                  is_live_call_response: isLiveCallResponse,
                 });
               } catch {
                 setRoomStatus("A shared AI response could not be decrypted on this device.");
@@ -923,18 +945,25 @@ export default function Home() {
             incoming.type === "ai_response.shared"
             && incoming.id && incoming.owner_sub && incoming.ciphertext
           ) {
-            const payload = await decryptRoomMessage(roomKeyRef.current, incoming.ciphertext) as { content?: unknown };
+            const payload = await decryptRoomMessage(roomKeyRef.current, incoming.ciphertext) as {
+              content?: unknown;
+              response_type?: unknown;
+            };
             if (typeof payload.content === "string") {
+              const isLiveCallResponse = payload.response_type === "live_call";
               const sharedResponse: ChatMessage = {
                 id: incoming.id,
                 role: "assistant",
                 content: payload.content,
                 sender_sub: incoming.owner_sub,
-                sender_name: incoming.owner_sub === identity?.sub
+                sender_name: isLiveCallResponse
+                  ? "Genie · Live call"
+                  : incoming.owner_sub === identity?.sub
                   ? "You · Genie"
                   : `${incoming.sender_name || "Room member"} · Genie`,
                 sent_at: incoming.ai_responded_at || incoming.created_at,
                 is_group_shared_ai_response: true,
+                is_live_call_response: isLiveCallResponse,
               };
               setMessages((current) => current.some((message) => message.id === sharedResponse.id)
                 ? current.map((message) => message.id === sharedResponse.id ? sharedResponse : message)
@@ -1073,6 +1102,20 @@ export default function Home() {
             setOnlineSubs((current) => incoming.online
               ? current.includes(incoming.user_sub!) ? current : [...current, incoming.user_sub!]
               : current.filter((sub) => sub !== incoming.user_sub));
+            if (incoming.online) {
+              void apiFetch<RoomPerson[]>(`/api/rooms/${encodeURIComponent(room.id)}/members`, credential)
+                .then((roomMembers) => {
+                  setMembers(roomMembers);
+                  setRooms((current) => current.map((item) => item.id === room.id
+                    ? {
+                        ...item,
+                        member_count: roomMembers.length,
+                        auto_saved: Boolean(item.auto_saved || roomMembers.length >= 2),
+                      }
+                    : item));
+                })
+                .catch(() => setRoomStatus("Room member updates could not be refreshed."));
+            }
           } else if (incoming.type === "call.signal" && incoming.from_sub && incoming.payload) {
             setCallSignal({ from_sub: incoming.from_sub, payload: incoming.payload });
           } else if (incoming.type === "ROOM_VOICE_CONFIG_UPDATE" && incoming.voice_dialect) {
@@ -1110,6 +1153,49 @@ export default function Home() {
       .then(setMembers)
       .catch((error: unknown) => setRoomStatus(error instanceof Error ? error.message : "Room members could not be loaded."));
   }, [room?.id, credential]);
+
+  useEffect(() => {
+    if (!credential || !identity?.sub) return;
+    let disposed = false;
+    const checkIncomingRequests = async () => {
+      try {
+        const requests = await apiFetch<FriendRequestItem[]>("/api/social/requests", credential);
+        if (disposed) return;
+        if (friendRequestNoticeInitialized.current) {
+          const newRequest = requests.find((request) => !friendRequestIdsRef.current.has(request.id));
+          if (newRequest) {
+            setToast(`Friend request received from ${newRequest.sender_name}.`);
+            if ("Notification" in window && Notification.permission === "granted") {
+              new Notification("Friend request received", { body: `${newRequest.sender_name} wants to connect.` });
+            }
+          }
+        }
+        friendRequestNoticeInitialized.current = true;
+        friendRequestIdsRef.current = new Set(requests.map((request) => request.id));
+        setFriendRequests(requests);
+      } catch {
+        // Polling is best-effort; the Friends view reports actionable request errors.
+      }
+    };
+    void checkIncomingRequests();
+    const timer = window.setInterval(() => void checkIncomingRequests(), 10_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [credential, identity?.sub]);
+
+  useEffect(() => {
+    if (!room?.group_slot || members.length < 2 || !identity?.sub) return;
+    const activeGroupsKey = userStorageKey("genie_active_group_chats", identity.sub);
+    const activeGroups = readStored<number[]>(activeGroupsKey, []);
+    if (!activeGroups.includes(room.group_slot)) {
+      localStorage.setItem(activeGroupsKey, JSON.stringify([...activeGroups, room.group_slot]));
+    }
+    setRooms((current) => current.map((item) => item.id === room.id
+      ? { ...item, member_count: members.length, auto_saved: true }
+      : item));
+  }, [room?.id, room?.group_slot, members.length, identity?.sub]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1396,15 +1482,39 @@ export default function Home() {
     }
   }
 
-  async function createRoom() {
+  async function transcribeVoiceAudio(dataUrl: string, dialect: string): Promise<string> {
+    if (!credential) throw new Error("Sign in before transcribing a voice note.");
+    const [header, audioBase64] = dataUrl.split(",", 2);
+    const mimeType = header?.match(/^data:([^;]+)/)?.[1] || "audio/webm";
+    const result = await apiFetch<{ text: string }>("/api/voice/stt", credential, {
+      method: "POST",
+      body: JSON.stringify({ audio_base64: audioBase64, mime_type: mimeType, dialect }),
+    });
+    return result.text;
+  }
+
+  async function createRoom(groupSlot?: number) {
     if (!credential) return;
+    if (groupSlot !== undefined) {
+      const existing = rooms.find((candidate) => candidate.group_slot === groupSlot);
+      if (existing) {
+        await openRoom(existing.id);
+        return;
+      }
+    }
     const invite = randomToken(32);
     const key = randomToken(32);
     const passcode = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1_000_000).padStart(6, "0");
     const localRoomId = `local-${crypto.randomUUID()}`;
     const created = await apiFetchWithFallback<Room>("/api/rooms", credential, {
       method: "POST",
-      body: JSON.stringify({ name: "Private room", invite_code: invite, passcode, max_uses: 20 }),
+      body: JSON.stringify({
+        name: groupSlot === undefined ? "Private room" : `Group ${groupSlot}`,
+        invite_code: invite,
+        passcode,
+        max_uses: 20,
+        ...(groupSlot === undefined ? {} : { group_slot: groupSlot }),
+      }),
     }, () => ({ id: localRoomId, name: "Private room" }), () => {
       setToast("Room created locally; room invites and relay need a valid backend session.");
     });
@@ -1421,6 +1531,8 @@ export default function Home() {
       owner_sub: identity?.sub,
       voice_dialect: "en-IN",
       member_count: 1,
+      group_slot: groupSlot,
+      auto_saved: false,
     };
     setRooms((current) => [fullRoom, ...current.filter((item) => item.id !== fullRoom.id)]);
     setMessages([]);
@@ -1429,9 +1541,36 @@ export default function Home() {
     setRoomKey(key);
     setThreadId("");
     setView("chat");
-    setInviteLink(roomInviteUrl(roomId, key, invite));
+    setInviteLink(roomInviteUrl(roomId, key, invite, groupSlot));
     setInvitePasscode(passcode);
     setInviteOpen(true);
+  }
+
+  async function regenerateRoomInvite(customInviteCode: string) {
+    if (!room || !credential) throw new Error("Open a connected group before regenerating its invite.");
+    const currentInvite = localStorage.getItem(`genie_room_invite_${room.id}`);
+    const key = localStorage.getItem(`genie_room_key_${room.id}`);
+    const passcode = localStorage.getItem(`genie_room_passcode_${room.id}`);
+    if (!currentInvite || !key || !passcode) {
+      throw new Error("This device does not have the current room invite credentials.");
+    }
+    const result = await apiFetch<{ invite_code: string; passcode: string }>(
+      `/api/rooms/${encodeURIComponent(room.id)}/invites`,
+      credential,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          replace_invite_code: currentInvite,
+          max_uses: 4,
+          passcode,
+          ...(customInviteCode ? { custom_invite_code: customInviteCode } : {}),
+        }),
+      },
+    );
+    localStorage.setItem(`genie_room_invite_${room.id}`, result.invite_code);
+    localStorage.setItem(`genie_room_passcode_${room.id}`, result.passcode);
+    setInviteLink(roomInviteUrl(room.id, key, result.invite_code, room.group_slot));
+    setInvitePasscode(result.passcode);
   }
 
   async function joinRoom(inviteInput: string) {
@@ -1488,12 +1627,6 @@ export default function Home() {
     window.history.replaceState(null, "", `/?join=${encodeURIComponent(id)}#key=${encodeURIComponent(key)}`);
   }
 
-  function setRoomArchived(id: string, archived: boolean) {
-    setArchivedRoomIds((current) => archived
-      ? current.includes(id) ? current : [...current, id]
-      : current.filter((roomId) => roomId !== id));
-  }
-
   async function shareRoomEnergy(recipientSub: string, amount: number) {
     if (!room || !credential) return;
     try {
@@ -1507,10 +1640,13 @@ export default function Home() {
     }
   }
 
-  async function shareRoomAiResponse(responseId: string, content: string) {
+  async function shareRoomAiResponse(responseId: string, content: string, liveCallResponse = false) {
     if (!room || !credential || !roomKeyRef.current) return;
     try {
-      const ciphertext = await encryptRoomMessage(roomKeyRef.current, { content });
+      const ciphertext = await encryptRoomMessage(roomKeyRef.current, {
+        content,
+        ...(liveCallResponse ? { response_type: "live_call", speaker: "Genie" } : {}),
+      });
       const result = await apiFetch<{ ai_responded_at: string }>(
         `/api/rooms/${encodeURIComponent(room.id)}/ai-responses/${encodeURIComponent(responseId)}/share`,
         credential,
@@ -1521,8 +1657,9 @@ export default function Home() {
             ...message,
             sent_at: result.ai_responded_at,
             sender_sub: identity?.sub,
-            sender_name: "You · Genie",
+            sender_name: liveCallResponse ? "Genie · Live call" : "You · Genie",
             is_group_shared_ai_response: true,
+            is_live_call_response: liveCallResponse,
           }
         : message));
     } catch (error) {
@@ -1544,6 +1681,7 @@ export default function Home() {
     voiceDialect?: string,
     regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] },
     requestChatMode: ChatMode = "ai_room",
+    liveCallResponse = false,
   ) {
     if (!identity || !credential) return;
     const content = secret ? `${SECRET_MARKER}${text}` : text;
@@ -1577,6 +1715,27 @@ export default function Home() {
         setMessages((current) => current.filter((message) => message.id !== userMessage.id));
       }
       return;
+    }
+
+    if (room && requestChatMode === "ai_room") {
+      const socket = socketRef.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !roomKeyRef.current) {
+        setRoomStatus("Room is not connected. Your prompt was not sent.");
+        setMessages((current) => current.filter((message) => message.id !== userMessage.id));
+        return;
+      }
+      try {
+        const ciphertext = await encryptRoomMessage(roomKeyRef.current, {
+          content,
+          chat_mode: requestChatMode,
+          attachment: attachment ? { mime_type: attachment.mime_type, data: attachment.data } : undefined,
+        });
+        socket.send(JSON.stringify({ type: "message.send", ciphertext, is_secret: false, client_id: userMessage.id }));
+      } catch {
+        setRoomStatus("Message encryption failed. Nothing was sent.");
+        setMessages((current) => current.filter((message) => message.id !== userMessage.id));
+        return;
+      }
     }
 
     if (secret) {
@@ -1652,7 +1811,7 @@ export default function Home() {
       room_mode: Boolean(room),
       chat_mode: requestChatMode,
       thinking_level: thinkingLevel,
-      response_visibility: regenerate?.visibility || "private",
+      response_visibility: regenerate?.visibility || (room && requestChatMode === "ai_room" ? "group" : "private"),
       is_secret: false,
       room_id: room?.id,
     };
@@ -1706,6 +1865,8 @@ export default function Home() {
           text?: string;
           detail?: string;
           sub_agents?: string[];
+          proposed_memory?: ChatMessage["proposed_memory"];
+          proposed_memory_id?: string;
         };
         const replyText = data.reply || data.response || data.content || data.message || data.text;
 
@@ -1714,10 +1875,16 @@ export default function Home() {
         }
 
         setMessages((current) => current.map((message) => message.id === assistantId
-          ? { ...message, content: replyText, sub_agents: data.sub_agents }
+          ? {
+              ...message,
+              content: replyText,
+              sub_agents: data.sub_agents,
+              proposed_memory: data.proposed_memory,
+              proposed_memory_id: data.proposed_memory_id,
+            }
           : message));
-        if (room && regenerate?.visibility === "group") {
-          await shareRoomAiResponse(assistantId, replyText);
+        if (room && (requestChatMode === "ai_room" || regenerate?.visibility === "group")) {
+          await shareRoomAiResponse(assistantId, replyText, liveCallResponse);
         }
         if (voiceReply && target === "agent" && !replyText.startsWith("🔒 Secret received.")) {
           void speakGenieReply(replyText, voiceDialect);
@@ -1728,8 +1895,8 @@ export default function Home() {
         if (!reader) {
           const textFallback = await response.text();
           setMessages((current) => current.map((message) => message.id === assistantId ? { ...message, content: textFallback } : message));
-          if (room && regenerate?.visibility === "group") {
-            await shareRoomAiResponse(assistantId, textFallback);
+          if (room && (requestChatMode === "ai_room" || regenerate?.visibility === "group")) {
+            await shareRoomAiResponse(assistantId, textFallback, liveCallResponse);
           }
           if (voiceReply && target === "agent") void speakGenieReply(textFallback, voiceDialect);
           return;
@@ -1757,11 +1924,18 @@ export default function Home() {
                 response?: string;
                 content?: string;
                 sub_agents?: string[];
+                proposed_memory?: ChatMessage["proposed_memory"];
+                proposed_memory_id?: string;
               };
               const textVal = payload.text || payload.reply || payload.response || payload.content;
-              if (eventType === "metadata" && payload.sub_agents) {
+              if (eventType === "metadata" && (payload.sub_agents || payload.proposed_memory || payload.proposed_memory_id)) {
                 setMessages((current) => current.map((message) => message.id === assistantId
-                  ? { ...message, sub_agents: payload.sub_agents }
+                  ? {
+                      ...message,
+                      sub_agents: payload.sub_agents,
+                      proposed_memory: payload.proposed_memory as ChatMessage["proposed_memory"],
+                      proposed_memory_id: typeof payload.proposed_memory_id === "string" ? payload.proposed_memory_id : undefined,
+                    }
                   : message));
               } else if ((eventType === "token" || eventType === "message") && textVal) {
                 streamReceivedReply = true;
@@ -1791,8 +1965,8 @@ export default function Home() {
         if (!streamReceivedReply || !spokenReply.trim()) {
           throw new Error("Chat stream ended before a reply arrived.");
         }
-        if (room && regenerate?.visibility === "group") {
-          await shareRoomAiResponse(assistantId, spokenReply);
+        if (room && (requestChatMode === "ai_room" || regenerate?.visibility === "group")) {
+          await shareRoomAiResponse(assistantId, spokenReply, liveCallResponse);
         }
         if (voiceReply && target === "agent" && !spokenReply.startsWith("🔒 Secret received.")) {
           void speakGenieReply(spokenReply, voiceDialect);
@@ -2070,6 +2244,9 @@ export default function Home() {
   function signOut() {
     sessionStorage.removeItem("genie_google_credential");
     sessionStorage.removeItem("genie_user_session");
+    localStorage.removeItem("genie_admin_signed_session");
+    setAdminToken("");
+    setAdminStats(null);
     window.google?.accounts.id.disableAutoSelect();
     setCredential("");
     setIdentity(null);
@@ -2104,6 +2281,7 @@ export default function Home() {
       localStorage.removeItem(userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub));
       localStorage.removeItem(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub));
       localStorage.removeItem(userStorageKey(LOCAL_REQUESTS_STORAGE, identity.sub));
+      localStorage.removeItem(userStorageKey("genie_local_outgoing_friend_requests", identity.sub));
       localStorage.removeItem(userStorageKey(LOCAL_FRIENDS_STORAGE, identity.sub));
     }
     try {
@@ -2203,7 +2381,6 @@ export default function Home() {
       });
       const data = dataUrl.split(",", 2)[1] || "";
       const documentData = { name: file.name, mime_type: mimeType, data };
-      setDocumentName(file.name);
       const documentAttachment: GenieDocumentAttachment = {
         mime_type: mimeType,
         data,
@@ -2241,7 +2418,6 @@ export default function Home() {
           data: dataUrl.split(",", 2)[1] || "",
           name: file.name,
         };
-        setDocumentName(file.name);
         setQueuedAttachment({
           text: `Review the attached image: ${file.name}`,
           secret: false,
@@ -2262,7 +2438,6 @@ export default function Home() {
     if (!queuedAttachment) return;
     const queued = queuedAttachment;
     setQueuedAttachment(null);
-    setDocumentName("");
     void sendMessage(
       queued.text,
       queued.secret,
@@ -2281,14 +2456,19 @@ export default function Home() {
     thinkingLevel = "pro",
     target: SubmitTarget = "agent",
   ) {
+    const isLiveCallResponse = Boolean(callSummonTranscript.current)
+      && text.trim() === callSummonTranscript.current.trim();
+    if (isLiveCallResponse) callSummonTranscript.current = "";
+    const asksGenieInStandby = chatMode === "friends_only" && /@genie\b/i.test(text);
+    const effectiveTarget: SubmitTarget = asksGenieInStandby ? "agent" : target;
+    const effectiveChatMode: ChatMode = asksGenieInStandby || isLiveCallResponse ? "ai_room" : chatMode;
     const selectedModel = forceMaster ? "genie-master" : model;
     if (forceMaster) {
       setActiveModel("Genie Master");
       setForceMaster(false);
     }
-    if (attachment && !secret && target === "agent" && selectedModel !== "genie-master") {
-      setQueuedAttachment({ text, secret, attachment, model: selectedModel, thinkingLevel, target });
-      setDocumentName(attachment.name);
+    if (attachment && !secret && effectiveTarget === "agent" && selectedModel !== "genie-master") {
+      setQueuedAttachment({ text, secret, attachment, model: selectedModel, thinkingLevel, target: effectiveTarget });
       return;
     }
     void sendMessage(
@@ -2297,12 +2477,13 @@ export default function Home() {
       attachment,
       selectedModel,
       forceMaster ? "deep" : thinkingLevel,
-      target,
+      effectiveTarget,
       undefined,
-      false,
+      isLiveCallResponse,
       undefined,
       undefined,
-      chatMode,
+      effectiveChatMode,
+      isLiveCallResponse,
     );
   }
 
@@ -2315,14 +2496,73 @@ export default function Home() {
   }
 
   async function saveEditedMessage(message: ChatMessage, content: string) {
-  if (room) {
-    await editRoomMessage(message, content);
-    return;
+    if (room) {
+      await editRoomMessage(message, content);
+      return;
+    }
+    const updatedAt = new Date().toISOString();
+    setMessages((current) => current.map((item) => item.id === message.id
+      ? { ...item, content, updated_at: updatedAt, is_edited: true }
+      : item));
   }
-  const updatedAt = new Date().toISOString();
-  setMessages((current) => current.map((item) => item.id === message.id
-    ? { ...item, content, updated_at: updatedAt, is_edited: true }
-    : item));
+
+  async function saveResponseToLibrary(message: ChatMessage) {
+    if (!credential) throw new Error("Sign in before saving a response.");
+    const localItem: SavedItem = {
+      id: message.id,
+      content: message.content,
+      createdAt: message.sent_at || new Date().toISOString(),
+    };
+    try {
+      const saved = await saveLibraryItem(message.content, credential, {
+        message_id: message.id,
+        source: "chat",
+      });
+      const item = { ...localItem, id: saved.id || localItem.id, createdAt: saved.created_at || localItem.createdAt };
+      setLibrary((current) => current.some((existing) => existing.id === item.id) ? current : [item, ...current]);
+      setToast("Response saved to your Library.");
+    } catch {
+      setLibrary((current) => current.some((existing) => existing.id === localItem.id)
+        ? current
+        : [localItem, ...current]);
+      setToast("Saved on this device. The Library service is unavailable right now.");
+    }
+  }
+
+  async function approveMemoryFromResponse(message: ChatMessage) {
+    const memory = typeof message.proposed_memory === "object" && message.proposed_memory
+      ? message.proposed_memory
+      : undefined;
+    const proposalId = memory?.id
+      || memory?.proposal_id
+      || message.proposed_memory_id
+      || (typeof message.proposed_memory === "string" && /^[\w-]{8,}$/.test(message.proposed_memory)
+        ? message.proposed_memory
+        : "");
+    if (!proposalId) {
+      setToast("This memory proposal is missing its approval identifier.");
+      throw new Error("Memory proposal ID is missing.");
+    }
+    try {
+      await approveProposedMemory(proposalId, credential);
+      setMessages((current) => current.map((item) => item.id === message.id
+        ? { ...item, memory_status: "approved" }
+        : item));
+      setToast("Suggested memory approved.");
+    } catch (caught) {
+      setToast(caught instanceof Error ? caught.message : "Memory approval failed.");
+      throw caught;
+    }
+  }
+
+  async function addResponseToFutureSelf(message: ChatMessage) {
+    try {
+      await createFutureSelfEntry(message.content, credential, message.id);
+      setToast("Response added to Future Self.");
+    } catch (caught) {
+      setToast(caught instanceof Error ? caught.message : "Future Self could not be updated.");
+      throw caught;
+    }
   }
 
   async function reactToChatMessage(
@@ -2427,12 +2667,14 @@ export default function Home() {
 
   async function refreshSocial() {
     if (!credential) return;
-    const [requestList, friendList, roomList] = await Promise.all([
+    const [requestList, outgoingRequestList, friendList, roomList] = await Promise.all([
       apiFetch<FriendRequestItem[]>("/api/social/requests", credential).catch(() => [] as FriendRequestItem[]),
+      apiFetch<OutgoingFriendRequestItem[]>("/api/social/requests/outgoing", credential).catch(() => [] as OutgoingFriendRequestItem[]),
       apiFetch<FriendItem[]>("/api/social/friends", credential).catch(() => [] as FriendItem[]),
       apiFetch<Room[]>("/api/rooms", credential).catch(() => [] as Room[]),
     ]);
-    setFriendRequests((current) => Array.from(new Map([...current, ...requestList].map((item) => [item.id, item] as const)).values()));
+    setFriendRequests(requestList);
+    setOutgoingFriendRequests(outgoingRequestList);
     setFriends((current) => Array.from(new Map([...current, ...friendList].map((item) => [item.user_sub, item] as const)).values()));
     setRooms((current) => Array.from(new Map([...current, ...roomList].map((item) => [item.id, item] as const)).values()));
   }
@@ -2472,20 +2714,37 @@ export default function Home() {
     const normalizedUsername = username.trim().replace(/^@/, "").toLowerCase();
     const request = {
       id: `local:${crypto.randomUUID()}`,
-      sender_name: identity?.name || "You",
-      sender_username: normalizedUsername,
+      receiver_name: normalizedUsername,
+      receiver_username: normalizedUsername,
     };
-    setFriendRequests((current) => current.some((item) => item.sender_username === normalizedUsername)
+    setOutgoingFriendRequests((current) => current.some((item) => item.receiver_username === normalizedUsername)
       ? current
       : [request, ...current]);
     try {
-      await apiFetch("/api/social/requests", credential, { method: "POST", body: JSON.stringify({ username: normalizedUsername }) });
-    } catch {
-      setToast("Friend request is saved on this device; account sync is unavailable.");
+      const created = await apiFetch<{ id: string }>("/api/social/requests", credential, {
+        method: "POST",
+        body: JSON.stringify({ username: normalizedUsername }),
+      });
+      setOutgoingFriendRequests((current) => current.map((item) => item.id === request.id
+        ? { ...item, id: created.id }
+        : item));
+      await refreshSocial();
+    } catch (error) {
+      setOutgoingFriendRequests((current) => current.filter((item) => item.id !== request.id));
+      throw error;
+    }
+  }
+
+  async function cancelFriendRequest(id: string) {
+    if (!credential) return;
+    setOutgoingFriendRequests((current) => current.filter((item) => item.id !== id));
+    try {
+      await apiFetch(`/api/social/requests/${encodeURIComponent(id)}/cancel`, credential, { method: "POST", body: "{}" });
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "The friend request could not be cancelled.");
     }
     await refreshSocial();
   }
-
   async function searchDirectory(query: string) {
     if (!credential) return [];
     return apiFetch<FriendItem[]>(
@@ -2503,7 +2762,7 @@ export default function Home() {
       setToast("This device does not have the complete room invitation.");
       return;
     }
-    setInviteLink(roomInviteUrl(room.id, key, invite));
+    setInviteLink(roomInviteUrl(room.id, key, invite, room.group_slot));
     setInvitePasscode(passcode);
     setInviteOpen(true);
   }
@@ -2524,9 +2783,16 @@ export default function Home() {
 
   function onCallGenie() {
     setRailOpen(false);
+    if (callAudioStream) {
+      callSummonTranscript.current = "";
+      setTranscribeRequest((request) => request + 1);
+      setToast("Listening through the active call mic. Review the transcript, then send it to Genie.");
+      return;
+    }
     const recognitionWindow = window as SpeechRecognitionWindow;
     const Recognition = recognitionWindow.SpeechRecognition || recognitionWindow.webkitSpeechRecognition;
     if (!Recognition) {
+      callSummonTranscript.current = "";
       setToast("Live voice input is unavailable here. Use the composer microphone and send with ↑.");
       setTranscribeRequest((request) => request + 1);
       return;
@@ -2549,6 +2815,9 @@ export default function Home() {
           undefined,
           true,
           voiceDialect,
+          undefined,
+          "ai_room",
+          true,
         );
       }
     };
@@ -2657,18 +2926,7 @@ export default function Home() {
     if (!speech) return;
     const voice = GENIE_VOICES.find((candidate) => candidate.lang === dialect) || selectedVoice();
     try {
-      const response = await apiRequest("/api/tts", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + credential },
-        body: JSON.stringify({
-          text: speech.slice(0, 12_000),
-          dialect,
-          model: voice.id,
-        }),
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("Native speech synthesis is unavailable.");
-      const result = await response.json() as { audio_base64?: string; mime_type?: string };
+      const result = await requestVoiceTts(speech, dialect, voice.id, credential);
       if (!result.audio_base64) throw new Error("Native speech synthesis returned no audio.");
       const audio = new Audio(`data:${result.mime_type || "audio/wav"};base64,${result.audio_base64}`);
       replyAudioRef.current?.pause();
@@ -2689,42 +2947,13 @@ export default function Home() {
     voiceRecognitionRef.current?.stop();
   }, []);
 
-  function sendUtilityVoiceNote(dataUrl: string, durationSeconds: number) {
-    if (!room) {
-      setToast("Open an encrypted room before sending a peer voice note.");
-      return;
-    }
-    const [header, data] = dataUrl.split(",", 2);
-    const mimeType = header?.match(/data:([^;]+)/)?.[1] || "audio/webm";
-    void sendMessage(
-      `[VOICE_NOTE] ${durationSeconds}s`,
-      false,
-      { mime_type: mimeType, data: data || "", name: `voice-note-${durationSeconds}s` },
-      "genie-pro",
-      "pro",
-      "peers",
-    );
-  }
-
-  function sendCallSignal(toSub: string, payload: RTCSessionDescriptionInit | RTCIceCandidateInit) {
+  function sendCallSignal(toSub: string, payload: CallSignal["payload"]) {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       setRoomStatus("Room is not connected. The call signal was not sent.");
       return;
     }
     socket.send(JSON.stringify({ type: "call.signal", to_sub: toSub, payload }));
-  }
-
-  function updateRoomVoiceDialect(dialect: string) {
-    const socket = socketRef.current;
-    if (!room || !socket || socket.readyState !== WebSocket.OPEN) {
-      setRoomStatus("Room is not connected. The voice setting was not changed.");
-      return;
-    }
-    socket.send(JSON.stringify({
-      type: "ROOM_VOICE_CONFIG_UPDATE",
-      voice_dialect: dialect,
-    }));
   }
 
   if (!isMounted) {
@@ -2834,14 +3063,14 @@ export default function Home() {
 
   const sectionView = view === "chat" ? null : view;
   const privacyModeLabel = chatMode === "friends_only"
-    ? "👥 Friends Only"
+    ? "⏸️ AI Standby"
     : chatMode === "private_ai"
       ? "🔒 Private AI"
       : "🔓 AI + Room";
   const privacyModeOptions: Array<{ mode: ChatMode; label: string; description: string }> = [
     { mode: "ai_room", label: "🔓 AI + Room", description: "Standard AI and room chat" },
-    { mode: "friends_only", label: "👥 Friends Only", description: "Encrypted human chat; AI is paused" },
-    { mode: "private_ai", label: "🔒 Private AI", description: "Private AI whisper, not shared with the room" },
+    { mode: "friends_only", label: "⏸️ AI Standby", description: "Chat with room members; ask Genie when needed" },
+    { mode: "private_ai", label: "🔒 AI Private", description: "Private whisper, visible only to you and Genie" },
   ];
   return (
     <main className="application-shell h-dvh max-h-dvh overflow-hidden flex flex-col">
@@ -2853,6 +3082,8 @@ export default function Home() {
         deletedThreads={deletedThreads}
         selectedThreadId={threadId}
         onlineMembers={onlineNames}
+        rooms={rooms}
+        currentRoomId={room?.id}
         displayName={profileDetails.display_name || identity.name}
         pictureUrl={profileDetails.custom_picture_data || identity.picture}
         activeModel={activeModel}
@@ -2873,6 +3104,8 @@ export default function Home() {
         onInviteRoom={() => room ? void shareCurrentRoom() : void createRoom()}
         onOpenSettings={() => setSettingsOpen(true)}
         onProfileTap={handleAvatarTap}
+        onOpenRoom={(id) => void openRoom(id)}
+        onCreateGroupSlot={(slot) => void createRoom(slot)}
       />
       {mobileSidebarOpen && (
         <button
@@ -2993,11 +3226,6 @@ export default function Home() {
                 })}
               </div>}
             </div>}
-            <button className="utility-trigger" onClick={() => {
-              setHeaderMenuOpen(false);
-              setRosterOpen(false);
-              setRailOpen((open) => !open);
-            }} aria-label="Open workspace utilities" aria-expanded={railOpen}><Settings2 size={15} /><span>Utilities</span></button>
             <div className="header-actions-menu">
               <button className="utility-trigger header-menu-trigger" onClick={() => {
                 setRailOpen(false);
@@ -3006,7 +3234,6 @@ export default function Home() {
                 setHeaderMenuOpen((open) => !open);
               }} aria-label="Open workspace actions" aria-expanded={headerMenuOpen}><MoreHorizontal size={16} /></button>
               {headerMenuOpen && <div className="header-actions-popover" role="menu">
-                <button role="menuitem" onClick={() => { setRailOpen(true); setHeaderMenuOpen(false); }}><Settings2 size={15} /> Utilities</button>
                 <button role="menuitem" onClick={() => { setSearchOpen(true); setHeaderMenuOpen(false); }}><Search size={15} /> Search chats</button>
                 <button className="header-danger-menu-item" role="menuitem" onClick={() => {
                   setHeaderMenuOpen(false);
@@ -3029,21 +3256,21 @@ export default function Home() {
         {sectionView ? (
           <WorkspacePanel
             view={sectionView}
+            credential={credential}
             savedItems={library}
             onRemoveSaved={(id) => setLibrary((items) => items.filter((item) => item.id !== id))}
             rooms={rooms}
-            archivedRoomIds={archivedRoomIds}
-            onArchiveRoom={(id) => setRoomArchived(id, true)}
-            onUnarchiveRoom={(id) => setRoomArchived(id, false)}
             currentRoomId={room?.id}
             activeMembers={room
               ? members.filter((member) => member.user_sub === identity.sub || onlineSubs.includes(member.user_sub))
               : []}
             currentUserSub={identity.sub}
             requests={friendRequests}
+            outgoingRequests={outgoingFriendRequests}
             friends={friends}
             onAcceptRequest={acceptFriendRequest}
             onRejectRequest={rejectFriendRequest}
+            onCancelRequest={cancelFriendRequest}
             onSendFriendRequest={sendFriendRequest}
             onSearchDirectory={searchDirectory}
             onCreateRoom={createRoom}
@@ -3067,6 +3294,9 @@ export default function Home() {
             }}
             onEdit={(message, content) => void saveEditedMessage(message, content)}
             onLoadLedger={loadMessageLedger}
+            onApproveProposedMemory={approveMemoryFromResponse}
+            onSaveToLibrary={saveResponseToLibrary}
+            onFutureSelf={addResponseToFutureSelf}
             reactionCounts={reactionCounts}
             onReact={(message, target, emoji) => void reactToChatMessage(message, target, emoji)}
             onReadAloud={(message) => void speakGenieReply(message.content)}
@@ -3117,32 +3347,28 @@ export default function Home() {
                     : `${name} is prompting Genie…`
               ))}
             />
-            {queuedAttachment && activeModel !== "Genie Master" && (
-              <div className="mx-auto mb-2 flex w-full max-w-[850px] flex-wrap items-center justify-between gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm text-slate-800">
-                <span>📄 Attachment ready. Switch to Genie Master for deep review?</span>
-                <span className="flex gap-2">
-                  <button className="utility-trigger" onClick={() => {
-                    setActiveModel("Genie Master");
-                    sendQueuedAttachment("genie-master");
-                  }} type="button">Switch to Genie Master</button>
-                  <button className="utility-trigger" onClick={() => { setQueuedAttachment(null); setDocumentName(""); }} type="button">Dismiss</button>
-                </span>
-              </div>
-            )}
-            {queuedAttachment && activeModel === "Genie Master" && (
-              <div className="mx-auto mb-2 flex w-full max-w-[850px] flex-wrap items-center justify-between gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-3 text-sm text-slate-800">
-                <span>📄 Ready for Genie Master analysis{documentName ? `: ${documentName}` : ""}.</span>
-                <span className="flex gap-2">
-                  <button className="utility-trigger" onClick={() => sendQueuedAttachment("genie-master")} type="button">Analyze with Genie Master</button>
-                  <button className="utility-trigger" onClick={() => { setQueuedAttachment(null); setDocumentName(""); }} type="button">Dismiss</button>
-                </span>
-              </div>
-            )}
             <OmniComposer
               isMultiUserRoom={Boolean(room)}
               memberCount={room ? members.length : 1}
               participants={members.filter((member) => member.user_sub !== identity.sub).map((member) => member.user_name)}
               model={tierForModel(activeModel)}
+              onTranscribeAudio={transcribeVoiceAudio}
+              sharedAudioStream={callAudioStream}
+              onOpenCall={() => {
+                if (callAudioStream) {
+                  setToast("Use + Add member in the live call dock to invite more room members.");
+                  return;
+                }
+                setHeaderMenuOpen(false);
+                setRailOpen(true);
+              }}
+              queuedAttachmentPreview={queuedAttachment ? {
+                name: queuedAttachment.attachment.name,
+                mime_type: queuedAttachment.attachment.mime_type,
+                data: queuedAttachment.attachment.data,
+              } : undefined}
+              onSendQueuedAttachment={() => sendQueuedAttachment(tierForModel(activeModel))}
+              onRemoveQueuedAttachment={() => setQueuedAttachment(null)}
               chatMode={chatMode}
               sending={sending}
               aiAvailability={aiAvailability || undefined}
@@ -3173,8 +3399,8 @@ export default function Home() {
                 setActiveModel("Genie Master");
                 setToast("Genie Master is selected for your next response.");
               }}
-              stagedVoiceNote={stagedVoiceNote}
               transcribeRequest={transcribeRequest}
+              onCallTranscript={(text) => { callSummonTranscript.current = text.trim(); }}
               externalTranscription={studioDictationText}
               onSubmit={submitComposerMessage}
             />
@@ -3184,22 +3410,14 @@ export default function Home() {
       <RightSideRail
         open={railOpen}
         roomId={room?.id}
-        isRoomHost={room?.owner_sub === identity.sub}
-        voiceDialect={roomVoiceDialect}
         mySub={identity.sub}
         members={members}
         onlineSubs={onlineSubs}
         incomingSignal={callSignal}
         onClose={() => setRailOpen(false)}
         onCallGenie={onCallGenie}
-        onSendVoiceNote={sendUtilityVoiceNote}
-        onStageVoiceNote={(dataUrl, durationSeconds) => setStagedVoiceNote({
-          id: crypto.randomUUID(), dataUrl, durationSeconds,
-        })}
-        onTranscribeLive={() => setTranscribeRequest((request) => request + 1)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onLocalStreamChange={setCallAudioStream}
         onVoiceParticipantsChange={updateVoiceSubs}
-        onVoiceDialectChange={updateRoomVoiceDialect}
         onSendSignal={sendCallSignal}
       />
       <SettingsDialog
@@ -3231,6 +3449,8 @@ export default function Home() {
         open={inviteOpen}
         link={inviteLink}
         passcode={invitePasscode}
+        groupSlot={room?.group_slot}
+        onRegenerate={regenerateRoomInvite}
         onClose={() => setInviteOpen(false)}
         onShare={(text) => {
           try {
@@ -3263,12 +3483,12 @@ export default function Home() {
           .catch((error: unknown) => setToast(error instanceof Error ? error.message : "Admin session rejected."));
         }}
       />
-      {adminToken && adminStats && <div className="admin-session-badge"><ShieldCheck size={13} /> Secure Admin session active <button onClick={() => setAdminStats(adminStats)}>Open dashboard</button><button onClick={() => { setAdminToken(""); setAdminStats(null); }}>Lock</button></div>}
+      {adminToken && adminStats && <div className="admin-session-badge"><ShieldCheck size={13} /> Secure Admin session active <button onClick={() => setAdminStats(adminStats)}>Open dashboard</button><button onClick={() => { localStorage.removeItem("genie_admin_signed_session"); setAdminToken(""); setAdminStats(null); }}>Lock</button></div>}
       <AdminDashboard
         stats={adminStats}
         credential={credential}
         adminToken={adminToken}
-        onClose={() => { setAdminStats(null); setAdminToken(""); }}
+        onClose={() => { localStorage.removeItem("genie_admin_signed_session"); setAdminStats(null); setAdminToken(""); }}
       />
       <ForwardToRoomModal
         open={Boolean(forwardingMessage)}

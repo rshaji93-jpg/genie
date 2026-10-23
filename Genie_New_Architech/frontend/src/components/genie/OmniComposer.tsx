@@ -1,6 +1,6 @@
 "use client";
 
-import { ArrowUp, ImagePlus, X } from "lucide-react";
+import { ArrowUp, Headphones, ImagePlus, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import EmojiPicker from "@/modules/composer/EmojiPicker";
 import StagedAudioPill from "@/modules/composer/StagedAudioPill";
@@ -46,12 +46,22 @@ interface OmniComposerProps {
   onClearQuote?: () => void;
   onActivity?: (activity: "typing" | "recording" | "prompting" | "idle") => void;
   defaultDialect?: string;
-  stagedVoiceNote?: { id: string; dataUrl: string; durationSeconds: number };
   transcribeRequest?: number;
   recentContext?: string;
   wakeWordActive?: boolean;
   onWakeWordPrompt?: (text: string, dialect: string) => void;
   externalTranscription?: string;
+  onCallTranscript?: (text: string) => void;
+  queuedAttachmentPreview?: {
+    name: string;
+    mime_type: string;
+    data: string;
+  };
+  onSendQueuedAttachment?: () => void;
+  onRemoveQueuedAttachment?: () => void;
+  onTranscribeAudio?: (dataUrl: string, dialect: string) => Promise<string>;
+  onOpenCall?: () => void;
+  sharedAudioStream?: MediaStream | null;
 }
 
 export default function OmniComposer(props: OmniComposerProps) {
@@ -77,12 +87,6 @@ export default function OmniComposer(props: OmniComposerProps) {
     input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
     input.style.overflowY = input.scrollHeight > 140 ? "auto" : "hidden";
   }, [text]);
-  useEffect(() => {
-    if (props.stagedVoiceNote) {
-      addVoiceNote(props.stagedVoiceNote.dataUrl, props.stagedVoiceNote.durationSeconds);
-    }
-  }, [props.stagedVoiceNote?.id]);
-
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!text.trim() && !attachment) return;
@@ -115,11 +119,24 @@ export default function OmniComposer(props: OmniComposerProps) {
     setAttachment({ mime_type: mimeType, data, name: `voice-note-${durationSeconds}s` });
   }
 
+  function sendVoiceNote(dataUrl: string, durationSeconds: number) {
+    const [header, data] = dataUrl.split(",", 2);
+    const mimeType = header.match(/data:([^;]+)/)?.[1] || "audio/webm";
+    props.onSubmit(
+      `[VOICE_NOTE] ${durationSeconds}s`,
+      false,
+      { mime_type: mimeType, data, name: `voice-note-${durationSeconds}s` },
+      props.model,
+      thinkingLevel,
+      multi ? "peers" : "agent",
+    );
+  }
+
   function mentionOptions() {
     const last = text.slice(text.lastIndexOf(" ") + 1);
     if (!last.startsWith("@")) return [];
     const query = last.slice(1).toLocaleLowerCase();
-    return ["Genie Lite", "Genie Pro", "Genie Master", ...props.participants]
+    return ["Genie", "Genie Lite", "Genie Pro", "Genie Master", ...props.participants]
       .filter((name) => name.toLocaleLowerCase().includes(query))
       .slice(0, 6);
   }
@@ -133,6 +150,25 @@ export default function OmniComposer(props: OmniComposerProps) {
 
   return (
     <div className="composer-shell">
+      {props.queuedAttachmentPreview && (
+        <div className="composer-attachment-previews" aria-label="Attachments ready to send">
+          {props.queuedAttachmentPreview.mime_type.startsWith("image/") ? (
+            <div className="composer-image-preview">
+              <img
+                alt={props.queuedAttachmentPreview.name}
+                src={`data:${props.queuedAttachmentPreview.mime_type};base64,${props.queuedAttachmentPreview.data}`}
+              />
+              <button aria-label={`Remove ${props.queuedAttachmentPreview.name}`} onClick={props.onRemoveQueuedAttachment} type="button"><X size={13} /></button>
+            </div>
+          ) : (
+            <div className="composer-file-preview">
+              <ImagePlus size={15} /><span>{props.queuedAttachmentPreview.name}</span>
+              <button aria-label={`Remove ${props.queuedAttachmentPreview.name}`} onClick={props.onRemoveQueuedAttachment} type="button"><X size={13} /></button>
+            </div>
+          )}
+          <button className="composer-attachment-send" onClick={props.onSendQueuedAttachment} type="button">Send with {props.model === "genie-master" ? "Genie Master" : "Genie"}</button>
+        </div>
+      )}
       {attachment && (
         <div className="attachment-chip"><ImagePlus size={14} /><span>{attachment.name}</span><button type="button" onClick={() => setAttachment(undefined)} aria-label="Remove attachment"><X size={14} /></button></div>
       )}
@@ -167,9 +203,9 @@ export default function OmniComposer(props: OmniComposerProps) {
           }}
           className="flex-1 min-w-0"
           placeholder={props.chatMode === "friends_only"
-            ? "👥 Encrypted Friends Chat — AI is paused, only friends see this..."
+            ? "⏸️ AI Standby — chat with your group or mention @Genie..."
             : props.chatMode === "private_ai"
-              ? "🔒 Private AI Whisper — Hidden from friends in this room..."
+              ? "🔒 Private to you & Genie..."
               : "Message Genie or your room..."}
           rows={1}
           maxLength={20_000}
@@ -180,7 +216,12 @@ export default function OmniComposer(props: OmniComposerProps) {
             {mentionOptions().map((name) => <button type="button" key={name} onClick={() => insertMention(name)}>@{name}</button>)}
           </div>
         )}
-        <VoiceMic isMultiUserRoom={multi} dialect={dialect} currentText={text} recentContext={props.recentContext} disabled={props.sending} transcribeRequest={props.transcribeRequest} wakeWordActive={Boolean(multi && props.wakeWordActive)} onWakeWordPrompt={props.onWakeWordPrompt} onActivity={(activity) => props.onActivity?.(activity)} onTranscription={(value) => setText(value)} onVoiceNoteRecorded={addVoiceNote} />
+        <VoiceMic isMultiUserRoom={multi} dialect={dialect} currentText={text} recentContext={props.recentContext} disabled={props.sending} transcribeRequest={props.transcribeRequest} wakeWordActive={Boolean(multi && props.wakeWordActive)} onWakeWordPrompt={props.onWakeWordPrompt} onActivity={(activity) => props.onActivity?.(activity)} onTranscription={(value) => setText(value)} onCallTranscript={props.onCallTranscript} onVoiceNoteRecorded={addVoiceNote} onVoiceNoteSend={sendVoiceNote} onTranscribeAudio={props.onTranscribeAudio} sharedAudioStream={props.sharedAudioStream} />
+        {!text.trim() && multi && props.onOpenCall && (
+          <button className="icon-button composer-call-button" onClick={props.onOpenCall} type="button" aria-label="Call room members" title="Call room members">
+            <Headphones size={17} />
+          </button>
+        )}
         <button type="submit" className="send-button" disabled={props.sending || (!text.trim() && !attachment)} aria-label="Send to selected AI agent" title="Send to selected AI agent">
           <ArrowUp size={17} />
         </button>

@@ -4,8 +4,9 @@ import {
   Check,
   CheckCheck,
   Copy,
+  ArrowDown,
+  Bookmark,
   Globe2,
-  LockKeyhole,
   RefreshCw,
   Sparkles,
   ThumbsDown,
@@ -51,6 +52,10 @@ export interface ChatMessage {
   is_group_shared_ai_response?: boolean;
   owner_sub?: string;
   sub_agents?: string[];
+  proposed_memory?: { id?: string; proposal_id?: string; content?: string; status?: "pending" | "approved" | "rejected" } | string | boolean;
+  proposed_memory_id?: string;
+  memory_status?: "pending" | "approved" | "rejected";
+  is_live_call_response?: boolean;
 }
 
 interface ChatCanvasProps {
@@ -73,6 +78,9 @@ interface ChatCanvasProps {
   onRegenerateResponse?: (message: ChatMessage) => void;
   onRetryResponse?: (message: ChatMessage) => void;
   onToggleResponseVisibility?: (message: ChatMessage) => void;
+  onApproveProposedMemory?: (message: ChatMessage) => Promise<void>;
+  onSaveToLibrary?: (message: ChatMessage) => Promise<void>;
+  onFutureSelf?: (message: ChatMessage) => Promise<void>;
   selectionMode: boolean;
   selectedMessageIds: string[];
   onEnterMessageSelection: (messageId?: string) => void;
@@ -241,6 +249,68 @@ export default function ChatCanvas(props: ChatCanvasProps) {
   const [actionsPosition, setActionsPosition] = useState<{ x: number; y: number } | null>(null);
   const longPressTimer = useRef<number | undefined>(undefined);
   const longPressTriggered = useRef(false);
+  const messageScrollRef = useRef<HTMLElement | null>(null);
+  const messageElements = useRef(new Map<string, HTMLElement>());
+  const previousMessageContent = useRef<Record<string, string>>({});
+  const hasMountedMessages = useRef(false);
+  const awayFromBottom = useRef(false);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [pendingResponseAction, setPendingResponseAction] = useState<string | null>(null);
+  const [completedResponseActions, setCompletedResponseActions] = useState<Set<string>>(() => new Set());
+
+  async function runResponseAction(
+    action: "memory" | "library" | "future-self",
+    message: ChatMessage,
+    callback?: (message: ChatMessage) => Promise<void>,
+  ) {
+    if (!callback) return;
+    const actionId = `${action}:${message.id}`;
+    setPendingResponseAction(actionId);
+    try {
+      await callback(message);
+      setCompletedResponseActions((current) => new Set(current).add(actionId));
+    } catch {
+      // The parent owns user-facing error messaging.
+    } finally {
+      setPendingResponseAction(null);
+    }
+  }
+
+  useEffect(() => {
+    const previous = previousMessageContent.current;
+    const current: Record<string, string> = {};
+    const arrived = props.messages.filter((message) => {
+      current[message.id] = message.content;
+      return message.role === "assistant"
+        && message.content
+        && (previous[message.id] === undefined || previous[message.id] === "");
+    });
+    if (hasMountedMessages.current && arrived.length) {
+      if (awayFromBottom.current) setUnreadCount((count) => count + arrived.length);
+      const response = arrived[arrived.length - 1];
+      messageElements.current.get(response.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    previousMessageContent.current = current;
+    hasMountedMessages.current = true;
+  }, [props.messages]);
+
+  function updateScrollPosition() {
+    const element = messageScrollRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const away = distance > 150;
+    awayFromBottom.current = away;
+    setShowJumpToBottom(away);
+    if (!away) setUnreadCount(0);
+  }
+
+  function jumpToBottom() {
+    const element = messageScrollRef.current;
+    if (!element) return;
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    setUnreadCount(0);
+  }
 
   useEffect(() => {
     const closeOnOutside = (event: Event) => {
@@ -288,7 +358,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
           <h1>{props.activeRoom ? "Room conversation" : "Good to see you."}</h1>
         </div>
       </div>
-      <section className="message-scroll" aria-live="polite">
+      <section className="message-scroll" aria-live="polite" onScroll={updateScrollPosition} ref={messageScrollRef}>
         {!props.messages.length && (
           <div className="welcome-card">
             <div className="welcome-sparkle"><IdealGLogo size={42} /></div>
@@ -299,14 +369,16 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         {props.messages.map((message) => {
           const status = message.tick_status || "sent";
           const hasReview = Boolean(message.ai_reply);
-          const reactionTarget = message.role === "user" ? "user_message" : "ai_response";
-          const counts = props.reactionCounts?.[`${reactionTarget}:${message.id}`];
           const canVerify = message.review_triggered_by === props.mySub && status === "ai_review_active";
           const retryOnly = message.role === "assistant" && /failed to fetch|\b405\b/i.test(message.content);
           return (
             <article
               className={`message-row ${message.role === "user" ? "user-row" : "assistant-row"} ${props.selectionMode ? "message-row-selecting" : ""}`}
               key={message.id}
+              ref={(element) => {
+                if (element) messageElements.current.set(message.id, element);
+                else messageElements.current.delete(message.id);
+              }}
             >
               {props.selectionMode && (
                 <input
@@ -355,8 +427,10 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                   setActionsPosition({ x: event.clientX, y: event.clientY });
                 }}
               >
+                <div className="message-sender">
+                  {message.sender_name || (message.role === "assistant" ? "✨ Genie AI" : "You")}
+                </div>
                 {message.is_secret && <div className="secret-label">🔒 Secret · not sent to AI</div>}
-                {message.chat_mode === "friends_only" && <div className="friends-e2ee-badge">🛡️ Friends E2EE</div>}
                 {message.role === "assistant" && message.chat_mode === "private_ai" && !message.is_group_shared_ai_response && (
                   <div className="private-response-badge">🔒 Only You</div>
                 )}
@@ -380,8 +454,37 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                     onCancel={() => setEditingId(null)}
                   />
                 ) : message.content ? <MarkdownContent content={message.content} /> : null}
+                {message.is_live_call_response && (
+                  <span className="live-call-response-pill">🎙️ Active call response</span>
+                )}
+                {message.role === "assistant" && (message.proposed_memory || message.proposed_memory_id) && (
+                  <div className="proposed-memory-pill" role="status">
+                    <span title={typeof message.proposed_memory === "object" ? message.proposed_memory?.content : undefined}>
+                      {message.memory_status === "approved"
+                      || (typeof message.proposed_memory === "object" && message.proposed_memory?.status === "approved")
+                      ? "✓ Memory saved"
+                      : `Suggested memory${typeof message.proposed_memory === "object" && message.proposed_memory?.content
+                        ? ` · ${message.proposed_memory.content}`
+                        : ""}`}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!props.onApproveProposedMemory
+                        || !(message.proposed_memory_id
+                          || (typeof message.proposed_memory === "object"
+                            && (message.proposed_memory?.id || message.proposed_memory?.proposal_id))
+                          || (typeof message.proposed_memory === "string" && /^[\w-]{8,}$/.test(message.proposed_memory)))
+                        || pendingResponseAction === `memory:${message.id}`
+                        || completedResponseActions.has(`memory:${message.id}`)
+                        || message.memory_status === "approved"
+                        || (typeof message.proposed_memory === "object" && message.proposed_memory?.status === "approved")}
+                      onClick={() => void runResponseAction("memory", message, props.onApproveProposedMemory)}
+                    >
+                      {pendingResponseAction === `memory:${message.id}` ? "Saving…" : "Approve"}
+                    </button>
+                  </div>
+                )}
                 <div className="message-meta">
-                  {message.sender_name && <span>{message.sender_name}</span>}
                   <time>{message.sent_at ? new Date(message.sent_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "Now"}</time>
                   {message.is_edited && <span>Edited {message.updated_at ? new Date(message.updated_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}</span>}
                   {message.role === "user" && (
@@ -420,9 +523,26 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                 </button>
               )}
               {message.role === "assistant" && !retryOnly && (
+                <>
                 <div className="ai-response-toolbar" aria-label="AI response actions">
                   <button type="button" onClick={() => props.onReadAloud?.(message)} title="Read this response aloud" aria-label="Read this response aloud"><Volume2 size={15} /></button>
                   <button type="button" onClick={() => props.onCopyResponse?.(message)} title="Copy response" aria-label="Copy response"><Copy size={15} /></button>
+                  <button
+                    type="button"
+                    disabled={!props.onFutureSelf || pendingResponseAction === `future-self:${message.id}` || completedResponseActions.has(`future-self:${message.id}`)}
+                    onClick={() => void runResponseAction("future-self", message, props.onFutureSelf)}
+                    title="Save this response for your Future Self"
+                  >
+                    <Sparkles size={14} />{completedResponseActions.has(`future-self:${message.id}`) ? "Added to Future Self" : "Future Self"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!props.onSaveToLibrary || pendingResponseAction === `library:${message.id}` || completedResponseActions.has(`library:${message.id}`)}
+                    onClick={() => void runResponseAction("library", message, props.onSaveToLibrary)}
+                    title="Save this response to your Library"
+                  >
+                    <Bookmark size={14} />{completedResponseActions.has(`library:${message.id}`) ? "Saved" : "Save to Library"}
+                  </button>
                   <button
                     type="button"
                     disabled={props.activeRoom && message.sender_sub !== props.mySub}
@@ -430,18 +550,16 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                     title={!props.activeRoom || message.sender_sub === props.mySub ? "Regenerate response" : "Only the response owner can regenerate it"}
                     aria-label="Regenerate response"
                   ><RefreshCw size={15} /></button>
-                  {message.chat_mode === "friends_only" ? (
-                    <span className="friends-e2ee-badge">🛡️ Friends E2EE</span>
-                  ) : (
+                  {message.chat_mode === "private_ai" && (
                     <button
                       className={`response-visibility-pill ${message.is_group_shared_ai_response ? "response-shared" : "response-private"}`}
                       type="button"
                       disabled={!props.activeRoom || message.sender_sub !== props.mySub || !props.onToggleResponseVisibility}
                       onClick={() => props.onToggleResponseVisibility?.(message)}
-                      title={message.is_group_shared_ai_response ? "Hide this response from the room" : "Share this response with the room"}
-                      aria-label={message.is_group_shared_ai_response ? "Shared; click to hide from room" : "Only you; click to share with room"}
+                      title="Share this private AI response with the room"
+                      aria-label="Share this private AI response with the room"
                     >
-                      {message.is_group_shared_ai_response ? <><Globe2 size={14} /> Shared</> : <><LockKeyhole size={14} /> Only You · Share</>}
+                      <><Globe2 size={14} /> 📤 Share to Group</>
                     </button>
                   )}
                   <button
@@ -449,14 +567,15 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                     disabled={!props.activeRoom}
                     onClick={() => props.onReact?.(message, "ai_response", "👍")}
                     aria-label="Like AI response"
-                  ><ThumbsUp size={15} /> {counts?.["👍"] || 0}</button>
+                  ><ThumbsUp size={15} /></button>
                   <button
                     type="button"
                     disabled={!props.activeRoom}
                     onClick={() => props.onReact?.(message, "ai_response", "👎")}
                     aria-label="Dislike AI response"
-                  ><ThumbsDown size={15} /> {counts?.["👎"] || 0}</button>
+                  ><ThumbsDown size={15} /></button>
                 </div>
+                </>
               )}
               {props.activeRoom && !message.is_secret && (message.role === "user" || message.is_group_shared_ai_response) && (
                 <div className="message-reaction-bar" aria-label="Message reactions">
@@ -471,14 +590,14 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                       )}
                       aria-label={`React with ${emoji}`}
                     >
-                      {emoji}                       <span>{counts?.[emoji] || 0}</span>
+                      {emoji}
                     </button>
                   ))}
                 </div>
               )}
               {props.activeRoom && message.role === "user" && (status === "read_no_ai" || status === "yellow_no_ai") && !hasReview && !message.is_secret && (
                 <button className="message-action review-action" onClick={() => props.onReview(message.id)}>
-                  <Sparkles size={14} /> Review with AI
+                  <Sparkles size={14} /> ✨ Ask Genie
                 </button>
               )}
               {hasReview && (
@@ -503,6 +622,17 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         })}
         {props.loading && <div className="typing-indicator"><i /><i /><i /> Genie is thinking</div>}
       </section>
+      {showJumpToBottom && (
+        <button
+          aria-label={`Jump to latest messages${unreadCount ? `, ${unreadCount} unread` : ""}`}
+          className="jump-to-bottom"
+          onClick={jumpToBottom}
+          type="button"
+        >
+          <ArrowDown size={18} />
+          {unreadCount > 0 && <span>{unreadCount > 99 ? "99+" : unreadCount}</span>}
+        </button>
+      )}
       {props.selectionMode && (
         <div className="message-selection-toolbar" role="toolbar" aria-label="Selected message actions">
           <button type="button" onClick={props.onSelectAllMessages}>Select All</button>

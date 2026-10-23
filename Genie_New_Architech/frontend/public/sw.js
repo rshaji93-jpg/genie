@@ -41,3 +41,31 @@ self.addEventListener("fetch", (event) => {
     })));
   }
 });
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = { body: event.data?.text() || "You have a new Personal AI Genie notification." };
+  }
+  const title = typeof payload.title === "string" ? payload.title : "Personal AI Genie";
+  const body = typeof payload.body === "string" ? payload.body : "You have a new notification.";
+  event.waitUntil(self.registration.showNotification(title, {
+    body,
+    icon: "/genie-icon.svg",
+    badge: "/genie-icon.svg",
+    tag: typeof payload.tag === "string" ? payload.tag : "genie-notification",
+    data: { url: typeof payload.url === "string" ? payload.url : "/" },
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const targetUrl = new URL(event.notification.data?.url || "/", self.location.origin).href;
+  event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((clients) => {
+    const existing = clients.find((client) => client.url === targetUrl);
+    if (existing) return existing.focus();
+    return self.clients.openWindow(targetUrl);
+  }));
+});

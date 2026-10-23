@@ -105,6 +105,97 @@ export async function apiFetchWithFallback<T>(
   }
 }
 
+export type LibrarySection =
+  | "living-graph"
+  | "ai-timeline"
+  | "genie-daily"
+  | "skill-dna"
+  | "trust-impact";
+
+export interface LibraryRecord {
+  id: string;
+  title?: string;
+  content?: string;
+  summary?: string;
+  created_at?: string;
+  updated_at?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface LibrarySectionResponse {
+  items: LibraryRecord[];
+  next_cursor?: string | null;
+}
+
+export interface ProposedMemory {
+  id: string;
+  content?: string;
+  status?: "pending" | "approved" | "rejected";
+}
+
+export interface VoiceTtsResponse {
+  audio_base64?: string;
+  mime_type?: string;
+}
+
+export function getLibrarySection(
+  section: LibrarySection,
+  credential: string,
+): Promise<LibrarySectionResponse> {
+  return apiFetch<LibrarySectionResponse>(`/api/library/${section}`, credential);
+}
+
+export function saveLibraryItem(
+  content: string,
+  credential: string,
+  metadata: Record<string, unknown> = {},
+): Promise<LibraryRecord> {
+  return apiFetch<LibraryRecord>("/api/library/items", credential, {
+    method: "POST",
+    body: JSON.stringify({ content, metadata }),
+  });
+}
+
+export function removeLibraryItem(id: string, credential: string): Promise<{ deleted?: boolean }> {
+  return apiFetch<{ deleted?: boolean }>(`/api/library/items/${encodeURIComponent(id)}`, credential, {
+    method: "DELETE",
+  });
+}
+
+export function approveProposedMemory(
+  proposalId: string,
+  credential: string,
+): Promise<{ approved: boolean; id: string }> {
+  return apiFetch<{ approved: boolean; id: string }>(
+    `/api/memory/proposals/${encodeURIComponent(proposalId)}/approve`,
+    credential,
+    { method: "POST", body: "{}" },
+  );
+}
+
+export function createFutureSelfEntry(
+  content: string,
+  credential: string,
+  sourceMessageId: string,
+): Promise<{ id: string }> {
+  return apiFetch<{ id: string }>("/api/future-self", credential, {
+    method: "POST",
+    body: JSON.stringify({ content, source_message_id: sourceMessageId }),
+  });
+}
+
+export function requestVoiceTts(
+  text: string,
+  dialect: string,
+  model: string,
+  credential: string,
+): Promise<VoiceTtsResponse> {
+  return apiFetch<VoiceTtsResponse>("/api/voice/tts", credential, {
+    method: "POST",
+    body: JSON.stringify({ text: text.slice(0, 12_000), dialect, model }),
+  });
+}
+
 export function websocketUrl(path: string): string {
   const baseUrl = window.location.hostname !== "localhost"
     ? CLOUD_API_URL

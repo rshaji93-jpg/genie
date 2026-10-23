@@ -4,6 +4,8 @@ import { Fingerprint, ShieldCheck, X } from "lucide-react";
 import { useState } from "react";
 import { apiFetch } from "@/lib/api";
 
+const ADMIN_SESSION_STORAGE_KEY = "genie_admin_signed_session";
+
 interface AdminPasskeyProps {
   open: boolean;
   credential: string;
@@ -121,6 +123,9 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
         "/api/admin/passkeys/auth/verify", props.credential,
         { method: "POST", body: JSON.stringify({ credential: serializeCredential(passkey) }) },
       );
+      if (!result.admin_session) throw new Error("The server did not issue an admin session.");
+      // Persist only the server-signed token returned after WebAuthn verification.
+      localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, result.admin_session);
       props.onUnlocked(result.admin_session);
       props.onClose();
     } catch (caught) {

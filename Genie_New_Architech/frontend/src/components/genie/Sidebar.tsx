@@ -1,9 +1,9 @@
 "use client";
 
 import {
-  Archive,
   CalendarClock,
   ChevronLeft,
+  ChevronDown,
   Library,
   MessageCircle,
   MoreHorizontal,
@@ -21,12 +21,20 @@ import { useEffect, useState } from "react";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import ProfileFooter from "@/modules/profile_settings/ProfileFooter";
 
-export type WorkspaceView = "chat" | "library" | "scheduled" | "friends" | "archive";
+export type WorkspaceView = "chat" | "library" | "scheduled" | "friends";
 
 export interface ThreadItem {
   id: string;
   title: string;
   pinned?: boolean;
+}
+
+export interface SidebarRoom {
+  id: string;
+  name: string;
+  group_slot?: number | null;
+  member_count?: number;
+  auto_saved?: boolean;
 }
 
 export interface DeletedThreadItem extends ThreadItem {
@@ -41,6 +49,8 @@ interface SidebarProps {
   deletedThreads: DeletedThreadItem[];
   selectedThreadId: string;
   onlineMembers: string[];
+  rooms: SidebarRoom[];
+  currentRoomId?: string;
   displayName: string;
   pictureUrl?: string;
   activeModel: string;
@@ -58,6 +68,8 @@ interface SidebarProps {
   onSearch: () => void;
   onOpenSettings: () => void;
   onProfileTap: () => void;
+  onOpenRoom: (id: string) => void;
+  onCreateGroupSlot: (slot: number) => void;
 }
 
 interface GovernanceMenuState {
@@ -70,12 +82,12 @@ const navigation = [
   { id: "library", label: "Library", icon: Library },
   { id: "scheduled", label: "Scheduled", icon: CalendarClock },
   { id: "friends", label: "Friends", icon: UsersRound },
-  { id: "archive", label: "Archived Rooms", icon: Archive },
 ] as const;
 
 export default function Sidebar(props: SidebarProps) {
   const [presenceOpen, setPresenceOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
+  const [groupChatsOpen, setGroupChatsOpen] = useState(true);
   const [governanceMenu, setGovernanceMenu] = useState<GovernanceMenuState | null>(null);
   const width = props.collapsed ? "sidebar collapsed" : "sidebar";
 
@@ -223,6 +235,37 @@ export default function Sidebar(props: SidebarProps) {
               {governanceMenu?.key === "recent" && renderGovernanceMenu()}
             </div>
           </div>
+          <section className="group-chat-slots">
+            <button
+              className="group-chat-heading"
+              aria-expanded={groupChatsOpen}
+              onClick={() => setGroupChatsOpen((open) => !open)}
+              type="button"
+            >
+              <UsersRound size={14} />
+              <span>Group Chats</span>
+              <ChevronDown className={groupChatsOpen ? "" : "group-chat-chevron-collapsed"} size={14} />
+            </button>
+            {groupChatsOpen && Array.from({ length: 5 }, (_, index) => {
+              const slot = index + 1;
+              const room = props.rooms.find((item) => item.group_slot === slot);
+              return (
+                <button
+                  className={`group-chat-slot ${room?.id === props.currentRoomId ? "selected" : ""}`}
+                  key={slot}
+                  onClick={() => room ? props.onOpenRoom(room.id) : props.onCreateGroupSlot(slot)}
+                  title={room ? `Open ${room.name}` : `Create Group ${slot}`}
+                  type="button"
+                >
+                  <span className="group-chat-slot-name">{room?.name || `Group ${slot}`}</span>
+                  {room
+                    ? <span className="group-chat-seat-badge">{Math.min(room.member_count || 1, 5)}/5</span>
+                    : <span className="group-chat-seat-badge">1/5</span>}
+                  {room?.auto_saved && <span className="group-chat-saved" title="Auto-saved">●</span>}
+                </button>
+              );
+            })}
+          </section>
           <div className="thread-list">
             {props.threads.map((thread) => (
               <div className="sidebar-thread-row" key={thread.id}>

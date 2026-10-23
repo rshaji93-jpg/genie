@@ -1,30 +1,37 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
+import {
+  getLibrarySection,
+  removeLibraryItem,
+  type LibraryRecord,
+  type LibrarySection,
+} from "@/lib/api";
 import type { WorkspaceView } from "./Sidebar";
 
 interface SavedItem { id: string; content: string; createdAt: string }
 interface ScheduleItem { id: string; title: string; at: string; notified?: boolean }
 interface RoomSummary { id: string; name: string; member_count?: number }
 interface FriendRequestItem { id: string; sender_name: string; sender_username: string }
+interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string }
 interface FriendItem { user_sub: string; user_name: string; username: string }
 interface ActiveRoomMember { user_sub: string; user_name: string; username?: string }
 
 interface WorkspacePanelProps {
   view: Exclude<WorkspaceView, "chat">;
+  credential: string;
   savedItems: SavedItem[];
   onRemoveSaved: (id: string) => void;
   rooms: RoomSummary[];
-  archivedRoomIds: string[];
-  onArchiveRoom: (id: string) => void;
-  onUnarchiveRoom: (id: string) => void;
   currentRoomId?: string;
   requests: FriendRequestItem[];
+  outgoingRequests: OutgoingFriendRequestItem[];
   friends: FriendItem[];
   activeMembers: ActiveRoomMember[];
   currentUserSub: string;
   onAcceptRequest: (id: string) => Promise<void>;
   onRejectRequest: (id: string) => Promise<void>;
+  onCancelRequest: (id: string) => Promise<void>;
   onSendFriendRequest: (username: string) => Promise<void>;
   onSearchDirectory: (query: string) => Promise<FriendItem[]>;
   onCreateRoom: () => Promise<void>;
@@ -51,10 +58,44 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
   const [inviteCode, setInviteCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [librarySection, setLibrarySection] = useState<LibrarySection>("living-graph");
+  const [libraryRecords, setLibraryRecords] = useState<LibraryRecord[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+
+  const libraryTabs: Array<{ id: LibrarySection; label: string }> = [
+    { id: "living-graph", label: "Living Graph & Items" },
+    { id: "ai-timeline", label: "AI Timeline" },
+    { id: "genie-daily", label: "Genie Daily" },
+    { id: "skill-dna", label: "Skill DNA & 10-Min Capsules" },
+    { id: "trust-impact", label: "Trust & Impact Center" },
+  ];
 
   useEffect(() => {
     setSchedule(storageRead<ScheduleItem[]>("genie_new_schedule", []));
   }, []);
+
+  useEffect(() => {
+    if (props.view !== "library" || !props.credential) return;
+    let cancelled = false;
+    setLibraryLoading(true);
+    setError("");
+    void getLibrarySection(librarySection, props.credential)
+      .then((result) => {
+        if (!cancelled) setLibraryRecords(Array.isArray(result.items) ? result.items : []);
+      })
+      .catch((caught: unknown) => {
+        if (!cancelled) {
+          setLibraryRecords([]);
+          if (librarySection !== "living-graph") {
+            setError(caught instanceof Error ? caught.message : "This library section could not be loaded.");
+          }
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLibraryLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [props.view, props.credential, librarySection]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -159,7 +200,6 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
     library: ["Library", "A private collection of answers you chose to keep."],
     scheduled: ["Scheduled", "Reminders stay in this browser. Genie does not receive them."],
     friends: ["Friends", "Find friends and manage invitations using public @usernames."],
-    archive: ["Archived Rooms", "Room shortcuts are hidden from the active list on this device."],
   } as const;
   const [title, description] = titles[props.view];
 
@@ -168,15 +208,57 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
       <div className="section-title"><span className="eyebrow">YOUR WORKSPACE</span><h1>{title}</h1><p>{description}</p></div>
       {error && <p className="section-error" role="alert">{error}</p>}
       {props.view === "library" && (
-        <div className="section-list">
-          {props.savedItems.map((item) => (
-            <article className="section-card" key={item.id}>
-              <time>{new Date(item.createdAt).toLocaleString()}</time><p>{item.content}</p>
-              <button className="subtle-button" onClick={() => props.onRemoveSaved(item.id)}>Remove</button>
-            </article>
-          ))}
-          {!props.savedItems.length && <div className="section-empty">Save any Genie answer from a chat to keep it here.</div>}
-        </div>
+        <>
+          <div className="library-tabs" role="tablist" aria-label="Genie Library sections">
+            {libraryTabs.map((tab) => (
+              <button
+                aria-selected={librarySection === tab.id}
+                className={librarySection === tab.id ? "library-tab library-tab-active" : "library-tab"}
+                key={tab.id}
+                onClick={() => setLibrarySection(tab.id)}
+                role="tab"
+                type="button"
+              >{tab.label}</button>
+            ))}
+          </div>
+          {libraryLoading && <p className="muted-copy" role="status">Loading {libraryTabs.find((tab) => tab.id === librarySection)?.label}…</p>}
+          {librarySection === "living-graph" ? (
+            <div className="section-list">
+              {props.savedItems.map((item) => (
+                <article className="section-card" key={item.id}>
+                  <time>{new Date(item.createdAt).toLocaleString()}</time><p>{item.content}</p>
+                  <button className="subtle-button" onClick={() => {
+                    void removeLibraryItem(item.id, props.credential).catch(() => undefined);
+                    props.onRemoveSaved(item.id);
+                  }}>Remove</button>
+                </article>
+              ))}
+              {libraryRecords.filter((record) => !props.savedItems.some((saved) => saved.id === record.id)).map((item) => (
+                <article className="section-card" key={item.id}>
+                  <time>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</time>
+                  {item.title && <strong>{item.title}</strong>}
+                  <p>{item.content || item.summary || ""}</p>
+                </article>
+              ))}
+              {!props.savedItems.length && !libraryRecords.length && !libraryLoading && (
+                <div className="section-empty">Save any Genie answer from a chat to keep it here.</div>
+              )}
+            </div>
+          ) : (
+            <div className="section-list" role="tabpanel">
+              {libraryRecords.map((item) => (
+                <article className="section-card" key={item.id}>
+                  <time>{item.created_at ? new Date(item.created_at).toLocaleString() : ""}</time>
+                  {item.title && <strong>{item.title}</strong>}
+                  <p>{item.content || item.summary || "No details provided."}</p>
+                </article>
+              ))}
+              {!libraryRecords.length && !libraryLoading && !error && (
+                <div className="section-empty">Nothing here yet.</div>
+              )}
+            </div>
+          )}
+        </>
       )}
       {props.view === "scheduled" && (
         <>
@@ -221,6 +303,17 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
               <div className="request-row" key={request.id}><span><strong>{request.sender_name}</strong><small>@{request.sender_username}</small></span><span><button className="primary-button compact" disabled={busy} onClick={() => void respondToFriendRequest(request.id, true)}>Accept</button><button className="subtle-button" disabled={busy} onClick={() => void respondToFriendRequest(request.id, false)}>Decline</button></span></div>
             ))}
             {!props.requests.length && <p className="muted-copy">No pending requests.</p>}
+            <h3>Requests you sent</h3>
+            {props.outgoingRequests.map((request) => (
+              <div className="request-row" key={request.id}>
+                <span><strong>{request.receiver_name}</strong><small>@{request.receiver_username}</small></span>
+                <span className="outgoing-request-actions">
+                  <span className="request-sent-label">⏳ Request Sent</span>
+                  <button className="subtle-button" disabled={busy} onClick={() => void props.onCancelRequest(request.id)} type="button">✕ Cancel</button>
+                </span>
+              </div>
+            ))}
+            {!props.outgoingRequests.length && <p className="muted-copy">No outgoing requests.</p>}
             <h3>Your friends</h3>
             {props.friends.map((friend) => <div className="friend-row" key={friend.user_sub}><span className="presence-light green" /><span>{friend.user_name}</span><small>@{friend.username}</small></div>)}
             <form className="inline-form" onSubmit={(event) => void submitFriend(event)}>
@@ -237,25 +330,13 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
           <div className="section-card">
             <h2>Rooms</h2>
             <button className="primary-button" onClick={() => void props.onCreateRoom()}>Create encrypted room</button>
-            {props.rooms.filter((room) => !props.archivedRoomIds.includes(room.id)).map((room) => <div className={`room-list-row ${props.currentRoomId === room.id ? "current-room" : ""}`} key={room.id}><button className="room-list-open" onClick={() => props.onOpenRoom(room.id)}><span><strong>{room.name}</strong><small>{room.member_count} member{room.member_count === 1 ? "" : "s"}</small></span><span className="room-open-arrow">Open</span></button><button className="subtle-button room-archive-action" onClick={() => props.onArchiveRoom(room.id)}>Archive</button></div>)}
+            {props.rooms.map((room) => <div className={`room-list-row ${props.currentRoomId === room.id ? "current-room" : ""}`} key={room.id}><button className="room-list-open" onClick={() => props.onOpenRoom(room.id)}><span><strong>{room.name}</strong><small>{room.member_count} member{room.member_count === 1 ? "" : "s"}</small></span><span className="room-open-arrow">Open</span></button></div>)}
             <form className="inline-form" onSubmit={(event) => void joinRoom(event)}>
               <input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Paste room invite code" required />
               <button className="primary-button compact" disabled={busy}>Join</button>
             </form>
             <p className="muted-copy">Room links include an encryption key in the URL fragment. Share them only with intended participants.</p>
           </div>
-        </div>
-      )}
-      {props.view === "archive" && (
-        <div className="section-list">
-          {props.rooms.filter((room) => props.archivedRoomIds.includes(room.id)).map((room) => (
-            <article className="section-card archived-room-row" key={room.id}>
-              <span><strong>{room.name}</strong><small>{room.member_count} member{room.member_count === 1 ? "" : "s"}</small></span>
-              <button className="primary-button compact" onClick={() => props.onOpenRoom(room.id)}>Open</button>
-              <button className="subtle-button" onClick={() => props.onUnarchiveRoom(room.id)}>Unarchive</button>
-            </article>
-          ))}
-          {!props.rooms.some((room) => props.archivedRoomIds.includes(room.id)) && <div className="section-empty">No rooms are archived on this device.</div>}
         </div>
       )}
     </section>

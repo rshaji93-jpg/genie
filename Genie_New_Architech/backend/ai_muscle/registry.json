@@ -1,0 +1,33 @@
+{
+  "body_agents": {
+    "research": {
+      "description": "Find relevant context, constraints, and evidence for the request."
+    },
+    "coding": {
+      "description": "Design, implement, and review reliable software changes."
+    },
+    "knowledge": {
+      "description": "Explain concepts using clear, verifiable information."
+    },
+    "social": {
+      "description": "Support thoughtful communication and collaboration."
+    },
+    "creative": {
+      "description": "Generate original ideas, plans, and creative material."
+    }
+  },
+  "skills": {
+    "memory_sieve_extract": {
+      "description": "Extract a user-approved decision, task, goal, or lesson from a conversation."
+    },
+    "skill_capsule_builder": {
+      "description": "Turn a focused practice objective into a ten-minute skill capsule."
+    },
+    "bilingual_library_qa": {
+      "description": "Answer questions grounded in library items and preserve the requested language."
+    },
+    "future_self_advisor": {
+      "description": "Help the user consider how a future version of themselves may evaluate a choice."
+    }
+  }
+}

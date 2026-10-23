@@ -1,6 +1,7 @@
 import asyncio
-import os
+import time
 import unittest
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import Mock, patch
 
 import requests
@@ -10,60 +11,60 @@ from gemini_pool import GeminiPool
 
 class GeminiPoolTests(unittest.TestCase):
     def make_pool(self):
-        with patch.dict(
-            os.environ,
-            {
-                "GENIE_GEMINI_FREE_KEYS": "free-one,free-two",
-                "GENIE_GEMINI_MASTER_KEYS": "master-one",
-            },
-            clear=True,
-        ):
+        with patch("gemini_pool.load_gemini_keys", return_value=["free-one", "free-two"]):
             return GeminiPool()
 
     def test_free_pool_rotates_and_retries_after_rate_limit(self):
         pool = self.make_pool()
         throttled = Mock()
         throttled.status_code = 429
-        rate_limit = requests.HTTPError(response=throttled)
+        throttled.text = "rate limit"
         ready = Mock()
-        ready.raise_for_status.return_value = None
+        ready.status_code = 200
+        ready.text = ""
+        ready.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "A natural answer."}]}}]
+        }
 
-        with patch("gemini_pool.requests.post", side_effect=[rate_limit, ready]) as post:
-            result = pool._generate("gemini-2.5-flash", [{"role": "user", "content": "Hello"}])
+        with patch("gemini_pool.requests.post", side_effect=[throttled, ready]) as post:
+            result = pool._call_google([{"role": "user", "content": "Hello"}])
 
-        self.assertIs(result, ready)
-        self.assertEqual(post.call_args_list[0].kwargs["params"]["key"], "free-one")
-        self.assertEqual(post.call_args_list[1].kwargs["params"]["key"], "free-two")
-        self.assertGreater(pool.cooldowns["free-one"], 0)
+        self.assertEqual(result, "A natural answer.")
+        self.assertEqual(parse_qs(urlsplit(post.call_args_list[0].args[0]).query)["key"], ["free-one"])
+        self.assertEqual(parse_qs(urlsplit(post.call_args_list[1].args[0]).query)["key"], ["free-two"])
+        self.assertGreater(pool._key_backoff_until["free-one"], time.monotonic())
         self.assertEqual(pool.availability()["genie_pro_available"], True)
 
-    def test_master_keys_are_separate_and_thinking_level_is_sent(self):
+    def test_master_keys_are_separate_from_free_pool(self):
         pool = self.make_pool()
+        pool.master_key = "master-one"
         ready = Mock()
-        ready.raise_for_status.return_value = None
+        ready.status_code = 200
+        ready.text = ""
+        ready.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "A private answer."}]}}]
+        }
 
         with patch("gemini_pool.requests.post", return_value=ready) as post:
-            pool._generate(
-                "gemini-2.5-pro",
+            answer = pool._call_google(
                 [{"role": "user", "content": "Review"}],
                 master=True,
-                thinking_level="deep",
             )
 
-        self.assertEqual(post.call_args.kwargs["params"]["key"], "master-one")
-        self.assertEqual(
-            post.call_args.kwargs["json"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            24576,
-        )
+        self.assertEqual(answer, "A private answer.")
+        self.assertEqual(parse_qs(urlsplit(post.call_args.args[0]).query)["key"], ["master-one"])
+        self.assertIn("systemInstruction", post.call_args.kwargs["json"])
+        self.assertFalse(pool._busy_keys)
 
     def test_availability_reports_master_cooldown_without_free_key_fallback(self):
         pool = self.make_pool()
-        pool.cooldowns.update({"master-one": 4_000_000_000, "free-one": 4_000_000_000, "free-two": 4_000_000_000})
+        pool._key_backoff_until.update({"free-one": time.monotonic() + 3600, "free-two": time.monotonic() + 3600})
+        pool._unhealthy_keys.update({"free-one", "free-two"})
         status = pool.availability()
         self.assertFalse(status["genie_master_available"])
         self.assertFalse(status["genie_pro_available"])
-        with self.assertRaisesRegex(RuntimeError, "cooling down"):
-            pool._generate("gemini-2.5-pro", [{"role": "user", "content": "Review"}], master=True)
+        with self.assertRaisesRegex(RuntimeError, "FREE_POOL_EXHAUSTED"):
+            pool._call_google([{"role": "user", "content": "Review"}])
 
     def test_probe_keeps_keys_active_for_transient_and_model_errors(self):
         key = "AIza" + "A" * 35

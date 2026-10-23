@@ -10,7 +10,11 @@ interface VoiceMicProps {
   recentContext?: string;
   disabled?: boolean;
   onTranscription: (text: string, interim?: boolean) => void;
+  onCallTranscript?: (text: string) => void;
   onVoiceNoteRecorded: (dataUrl: string, durationSeconds: number) => void;
+  onVoiceNoteSend?: (dataUrl: string, durationSeconds: number) => void;
+  onTranscribeAudio?: (dataUrl: string, dialect: string) => Promise<string>;
+  sharedAudioStream?: MediaStream | null;
   transcribeRequest?: number;
   onActivity?: (activity: "recording" | "idle") => void;
   wakeWordActive?: boolean;
@@ -38,6 +42,7 @@ export default function VoiceMic(props: VoiceMicProps) {
   const manualStop = useRef(false);
   const recorder = useRef<MediaRecorder | null>(null);
   const stream = useRef<MediaStream | null>(null);
+  const usesSharedStreamRef = useRef(false);
   const startedAt = useRef(0);
   const chunks = useRef<Blob[]>([]);
   const lastWakeWordAt = useRef(0);
@@ -49,6 +54,8 @@ export default function VoiceMic(props: VoiceMicProps) {
   const accumulatedTranscriptRef = useRef("");
   const dictationTimerRef = useRef<number | undefined>(undefined);
   const dictationIntervalRef = useRef<number | undefined>(undefined);
+  const recordingTimerRef = useRef<number | undefined>(undefined);
+  const recordingActionRef = useRef<"stage" | "send" | "transcribe">("stage");
 
   useEffect(() => {
     wakeCallback.current = props.onWakeWordPrompt;
@@ -158,9 +165,10 @@ export default function VoiceMic(props: VoiceMicProps) {
     dictationActive.current = false;
     if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
     if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    if (recordingTimerRef.current !== undefined) window.clearTimeout(recordingTimerRef.current);
     recognition.current?.stop();
     recorder.current?.stop();
-    stream.current?.getTracks().forEach((track) => track.stop());
+    if (!usesSharedStreamRef.current) stream.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
   function finishDictation(stopRecognition = true) {
@@ -168,10 +176,13 @@ export default function VoiceMic(props: VoiceMicProps) {
     manualStop.current = true;
     if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
     if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    if (recordingTimerRef.current !== undefined) window.clearTimeout(recordingTimerRef.current);
     dictationTimerRef.current = undefined;
     dictationIntervalRef.current = undefined;
     if (stopRecognition) recognition.current?.stop();
     recognition.current = null;
+    if (recorder.current?.state === "recording") recorder.current.stop();
+    recorder.current = null;
     setRecording(false);
     setSecondsRemaining(0);
     props.onActivity?.("idle");
@@ -181,7 +192,7 @@ export default function VoiceMic(props: VoiceMicProps) {
     setError("");
     startedAt.current = Date.now();
     manualStop.current = false;
-    if (!props.isMultiUserRoom || transcribeOnly) {
+    if ((!props.isMultiUserRoom || transcribeOnly) && !props.sharedAudioStream) {
       const candidate = window as typeof window & {
         SpeechRecognition?: RecognitionConstructor;
         webkitSpeechRecognition?: RecognitionConstructor;
@@ -205,16 +216,20 @@ export default function VoiceMic(props: VoiceMicProps) {
         instance.continuous = true;
         instance.interimResults = true;
         instance.onresult = (event) => {
-          let interimText = "";
-          const resultIndex = event.resultIndex ?? 0;
-          for (let index = resultIndex; index < event.results.length; index += 1) {
-            const result = event.results[index];
-            if (!result) continue;
-            const transcript = result[0]?.transcript || "";
-            if (result.isFinal) {
-              accumulatedTranscriptRef.current = `${accumulatedTranscriptRef.current} ${transcript}`.trim();
-            } else {
-              interimText += `${transcript} `;
+          const latestResult = event.results[event.results.length - 1];
+          if (!latestResult) return;
+          const transcript = latestResult[0]?.transcript?.trim() || "";
+          const interimText = latestResult.isFinal ? "" : transcript;
+          if (latestResult.isFinal && transcript) {
+            const existingWords = accumulatedTranscriptRef.current.split(/\s+/).filter(Boolean);
+            const incomingWords = transcript.split(/\s+/).filter(Boolean);
+            let overlap = Math.min(existingWords.length, incomingWords.length, 12);
+            while (overlap > 0 && !existingWords.slice(-overlap).every(
+              (word, index) => word.toLocaleLowerCase() === incomingWords[index]?.toLocaleLowerCase(),
+            )) overlap -= 1;
+            const addition = incomingWords.slice(overlap).join(" ");
+            if (addition) {
+              accumulatedTranscriptRef.current = [accumulatedTranscriptRef.current, addition].filter(Boolean).join(" ");
             }
           }
           let finalText = professionalizeTranscript(accumulatedTranscriptRef.current);
@@ -223,10 +238,11 @@ export default function VoiceMic(props: VoiceMicProps) {
           const text = [finalText, interim].filter(Boolean).join(" ");
           if (!text) return;
           const base = dictationBaseText.current;
-          props.onTranscription(
-            `${base}${base && !/\s$/.test(base) ? " " : ""}${text}`,
-            Boolean(interim),
-          );
+          const composedText = `${base}${base && !/\s$/.test(base) ? " " : ""}${text}`;
+          props.onTranscription(composedText, Boolean(interim));
+          if (transcribeOnly && latestResult.isFinal && transcript) {
+            props.onCallTranscript?.(composedText);
+          }
         };
         instance.onerror = (event) => {
           if (event.error === "no-speech" || event.error === "aborted") return;
@@ -268,39 +284,84 @@ export default function VoiceMic(props: VoiceMicProps) {
         props.onActivity?.("recording");
         return;
       }
-      if (transcribeOnly) {
+      if (transcribeOnly && !props.sharedAudioStream) {
         setError("Live transcription is unavailable in this browser.");
         return;
       }
     }
     try {
-      const media = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const sharedAudioTracks = props.sharedAudioStream?.getAudioTracks() || [];
+      const media = sharedAudioTracks.length
+        ? new MediaStream(sharedAudioTracks)
+        : await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      usesSharedStreamRef.current = sharedAudioTracks.length > 0;
       stream.current = media;
       const capture = new MediaRecorder(media);
       recorder.current = capture;
       chunks.current = [];
       capture.ondataavailable = (event) => { if (event.data.size) chunks.current.push(event.data); };
       capture.onstop = () => {
+        if (recordingTimerRef.current !== undefined) window.clearTimeout(recordingTimerRef.current);
+        recordingTimerRef.current = undefined;
         const blob = new Blob(chunks.current, { type: capture.mimeType || "audio/webm" });
         if (blob.size > 8_000_000) {
           setError("Voice note is larger than 8 MB. Record a shorter note.");
-          media.getTracks().forEach((track) => track.stop());
+          if (!usesSharedStreamRef.current) media.getTracks().forEach((track) => track.stop());
           stream.current = null;
+          usesSharedStreamRef.current = false;
           return;
         }
         const reader = new FileReader();
         reader.onloadend = () => {
           if (typeof reader.result === "string") {
-            props.onVoiceNoteRecorded(reader.result, Math.max(1, Math.round((Date.now() - startedAt.current) / 1000)));
+            const duration = Math.max(1, Math.round((Date.now() - startedAt.current) / 1000));
+            if (recordingActionRef.current === "transcribe") {
+              if (!props.onTranscribeAudio) {
+                setError("Voice transcription is unavailable.");
+              } else {
+                void props.onTranscribeAudio(reader.result, recognitionLocale.current)
+                  .then((text) => {
+                    props.onTranscription(text);
+                    if (transcribeOnly) props.onCallTranscript?.(text);
+                  })
+                  .catch((error: unknown) => setError(error instanceof Error ? error.message : "Voice transcription failed."));
+              }
+            } else if (recordingActionRef.current === "send") {
+              props.onVoiceNoteSend?.(reader.result, duration);
+            } else {
+              props.onVoiceNoteRecorded(reader.result, duration);
+            }
           }
         };
         reader.readAsDataURL(blob);
-        media.getTracks().forEach((track) => track.stop());
+        if (!usesSharedStreamRef.current) media.getTracks().forEach((track) => track.stop());
         stream.current = null;
+        usesSharedStreamRef.current = false;
       };
       capture.start();
       setRecording(true);
       props.onActivity?.("recording");
+      recordingActionRef.current = transcribeOnly ? "transcribe" : "stage";
+      if (transcribeOnly) {
+        dictationActive.current = true;
+        setSecondsRemaining(90);
+        dictationIntervalRef.current = window.setInterval(() => {
+          const remaining = Math.max(0, Math.ceil((90_000 - (Date.now() - startedAt.current)) / 1000));
+          setSecondsRemaining(remaining);
+          if (remaining === 0) finishDictation();
+        }, 1000);
+      }
+      recordingTimerRef.current = window.setTimeout(() => {
+        if (dictationActive.current) finishDictation();
+        else {
+          if (recorder.current?.state === "recording") recorder.current.stop();
+          recorder.current = null;
+          setRecording(false);
+          props.onActivity?.("idle");
+        }
+      }, 90_000);
     } catch {
       setError("Microphone access is unavailable. Use HTTPS and grant permission.");
     }
@@ -309,6 +370,21 @@ export default function VoiceMic(props: VoiceMicProps) {
   useEffect(() => {
     if (props.transcribeRequest) void start(true);
   }, [props.transcribeRequest]);
+
+  useEffect(() => {
+    if (props.sharedAudioStream || !usesSharedStreamRef.current) return;
+    dictationActive.current = false;
+    if (dictationTimerRef.current !== undefined) window.clearTimeout(dictationTimerRef.current);
+    if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+    if (recordingTimerRef.current !== undefined) window.clearTimeout(recordingTimerRef.current);
+    dictationTimerRef.current = undefined;
+    dictationIntervalRef.current = undefined;
+    recordingTimerRef.current = undefined;
+    if (recorder.current?.state === "recording") recorder.current.stop();
+    recorder.current = null;
+    setRecording(false);
+    setSecondsRemaining(0);
+  }, [props.sharedAudioStream]);
 
   useEffect(() => {
     if (!props.wakeWordActive) return;
@@ -329,6 +405,22 @@ export default function VoiceMic(props: VoiceMicProps) {
     manualStop.current = true;
     recognition.current?.stop();
     recognition.current = null;
+    if (recorder.current?.state === "recording") recorder.current.stop();
+    recorder.current = null;
+    setRecording(false);
+    props.onActivity?.("idle");
+  }
+
+  function finishRecording(action: "send" | "transcribe") {
+    recordingActionRef.current = action;
+    if (dictationActive.current) {
+      dictationActive.current = false;
+      if (dictationIntervalRef.current !== undefined) window.clearInterval(dictationIntervalRef.current);
+      dictationIntervalRef.current = undefined;
+      if (recordingTimerRef.current !== undefined) window.clearTimeout(recordingTimerRef.current);
+      recordingTimerRef.current = undefined;
+      setSecondsRemaining(0);
+    }
     if (recorder.current?.state === "recording") recorder.current.stop();
     recorder.current = null;
     setRecording(false);
@@ -356,6 +448,12 @@ export default function VoiceMic(props: VoiceMicProps) {
         {recording ? <Square size={15} fill="currentColor" /> : <Mic size={18} />}
       </button>
       {recording && <span className="voice-waveform" aria-label={props.wakeWordActive ? "Listening for Genie wake word" : "Listening"}>{Array.from({ length: 9 }, (_, index) => <i key={index} />)}</span>}
+      {recording && recorder.current?.state === "recording" && (
+        <div className="voice-note-quick-actions">
+          <button onClick={() => finishRecording("transcribe")} type="button" disabled={!props.onTranscribeAudio}>✍️ To Text</button>
+          <button onClick={() => finishRecording("send")} type="button" disabled={!props.onVoiceNoteSend}>▶️ Send Voice Note</button>
+        </div>
+      )}
       {dictationActive.current && recording && (
         <span className="dictation-live-pill" role="status">
           🔴 Listening ({secondsRemaining}s left) · Pause-safe — Tap Mic to finish

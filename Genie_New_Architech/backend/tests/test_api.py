@@ -62,7 +62,7 @@ class BackendApiTests(unittest.TestCase):
                 self.assertIsInstance(response.json(), dict)
 
     def test_friends_only_chat_skips_ai_inference(self):
-        with patch.object(main.agent_router, "chat") as provider:
+        with patch.object(main.multi_pool_router, "complete", new_callable=AsyncMock) as provider:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -78,10 +78,128 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["chat_mode"], "friends_only")
         self.assertTrue(response.json()["inference_skipped"])
         self.assertEqual(response.json()["tokens_burned"], 0)
-        provider.assert_not_called()
+        provider.assert_not_awaited()
+
+    def test_library_items_memory_approval_and_trust_actions(self):
+        self.actor["sub"] = "library-test-user"
+        seeded = self.client.get("/api/library")
+        self.assertEqual(seeded.status_code, 200, seeded.text)
+        self.assertGreaterEqual(seeded.json()["count"], 5)
+
+        created = self.client.post(
+            "/api/library",
+            json={
+                "title": "Launch decision",
+                "content": "We decided to launch the pilot on Friday.",
+                "item_type": "decision",
+                "visibility": "friends",
+                "related_item_ids": [],
+                "provenance": {"source": "test"},
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        item_id = created.json()["item"]["id"]
+        self.assertEqual(created.json()["item"]["provenance"]["source"], "test")
+
+        revoked = self.client.post(
+            "/api/library/trust",
+            json={"action": "revoke_share", "item_id": item_id},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertTrue(revoked.json()["share_revoked"])
+        exported = self.client.post("/api/library/trust", json={"action": "export"})
+        self.assertEqual(exported.status_code, 200, exported.text)
+        self.assertTrue(any(item["id"] == item_id for item in exported.json()["items"]))
+
+        candidate = main.master_brain.memory_sieve.propose(
+            "My goal is to finish the first project milestone this week.",
+            self.actor["sub"],
+        )
+        self.assertIsNotNone(candidate)
+        approved = self.client.post(
+            "/api/library/memory-sieve/approve",
+            json={"pending_action_token": candidate["pending_action_token"]},
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self.assertTrue(approved.json()["approved"])
+        duplicate = self.client.post(
+            "/api/library/memory-sieve/approve",
+            json={"pending_action_token": candidate["pending_action_token"]},
+        )
+        self.assertEqual(duplicate.status_code, 409)
+
+        deleted = self.client.delete(f"/api/library/{item_id}")
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertTrue(deleted.json()["deleted"])
+
+    def test_grounded_library_ask_returns_accessible_item_citations(self):
+        created = self.client.post(
+            "/api/library",
+            json={
+                "title": "Service notes",
+                "content": "The service keeps a 24-hour rolling token balance.",
+                "item_type": "article",
+                "provenance": {"source": "runbook"},
+            },
+        )
+        item_id = created.json()["item"]["id"]
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("The balance rolls over every 24 hours [1].", "pool-test"),
+        ) as provider:
+            response = self.client.post(
+                "/api/v1/workspace/library/grounded-ask",
+                json={
+                    "question": "How does the token balance work?",
+                    "action": "ask",
+                    "item_ids": [item_id],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["citations"][0]["item_id"], item_id)
+        self.assertEqual(response.json()["citations"][0]["title"], "Service notes")
+        self.assertEqual(response.json()["reply"], "The balance rolls over every 24 hours [1].")
+        provider.assert_awaited_once()
+        self.assertLessEqual(provider.await_args.kwargs["max_tokens"], 1200)
+
+    def test_genie_daily_has_five_pillars_and_skill_capsules_award_credits(self):
+        edition = self.client.get("/api/v1/genie-daily/editions/current")
+        self.assertEqual(edition.status_code, 200, edition.text)
+        self.assertEqual(
+            [pillar["pillar"] for pillar in edition.json()["pillars"]],
+            ["Knowledge", "Work & Goals", "Decisions", "Lessons", "Community & Creativity"],
+        )
+
+        created = self.client.post(
+            "/api/skills/capsules",
+            json={
+                "skill_id": "skill_capsule_builder",
+                "title": "Practice a concise plan",
+                "objective": "Draft a three-step plan for a real task.",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        capsule_id = created.json()["capsule"]["id"]
+        completed = self.client.post(f"/api/skills/capsules/{capsule_id}/complete")
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["credits_awarded"], 10)
+        self.assertEqual(completed.json()["time_credits"], 10)
+        duplicate = self.client.post(f"/api/skills/capsules/{capsule_id}/complete")
+        self.assertEqual(duplicate.status_code, 409)
+        capsules = self.client.get("/api/skills/capsules")
+        self.assertEqual(capsules.json()["time_credits"], 10)
+        self.assertEqual(capsules.json()["skill_dna"][0]["completed_capsules"], 1)
 
     def test_private_ai_chat_omits_prior_history_from_inference(self):
-        with patch.object(main.agent_router, "chat", return_value="Private answer") as provider:
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Private answer", "pool-test"),
+        ) as provider:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -98,7 +216,7 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["reply"], "Private answer")
-        inference_messages = provider.call_args.args[0]
+        inference_messages = provider.await_args.args[0]
         self.assertEqual(inference_messages[-1]["content"], "Analyze this private request carefully.")
         self.assertNotIn("Earlier room-visible question", str(inference_messages))
         self.assertNotIn("Earlier room-visible answer", str(inference_messages))
@@ -130,7 +248,12 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["tokens_burned"], 0)
 
     def test_chat_accepts_tier_history_and_room_mode(self):
-        with patch.object(main.agent_router, "chat", return_value="Context-aware answer") as provider:
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Context-aware answer", "pool-test"),
+        ) as provider:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -150,8 +273,8 @@ class BackendApiTests(unittest.TestCase):
             response.json()["sub_agents"],
             ["Coordinator Agent", "Context & Memory Agent", "Execution Agent"],
         )
-        provider.assert_called_once()
-        prompt = provider.call_args.args[0]
+        provider.assert_awaited_once()
+        prompt = provider.await_args.args[0]
         self.assertEqual(prompt[0]["role"], "system")
         self.assertIn("Current date and time:", prompt[0]["content"])
         self.assertRegex(
@@ -159,18 +282,16 @@ class BackendApiTests(unittest.TestCase):
             r"Current date and time: [A-Z][a-z]+, \d{2} [A-Z][a-z]+ \d{4}, \d{2}:\d{2} (?:AM|PM) IST\.",
         )
         self.assertIn("This is a shared-room request.", prompt[0]["content"])
-        self.assertEqual(prompt[1]["sender"], "Raja")
+        self.assertEqual(prompt[1]["content"], "Raja: We are designing a shared application.")
         self.assertEqual(prompt[-1]["content"], "Explain how to preserve conversation context in a team workflow.")
 
     def test_chat_falls_back_to_multi_provider_pool(self):
-        with (
-            patch.object(main.agent_router, "chat", side_effect=RuntimeError("router unavailable")),
-            patch.object(
-                main.multi_provider_pool,
-                "chat",
-                return_value="Fallback provider answer",
-            ) as fallback,
-        ):
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Fallback provider answer", "pool-fallback"),
+        ) as fallback:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -182,18 +303,16 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["reply"], "Fallback provider answer")
         self.assertEqual(response.json()["sub_agents"], ["Execution Agent"])
-        fallback.assert_called_once()
-        self.assertIn("Current date and time:", fallback.call_args.args[0][0]["content"])
+        fallback.assert_awaited_once()
+        self.assertIn("Current date and time:", fallback.await_args.args[0][0]["content"])
 
     def test_chat_waterfall_continues_after_unexpected_provider_exception(self):
-        with (
-            patch.object(main.agent_router, "chat", side_effect=ValueError("malformed provider response")),
-            patch.object(
-                main.multi_provider_pool,
-                "chat",
-                return_value="Recovered live AI answer",
-            ) as fallback,
-        ):
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Recovered live AI answer", "pool-recovered"),
+        ) as fallback:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -204,12 +323,14 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["reply"], "Recovered live AI answer")
-        fallback.assert_called_once()
+        fallback.assert_awaited_once()
 
     def test_chat_provider_exhaustion_returns_transparent_fallback_and_refunds(self):
-        with (
-            patch.object(main.agent_router, "chat", side_effect=ValueError("invalid provider output")),
-            patch.object(main.multi_provider_pool, "chat", side_effect=TypeError("provider transport error")),
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("provider waterfall exhausted"),
         ):
             response = self.client.post(
                 "/api/chat",
@@ -234,8 +355,14 @@ class BackendApiTests(unittest.TestCase):
 
     def test_stream_provider_exhaustion_returns_transparent_fallback(self):
         with (
-            patch.object(main.agent_router, "chat", side_effect=ValueError("invalid provider output")),
-            patch.object(main.multi_provider_pool, "chat", side_effect=TypeError("provider transport error")),
+            patch.object(
+                main.multi_pool_router,
+                "complete",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("provider waterfall exhausted"),
+            ),
+            patch.object(main, "_get_general_cache", return_value=None),
+            patch.object(main, "_set_general_cache"),
         ):
             response = self.client.post(
                 "/api/chat/stream",
@@ -263,7 +390,12 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(routed[1], {"role": "user", "content": "What day is it?"})
 
     def test_stream_chat_uses_tier_orchestrator_and_reports_agents(self):
-        with patch.object(main.agent_router, "chat", return_value="Streamed orchestrated answer") as provider:
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Streamed orchestrated answer", "pool-test"),
+        ) as provider:
             response = self.client.post(
                 "/api/chat/stream",
                 json={
@@ -276,7 +408,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn('"sub_agents": ["Coordinator Agent", "Context & Memory Agent", "Execution Agent"]', response.text)
         self.assertIn('"text": "Streamed orchestrated answer"', response.text)
-        prompt = provider.call_args.args[0]
+        prompt = provider.await_args.args[0]
         self.assertIn("Current date and time:", prompt[0]["content"])
         self.assertIn("This is a shared-room request.", prompt[0]["content"])
 
@@ -343,7 +475,12 @@ class BackendApiTests(unittest.TestCase):
 
     def test_chat_uses_primary_provider_by_default(self):
         with (
-            patch.object(main.agent_router, "chat", return_value="Synthesis") as provider,
+            patch.object(
+                main.multi_pool_router,
+                "complete",
+                new_callable=AsyncMock,
+                return_value=("Synthesis", "pool-primary"),
+            ) as provider,
             patch.object(main.multi_provider_pool, "chat") as legacy_provider,
             patch.object(main.gemini_pool, "chat") as gemini,
             patch.object(main, "_get_general_cache", return_value=None),
@@ -362,7 +499,7 @@ class BackendApiTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["reply"], "Synthesis")
-        provider.assert_called_once()
+        provider.assert_awaited_once()
         legacy_provider.assert_not_called()
         gemini.assert_not_called()
         with patch.object(
@@ -381,9 +518,10 @@ class BackendApiTests(unittest.TestCase):
     def test_chat_returns_local_fallback_when_all_providers_fail(self):
         with (
             patch.object(
-                main.agent_router,
-                "chat",
-                side_effect=RuntimeError("All configured AI providers failed."),
+                main.multi_pool_router,
+                "complete",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Provider waterfall exhausted."),
             ),
             patch.object(main, "_get_general_cache", return_value=None),
             patch.object(main, "_set_general_cache"),
@@ -409,7 +547,15 @@ class BackendApiTests(unittest.TestCase):
         main.gemini_pool.set_telemetry_gemini_pool(True)
         with (
             patch.object(main.gemini_pool, "chat", return_value="Gemini response") as gemini,
-            patch.object(main.agent_router, "chat", return_value="Primary response") as primary,
+            patch.object(
+                main.multi_pool_router,
+                "complete",
+                new_callable=AsyncMock,
+                side_effect=[
+                    ("Primary response", "pool-primary"),
+                    ("Orchestrated response", "pool-orchestrated"),
+                ],
+            ) as primary,
             patch.object(main, "_get_general_cache", return_value=None),
             patch.object(main, "_set_general_cache"),
             patch.object(main, "_charge_user_tokens", return_value="test-charge"),
@@ -430,9 +576,9 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(simple_response.status_code, 200, simple_response.text)
         self.assertEqual(simple_response.json()["reply"], "Primary response")
         self.assertEqual(complex_response.status_code, 200, complex_response.text)
-        self.assertEqual(complex_response.json()["reply"], "Gemini response")
-        self.assertEqual(gemini.call_count, 1)
-        self.assertEqual(primary.call_count, 1)
+        self.assertEqual(complex_response.json()["reply"], "Orchestrated response")
+        self.assertEqual(gemini.call_count, 0)
+        self.assertEqual(primary.await_count, 2)
 
     def test_gemini_pool_toggle_requires_genesis_admin_session(self):
         denied = self.client.post(
@@ -516,7 +662,10 @@ class BackendApiTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(stored["ciphertext"], encrypted_payload)
         self.assertEqual(stored["is_secret"], 1)
-        with patch.object(main.gemini_pool, "silent_pro_summarize", side_effect=AssertionError("summary called")):
+        with (
+            patch.object(main, "_master_access", return_value=True),
+            patch.object(main.gemini_pool, "silent_pro_summarize", side_effect=AssertionError("summary called")),
+        ):
             review = self.client.post(
                 f"/api/rooms/{room_id}/messages/{message_id}/review",
                 json={"context": [{"role": "user", "content": "ordinary"}]},
@@ -596,8 +745,9 @@ class BackendApiTests(unittest.TestCase):
             )
             connection.commit()
         with (
-            patch.object(main.gemini_pool, "silent_pro_summarize", return_value="summary") as summarize,
-            patch.object(main.gemini_pool, "chat", return_value="review reply") as master,
+            patch.object(main, "_master_access", return_value=True),
+            patch.object(main.multi_provider_pool, "chat", return_value="summary") as summarize,
+            patch.object(main.agent_router, "chat", return_value="review reply") as master,
         ):
             response = self.client.post(
                 f"/api/rooms/{room_id}/messages/{message_id}/review",
@@ -615,7 +765,9 @@ class BackendApiTests(unittest.TestCase):
         summary_context = summarize.call_args.args[0]
         self.assertEqual(len(summary_context), 1)
         self.assertNotIn(SECRET_MARKER, summary_context[0]["content"])
-        master.assert_called_once()
+        self.assertEqual(master.call_count, 4)
+        self.assertIn("Planner Agent", master.call_args_list[0].args[0][0]["content"])
+        self.assertIn("Critic Agent", master.call_args_list[-1].args[0][0]["content"])
         with closing(main.database()) as connection:
             row = connection.execute(
                 """
@@ -765,9 +917,18 @@ class BackendApiTests(unittest.TestCase):
                 ],
             )
             connection.commit()
-        pending = self.client.post("/api/social/requests", json={"email": receiver["email"]})
+        with patch.object(main.room_hub, "send_user_event", new_callable=AsyncMock) as notification:
+            pending = self.client.post("/api/social/requests", json={"email": receiver["email"]})
         self.assertEqual(pending.status_code, 200, pending.text)
         request_id = pending.json()["id"]
+        notification.assert_awaited_once()
+        self.assertEqual(notification.await_args.args[0], receiver["sub"])
+        self.assertEqual(notification.await_args.args[1]["type"], "friend_request_received")
+        self.assertEqual(notification.await_args.args[1]["sender"]["id"], self.actor["sub"])
+        self.assertEqual(
+            self.client.post(f"/api/social/requests/{request_id}/accept", json={}).status_code,
+            403,
+        )
         main.app.dependency_overrides[main.current_identity] = lambda: receiver
         self.assertEqual(self.client.get("/api/social/requests").json()[0]["id"], request_id)
         accepted = self.client.post(f"/api/social/requests/{request_id}/accept", json={})

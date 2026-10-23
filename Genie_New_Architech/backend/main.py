@@ -37,6 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from dotenv import load_dotenv
+from email.utils import parseaddr
 
 BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(BACKEND_DIR / ".env", override=False)
@@ -56,6 +57,7 @@ if __package__:
         passcode_hash,
         verify_passcode,
     )
+    from .orchestrator import master_brain, multi_pool_router, skill_registry
     from .security import (
         SUPER_ADMIN_EMAIL,
         is_zero_knowledge_secret,
@@ -81,6 +83,7 @@ else:
         passcode_hash,
         verify_passcode,
     )
+    from orchestrator import master_brain, multi_pool_router, skill_registry
     from security import (
         SUPER_ADMIN_EMAIL,
         is_zero_knowledge_secret,
@@ -103,6 +106,15 @@ GENIE_SESSION_SIGNING_KEY = os.getenv("GENIE_SESSION_SIGNING_KEY", "")
 WEBAUTHN_RP_ID = os.getenv("GENIE_WEBAUTHN_RP_ID", "localhost").strip()
 WEBAUTHN_RP_NAME = os.getenv("GENIE_WEBAUTHN_RP_NAME", "Personal AI Genie").strip()
 WEBAUTHN_ORIGIN = os.getenv("GENIE_WEBAUTHN_ORIGIN", "http://localhost:3000").strip()
+WEBAUTHN_ALLOWED_ORIGINS = {
+    value.strip().rstrip("/")
+    for value in os.getenv(
+        "GENIE_WEBAUTHN_ALLOWED_ORIGINS",
+        "https://personalaigenie.pages.dev,https://personalaigenie.eu.org,http://localhost:3000,http://localhost:3001",
+    ).split(",")
+    if value.strip()
+}
+MAX_MEMBERS = 5
 
 
 def utc_now() -> str:
@@ -280,7 +292,9 @@ def initialize_database() -> None:
                 name TEXT NOT NULL,
                 owner_sub TEXT NOT NULL,
                 invite_hash TEXT NOT NULL UNIQUE,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                group_slot INTEGER,
+                auto_saved INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS room_members (
                 room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -352,6 +366,8 @@ def initialize_database() -> None:
                 public_key BLOB NOT NULL,
                 sign_count INTEGER NOT NULL DEFAULT 0,
                 transports TEXT NOT NULL DEFAULT '[]',
+                rp_id TEXT,
+                origin TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS passkey_challenges (
@@ -359,6 +375,8 @@ def initialize_database() -> None:
                 user_sub TEXT NOT NULL,
                 challenge BLOB NOT NULL,
                 purpose TEXT NOT NULL,
+                rp_id TEXT,
+                origin TEXT,
                 expires_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS users (
@@ -409,6 +427,62 @@ def initialize_database() -> None:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_sub, phone_hash)
             );
+            CREATE TABLE IF NOT EXISTS library_items (
+                id TEXT PRIMARY KEY,
+                owner_sub TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                item_type TEXT NOT NULL CHECK(item_type IN (
+                    'prompt', 'article', 'code', 'game', 'thread', 'social_embed',
+                    'goal', 'project', 'decision', 'lesson', 'skill_capsule', 'memory_node'
+                )),
+                visibility TEXT NOT NULL CHECK(visibility IN ('private', 'room', 'friends', 'public')),
+                room_id TEXT,
+                related_item_ids TEXT NOT NULL DEFAULT '[]',
+                provenance TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'ready' CHECK(status IN ('pending_approval', 'ready')),
+                read_at TEXT,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_library_owner_created
+                ON library_items(owner_sub, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_library_visibility
+                ON library_items(visibility, status, revoked_at);
+            CREATE TABLE IF NOT EXISTS memory_approvals (
+                token_id TEXT PRIMARY KEY,
+                owner_sub TEXT NOT NULL,
+                item_id TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+                approved_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS skill_capsules (
+                id TEXT PRIMARY KEY,
+                user_sub TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                objective TEXT NOT NULL,
+                duration_minutes INTEGER NOT NULL DEFAULT 10,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'completed', 'expired')),
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_skill_capsules_user
+                ON skill_capsules(user_sub, created_at DESC);
+            CREATE TABLE IF NOT EXISTS time_credit_ledger (
+                id TEXT PRIMARY KEY,
+                user_sub TEXT NOT NULL,
+                capsule_id TEXT NOT NULL UNIQUE REFERENCES skill_capsules(id) ON DELETE CASCADE,
+                amount INTEGER NOT NULL CHECK(amount = 10),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS skill_dna (
+                user_sub TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                completed_capsules INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_sub, skill_id)
+            );
             """
         )
         user_columns = connection.execute("PRAGMA table_info(users)").fetchall()
@@ -440,6 +514,35 @@ def initialize_database() -> None:
         }
         if "review_ciphertext" not in message_columns:
             connection.execute("ALTER TABLE room_messages ADD COLUMN review_ciphertext TEXT")
+        room_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(rooms)").fetchall()
+        }
+        if "group_slot" not in room_columns:
+            connection.execute("ALTER TABLE rooms ADD COLUMN group_slot INTEGER")
+        if "auto_saved" not in room_columns:
+            connection.execute(
+                "ALTER TABLE rooms ADD COLUMN auto_saved INTEGER NOT NULL DEFAULT 0"
+            )
+        passkey_challenge_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(passkey_challenges)").fetchall()
+        }
+        passkey_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(passkeys)").fetchall()
+        }
+        if "rp_id" not in passkey_columns:
+            connection.execute("ALTER TABLE passkeys ADD COLUMN rp_id TEXT")
+        if "origin" not in passkey_columns:
+            connection.execute("ALTER TABLE passkeys ADD COLUMN origin TEXT")
+        if "rp_id" not in passkey_challenge_columns:
+            connection.execute("ALTER TABLE passkey_challenges ADD COLUMN rp_id TEXT")
+        if "origin" not in passkey_challenge_columns:
+            connection.execute("ALTER TABLE passkey_challenges ADD COLUMN origin TEXT")
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_owner_group_slot
+            ON rooms(owner_sub, group_slot) WHERE group_slot IS NOT NULL
+            """
+        )
         connection.execute(
             """
             INSERT OR IGNORE INTO system_config(config_key, config_value, updated_at)
@@ -571,6 +674,7 @@ class ChatRequest(StrictModel):
     room_id: str | None = Field(default=None, max_length=100)
     room_mode: bool = False
     chat_mode: Literal["ai_room", "friends_only", "private_ai"] = "ai_room"
+    future_self_mode: bool = False
 
     @model_validator(mode="after")
     def validate_chat_input(self) -> ChatRequest:
@@ -599,6 +703,7 @@ class OverflowDecision(StrictModel):
 class RoomCreate(StrictModel):
     name: str = Field(min_length=1, max_length=80)
     invite_code: str = Field(min_length=32, max_length=128)
+    group_slot: int | None = Field(default=None, ge=1, le=5)
     passcode: str | None = Field(default=None, pattern="^[0-9]{6}$")
     max_uses: int = Field(default=20, ge=1, le=100)
 
@@ -634,18 +739,66 @@ class InlinePushReply(StrictModel):
 class RoomInviteIssuance(StrictModel):
     invitee_username: str = Field(default="", max_length=80)
     replace_invite_code: str = Field(min_length=32, max_length=128)
-    max_uses: int = Field(default=1, ge=1, le=1)
+    custom_invite_code: str | None = Field(default=None, min_length=32, max_length=128)
+    max_uses: int = Field(default=4, ge=1, le=MAX_MEMBERS)
     passcode: str | None = Field(default=None, pattern="^[0-9]{6}$")
     expires_in_hours: int | None = Field(default=72, ge=1, le=720)
 
 
 class FriendRequest(StrictModel):
-    username: str = Field(min_length=2, max_length=33, pattern="^@?[A-Za-z0-9_]{2,32}$")
+    username: str | None = Field(default=None, min_length=2, max_length=33, pattern="^@?[A-Za-z0-9_]{2,32}$")
+    email: str | None = Field(default=None, min_length=3, max_length=254)
     attest_personal: bool = False
+
+    @model_validator(mode="after")
+    def validate_recipient(self) -> FriendRequest:
+        if bool(self.username) == bool(self.email):
+            raise ValueError("Provide exactly one recipient username or email.")
+        if self.email:
+            address = parseaddr(self.email.strip())[1]
+            if address != self.email.strip() or "@" not in address or "." not in address.rsplit("@", 1)[-1]:
+                raise ValueError("Provide a valid email address.")
+        return self
 
 
 class FriendAcceptance(StrictModel):
     attest_personal: bool = False
+
+
+class LibraryItemCreate(StrictModel):
+    title: str = Field(min_length=1, max_length=200)
+    content: str = Field(default="", max_length=100_000)
+    item_type: Literal[
+        "prompt", "article", "code", "game", "thread", "social_embed", "goal",
+        "project", "decision", "lesson", "skill_capsule", "memory_node",
+    ] = "thread"
+    visibility: Literal["private", "room", "friends", "public"] = "private"
+    room_id: str | None = Field(default=None, max_length=100)
+    related_item_ids: list[str] = Field(default_factory=list, max_length=50)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["pending_approval", "ready"] = "ready"
+
+
+class MemoryApprovalRequest(StrictModel):
+    pending_action_token: str = Field(min_length=20, max_length=4096)
+
+
+class GroundedLibraryAsk(StrictModel):
+    question: str = Field(min_length=1, max_length=12_000)
+    action: Literal["ask", "summarize", "translate", "explain"] = "ask"
+    language: str = Field(default="en", min_length=2, max_length=32)
+    item_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
+class LibraryTrustAction(StrictModel):
+    action: Literal["revoke_share", "delete", "export"]
+    item_id: str | None = Field(default=None, max_length=100)
+
+
+class SkillCapsuleCreate(StrictModel):
+    skill_id: str = Field(min_length=2, max_length=80)
+    title: str | None = Field(default=None, max_length=200)
+    objective: str = Field(min_length=1, max_length=4000)
 
 
 class ProfilePreferences(StrictModel):
@@ -714,6 +867,12 @@ class SpeechRequest(StrictModel):
     text: str = Field(min_length=1, max_length=12_000)
     dialect: str = Field(default="en-IN", max_length=16)
     model: str = Field(default="genie-assistant", pattern="^(genie-assistant|genie-master)$")
+
+
+class VoiceTranscriptionRequest(StrictModel):
+    audio_base64: str = Field(min_length=1, max_length=12_000_000)
+    mime_type: str = Field(default="audio/webm", pattern="^audio/[A-Za-z0-9.+-]+$")
+    dialect: str = Field(default="en-IN", max_length=16)
 
 
 class PhoneRegistration(StrictModel):
@@ -1093,6 +1252,7 @@ def requires_master_model(request: ChatRequest) -> bool:
     if (
         request.model == "genie-master"
         or request.model_tier == "genie-master"
+        or request.future_self_mode
         or request.thinking_level == "deep"
     ):
         return True
@@ -1736,6 +1896,45 @@ async def register_phone(
     return {"registered": True}
 
 
+@app.post("/api/social/metasync")
+async def discover_mutual_phone_contacts(
+    request: MetaSyncRequest,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    hashes = list(dict.fromkeys(metasync_phone_hash(phone) for phone in request.phone_numbers))
+    with closing(database()) as connection:
+        current = connection.execute(
+            "SELECT phone_hash FROM users WHERE user_sub = ?", (identity["sub"],)
+        ).fetchone()
+        if not current or not current["phone_hash"]:
+            raise HTTPException(status_code=409, detail="Register your phone before discovering mutual contacts.")
+        timestamp = utc_now()
+        connection.executemany(
+            """
+            INSERT INTO metasync_contacts(user_sub, phone_hash, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_sub, phone_hash) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            [(identity["sub"], phone_hash, timestamp) for phone_hash in hashes],
+        )
+        placeholders = ",".join("?" for _ in hashes)
+        rows = connection.execute(
+            f"""
+            SELECT u.user_sub, u.user_name, u.username
+            FROM users u
+            WHERE u.user_sub != ? AND u.phone_hash IN ({placeholders})
+              AND EXISTS (
+                SELECT 1 FROM metasync_contacts c
+                WHERE c.user_sub = u.user_sub AND c.phone_hash = ?
+              )
+            ORDER BY u.user_name COLLATE NOCASE
+            """,
+            (identity["sub"], *hashes, current["phone_hash"]),
+        ).fetchall()
+        connection.commit()
+    return [dict(row) for row in rows]
+
+
 @app.post("/api/py/chat")
 @app.post("/api/chat")
 async def chat(
@@ -1838,10 +2037,16 @@ async def chat(
             },
         ) from error
     try:
-        use_free_pool = telemetry_gemini_route_enabled()
-        reply = await asyncio.to_thread(
-            agentic_gemini_reply, request, messages, identity,
-            use_free_pool=use_free_pool,
+        tier = request.model_tier or (
+            "genie-master" if request.model == "genie-master" else request.model
+        )
+        brain_result = await master_brain.run(
+            messages,
+            user_sub=identity["sub"],
+            model_tier=tier,
+            future_self=request.future_self_mode,
+            room_mode=request.room_mode,
+            max_tokens=4096,
         )
     except Exception as error:
         _refund_user_tokens(identity["sub"], cost, room_id=request.room_id, created_at=charged_at)
@@ -1856,13 +2061,19 @@ async def chat(
             "source": "local-fallback",
             "provider_status": "unavailable",
             "sub_agents": [],
+            "proposed_memory": None,
+            "verified": False,
         }
+    reply = brain_result["reply"]
     _set_general_cache(cache_key, reply)
     return {
         "reply": reply,
         "tick_status": "read_no_ai",
         "tokens_burned": cost,
-        "sub_agents": agent_names_for_request(request),
+        "sub_agents": brain_result["sub_agents"],
+        "source": brain_result["source"],
+        "verified": brain_result.get("verified", True),
+        "proposed_memory": brain_result.get("proposed_memory"),
     }
 
 
@@ -1967,21 +2178,24 @@ async def chat_stream(
             },
         ) from error
 
-    use_free_pool = telemetry_gemini_route_enabled()
-
     async def events():
         try:
-            reply = await asyncio.to_thread(
-                agentic_gemini_reply,
-                request,
+            tier = request.model_tier or (
+                "genie-master" if request.model == "genie-master" else request.model
+            )
+            result = await master_brain.run(
                 messages,
-                identity,
-                use_free_pool=use_free_pool,
+                user_sub=identity["sub"],
+                model_tier=tier,
+                future_self=request.future_self_mode,
+                room_mode=request.room_mode,
+                max_tokens=4096,
             )
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps({'sub_agents': agent_names_for_request(request)})}\n\n"
+                f"{json.dumps({'sub_agents': result['sub_agents'], 'source': result['source'], 'proposed_memory': result.get('proposed_memory')})}\n\n"
             )
+            reply = result["reply"]
             yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
             _set_general_cache(cache_key, reply)
             yield "event: done\ndata: {}\n\n"
@@ -2084,6 +2298,116 @@ async def text_to_speech(
     return {"audio_base64": base64.b64encode(audio).decode("ascii"), "mime_type": "audio/mpeg"}
 
 
+@app.post("/api/voice/tts")
+async def voice_text_to_speech(
+    request: SpeechRequest,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    voices = {
+        "ta-IN": "ta-IN-PallaviNeural",
+        "ml-IN": "ml-IN-SobhanaNeural",
+        "te-IN": "te-IN-ShrutiNeural",
+        "kn-IN": "kn-IN-SapnaNeural",
+        "hi-IN": "hi-IN-SwaraNeural",
+        "bn-IN": "bn-IN-TanishaaNeural",
+        "mr-IN": "mr-IN-AarohiNeural",
+        "gu-IN": "gu-IN-DhwaniNeural",
+        "pa-IN": "pa-IN-VaaniNeural",
+        "en-IN": "en-IN-NeerjaNeural",
+        "Tanglish": "en-IN-NeerjaNeural",
+    }
+    voice = voices.get(request.dialect)
+    if not voice:
+        raise HTTPException(status_code=422, detail="Unsupported speech dialect.")
+    if request.model == "genie-master" and not _master_access(identity):
+        raise HTTPException(status_code=403, detail="Genie Master voice is available to the admin and active VIP passes.")
+    try:
+        import edge_tts
+
+        communicator = edge_tts.Communicate(request.text, voice)
+        audio = bytearray()
+        async for chunk in communicator.stream():
+            if chunk.get("type") == "audio":
+                audio.extend(chunk["data"])
+        if not audio:
+            raise RuntimeError("The speech provider returned no audio.")
+    except Exception as edge_error:
+        LOGGER.info("Edge TTS unavailable (%s); trying the configured speech fallback.", type(edge_error).__name__)
+        language = request.dialect.split("-", 1)[0]
+        if request.dialect == "Tanglish":
+            language = "en"
+        try:
+            try:
+                from .modules.linguist_tts.gtts_streamer import speech_mp3
+            except ImportError:
+                from modules.linguist_tts.gtts_streamer import speech_mp3
+            audio = bytearray(await asyncio.to_thread(speech_mp3, request.text, language))
+        except Exception as fallback_error:
+            LOGGER.warning("Voice TTS providers failed (%s)", type(fallback_error).__name__)
+            raise HTTPException(status_code=502, detail="Speech synthesis providers are unavailable.") from fallback_error
+    return StreamingResponse(io.BytesIO(bytes(audio)), media_type="audio/mpeg")
+
+
+@app.post("/api/voice/stt")
+async def speech_to_text(
+    request: VoiceTranscriptionRequest,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    del identity
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Speech transcription is not configured.")
+    try:
+        audio = base64.b64decode(request.audio_base64, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HTTPException(status_code=422, detail="The recorded audio payload is invalid.") from error
+    if not audio or len(audio) > 8_000_000:
+        raise HTTPException(status_code=413, detail="Voice recordings must be 8 MB or smaller.")
+    language = {
+        "en-IN": "en", "Tanglish": "en", "ta-IN": "ta", "ml-IN": "ml",
+        "hi-IN": "hi", "te-IN": "te",
+    }.get(request.dialect)
+    if not language:
+        raise HTTPException(status_code=422, detail="The selected transcription dialect is unsupported.")
+
+    boundary = f"----GenieVoice{secrets.token_hex(16)}"
+    fields = [
+        ("model", "whisper-large-v3-turbo"),
+        ("language", language),
+        ("response_format", "json"),
+    ]
+    body = bytearray()
+    for name, value in fields:
+        body.extend(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+        )
+    body.extend(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice-note\"\r\n"
+        f"Content-Type: {request.mime_type}\r\n\r\n".encode()
+    )
+    body.extend(audio)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    outbound = UrlRequest(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=bytes(body),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(outbound, timeout=45) as response:
+            payload = json.loads(response.read())
+        transcript = payload.get("text")
+        if not isinstance(transcript, str) or not transcript.strip():
+            raise ValueError("The speech provider returned no transcript.")
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as error:
+        LOGGER.warning("Voice transcription failed (%s)", type(error).__name__)
+        raise HTTPException(status_code=502, detail="Speech transcription provider request failed.") from error
+    return {"text": transcript.strip(), "model": "whisper-large-v3-turbo"}
+
+
 def native_gemini_speech(
     request: SpeechRequest, identity: dict[str, str]
 ) -> bytes | None:
@@ -2160,10 +2484,25 @@ async def create_room(
     timestamp = utc_now()
     with closing(database()) as connection:
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            "INSERT INTO rooms(id, name, owner_sub, invite_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-            (room_id, request.name.strip(), identity["sub"], invite_hash, timestamp),
-        )
+        try:
+            connection.execute(
+                """
+                INSERT INTO rooms(id, name, owner_sub, invite_hash, created_at, group_slot)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    room_id, request.name.strip(), identity["sub"], invite_hash,
+                    timestamp, request.group_slot,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            connection.rollback()
+            if request.group_slot is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Group {request.group_slot} already exists for this account.",
+                ) from error
+            raise
         connection.execute(
             "INSERT INTO room_members(room_id, user_sub, user_name, joined_at) VALUES (?, ?, ?, ?)",
             (room_id, identity["sub"], identity["name"], timestamp),
@@ -2192,6 +2531,8 @@ async def create_room(
         "owner_sub": identity["sub"],
         "voice_dialect": "en-IN",
         "created_at": timestamp,
+        "group_slot": request.group_slot,
+        "auto_saved": False,
     }
 
 
@@ -2201,6 +2542,7 @@ async def list_rooms(identity: dict[str, str] = Depends(current_identity)):
         rows = connection.execute(
             """
             SELECT r.id, r.name, r.owner_sub, r.voice_dialect, r.created_at,
+                   r.group_slot, r.auto_saved,
                    (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count
             FROM rooms r JOIN room_members m ON m.room_id = r.id
             WHERE m.user_sub = ? ORDER BY r.created_at DESC LIMIT 100
@@ -2223,7 +2565,12 @@ async def issue_room_invite(
         if re.fullmatch(r"[A-Za-z0-9_]{2,32}", requested_username)
         else ""
     )
-    invite_code = secrets.token_urlsafe(32)
+    invite_code = request.custom_invite_code or secrets.token_urlsafe(32)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", invite_code):
+        raise HTTPException(
+            status_code=422,
+            detail="Custom invite codes may contain only letters, numbers, hyphens, or underscores.",
+        )
     invite_passcode = request.passcode or create_passcode()
     invite_id = str(uuid.uuid4())
     timestamp = utc_now()
@@ -2240,8 +2587,11 @@ async def issue_room_invite(
             "SELECT COUNT(*) FROM room_members WHERE room_id = ?",
             (room_id,),
         ).fetchone()[0]
-        if member_count >= 5:
-            raise HTTPException(status_code=409, detail="This room has reached its five-member limit.")
+        if member_count >= MAX_MEMBERS:
+            raise HTTPException(
+                status_code=409,
+                detail="🔒 This group chat is full (5/5 members).",
+            )
         invitee = connection.execute(
             "SELECT user_sub FROM users WHERE username = ?",
             (invitee_username,),
@@ -2260,6 +2610,15 @@ async def issue_room_invite(
         ).fetchone()
         if not previous:
             raise HTTPException(status_code=409, detail="The current room invite could not be rotated.")
+        new_invite_hash = hashlib.sha256(invite_code.encode("utf-8")).hexdigest()
+        if (
+            connection.execute("SELECT 1 FROM rooms WHERE invite_hash = ?", (new_invite_hash,)).fetchone()
+            or connection.execute(
+                "SELECT 1 FROM room_invites WHERE invite_hash = ? AND revoked_at IS NULL",
+                (new_invite_hash,),
+            ).fetchone()
+        ):
+            raise HTTPException(status_code=409, detail="That invite token is already in use.")
         if previous["created_by"] == identity["sub"]:
             connection.execute(
                 """
@@ -2287,9 +2646,9 @@ async def issue_room_invite(
             """,
             (
                 invite_id, room_id,
-                hashlib.sha256(invite_code.encode("utf-8")).hexdigest(),
+                new_invite_hash,
                 f"{salt.hex()}:{passcode_hash(invite_passcode, salt)}",
-                1, expiry_iso, identity["sub"], timestamp, invitee_username,
+                request.max_uses, expiry_iso, identity["sub"], timestamp, invitee_username,
             ),
         )
         connection.commit()
@@ -2313,7 +2672,7 @@ async def join_room(
         connection.execute("BEGIN IMMEDIATE")
         room = connection.execute(
             """
-            SELECT r.id, r.name, r.owner_sub, r.voice_dialect FROM rooms r
+            SELECT r.id, r.name, r.owner_sub, r.voice_dialect, r.group_slot FROM rooms r
             WHERE r.invite_hash = ? OR EXISTS (
                 SELECT 1 FROM room_invites i WHERE i.room_id = r.id AND i.invite_hash = ?
             )
@@ -2340,9 +2699,12 @@ async def join_room(
                 "SELECT COUNT(*) FROM room_members WHERE room_id = ?",
                 (room["id"],),
             ).fetchone()[0]
-            if member_count >= 5:
+            if member_count >= MAX_MEMBERS:
                 connection.rollback()
-                raise HTTPException(status_code=409, detail="This room has reached its five-member limit.")
+                raise HTTPException(
+                    status_code=409,
+                    detail="🔒 This group chat is full (5/5 members).",
+                )
         if protected_invite and not already_member:
             invitee_username = protected_invite["invitee_username"]
             if invitee_username and ensure_public_username(connection, identity["sub"]).casefold() != invitee_username:
@@ -2385,12 +2747,24 @@ async def join_room(
             "INSERT OR IGNORE INTO room_members(room_id, user_sub, user_name, joined_at) VALUES (?, ?, ?, ?)",
             (room["id"], identity["sub"], identity["name"], timestamp),
         )
+        member_count = connection.execute(
+            "SELECT COUNT(*) FROM room_members WHERE room_id = ?",
+            (room["id"],),
+        ).fetchone()[0]
+        if member_count >= 2:
+            connection.execute(
+                "UPDATE rooms SET auto_saved = 1 WHERE id = ?",
+                (room["id"],),
+            )
         connection.commit()
     return {
         "id": room["id"],
         "name": room["name"],
         "owner_sub": room["owner_sub"],
         "voice_dialect": room["voice_dialect"],
+        "group_slot": room["group_slot"],
+        "member_count": member_count,
+        "auto_saved": member_count >= 2,
     }
 
 
@@ -2865,10 +3239,26 @@ async def list_friend_requests(identity: dict[str, str] = Depends(current_identi
     with closing(database()) as connection:
         rows = connection.execute(
             """
-            SELECT f.id, f.sender_sub, u.user_name AS sender_name,
+            SELECT f.id, f.sender_sub, f.receiver_sub, u.user_name AS sender_name,
                    u.username AS sender_username, f.created_at
             FROM friend_requests f JOIN users u ON u.user_sub = f.sender_sub
             WHERE f.receiver_sub = ? AND f.status = 'pending'
+            ORDER BY f.created_at DESC LIMIT 100
+            """,
+            (identity["sub"],),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/social/requests/outgoing")
+async def list_outgoing_friend_requests(identity: dict[str, str] = Depends(current_identity)):
+    with closing(database()) as connection:
+        rows = connection.execute(
+            """
+            SELECT f.id, f.sender_sub, f.receiver_sub, u.user_name AS receiver_name,
+                   u.username AS receiver_username, f.created_at
+            FROM friend_requests f JOIN users u ON u.user_sub = f.receiver_sub
+            WHERE f.sender_sub = ? AND f.status = 'pending'
             ORDER BY f.created_at DESC LIMIT 100
             """,
             (identity["sub"],),
@@ -2935,13 +3325,19 @@ async def search_friend_directory(
 async def send_friend_request(
     request: FriendRequest, identity: dict[str, str] = Depends(current_identity)
 ):
-    username = request.username.strip().removeprefix("@").casefold()
+    if request.email:
+        recipient_filter = "lower(email) = ?"
+        recipient_value = request.email.strip().casefold()
+    else:
+        recipient_filter = "username = ?"
+        recipient_value = request.username.strip().removeprefix("@").casefold()
     with closing(database()) as connection:
         recipient = connection.execute(
-            "SELECT user_sub, geo_region_hash FROM users WHERE username = ?", (username,)
+            f"SELECT user_sub, user_name, username, email, geo_region_hash FROM users WHERE {recipient_filter}",
+            (recipient_value,),
         ).fetchone()
         if not recipient:
-            raise HTTPException(status_code=404, detail="No Genie user has that username.")
+            raise HTTPException(status_code=404, detail="No Genie user has that username or email address.")
         if recipient["user_sub"] == identity["sub"]:
             raise HTTPException(status_code=422, detail="You cannot send a friend request to yourself.")
         sender = connection.execute(
@@ -2982,6 +3378,27 @@ async def send_friend_request(
             ),
         )
         connection.commit()
+    sender_profile = {
+        "id": identity["sub"],
+        "user_sub": identity["sub"],
+        "name": identity["name"],
+        "username": None,
+    }
+    receiver_profile = {
+        "id": recipient["user_sub"],
+        "user_sub": recipient["user_sub"],
+        "name": recipient["user_name"],
+        "username": recipient["username"],
+    }
+    await room_hub.send_user_event(
+        recipient["user_sub"],
+        {
+            "type": "friend_request_received",
+            "sender": sender_profile,
+            "receiver": receiver_profile,
+            "request_id": request_id,
+        },
+    )
     return {"id": request_id, "status": "pending"}
 
 
@@ -2996,11 +3413,17 @@ async def accept_friend_request(
         request = connection.execute(
             """
             SELECT sender_sub, receiver_sub, is_cross_geo FROM friend_requests
-            WHERE id = ? AND receiver_sub = ? AND status = 'pending'
+            WHERE id = ? AND status = 'pending'
             """,
-            (request_id, identity["sub"]),
+            (request_id,),
         ).fetchone()
         if not request:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Friend request not found.")
+        if request["sender_sub"] == identity["sub"]:
+            connection.rollback()
+            raise HTTPException(status_code=403, detail="The sender cannot approve their own friend request.")
+        if request["receiver_sub"] != identity["sub"]:
             connection.rollback()
             raise HTTPException(status_code=404, detail="Friend request not found.")
         if request["is_cross_geo"] and not acceptance.attest_personal:
@@ -3046,6 +3469,24 @@ async def reject_friend_request(
     if not changed:
         raise HTTPException(status_code=404, detail="Friend request not found.")
     return {"status": "rejected"}
+
+
+@app.post("/api/social/requests/{request_id}/cancel")
+async def cancel_friend_request(
+    request_id: str, identity: dict[str, str] = Depends(current_identity)
+):
+    with closing(database()) as connection:
+        changed = connection.execute(
+            """
+            UPDATE friend_requests SET status = 'cancelled'
+            WHERE id = ? AND sender_sub = ? AND status = 'pending'
+            """,
+            (request_id, identity["sub"]),
+        ).rowcount
+        connection.commit()
+    if not changed:
+        raise HTTPException(status_code=404, detail="Outgoing friend request not found.")
+    return {"status": "cancelled"}
 
 
 @app.post("/api/rooms/{room_id}/messages/{message_id}/read")
@@ -3466,6 +3907,22 @@ class RoomSocketHub:
             except Exception:
                 await self.disconnect(room_id, user_sub, socket)
 
+    async def send_user_event(self, user_sub: str, event: dict[str, Any]) -> int:
+        async with self.lock:
+            targets = [
+                (room_id, socket)
+                for room_id, members in self.sockets.items()
+                for socket in members.get(user_sub, set()).copy()
+            ]
+        delivered = 0
+        for room_id, socket in targets:
+            try:
+                await socket.send_json(event)
+                delivered += 1
+            except Exception:
+                await self.disconnect(room_id, user_sub, socket)
+        return delivered
+
     async def relay_call(
         self, room_id: str, sender: str, recipient: str, payload: dict[str, Any]
     ) -> None:
@@ -3791,22 +4248,91 @@ def require_super_admin(identity: dict[str, str]) -> None:
         raise HTTPException(status_code=403, detail="Super administrator access required.")
 
 
-def save_challenge(user_sub: str, challenge: bytes, purpose: str) -> None:
+def webauthn_origin_context(request: Request | None) -> tuple[str, str]:
+    supplied_origin = request.headers.get("origin", "").strip().rstrip("/") if request else ""
+    if not supplied_origin:
+        origin = WEBAUTHN_ORIGIN.rstrip("/")
+        return WEBAUTHN_RP_ID, origin
+    parsed = urlsplit(supplied_origin)
+    hostname = (parsed.hostname or "").casefold().rstrip(".")
+    if (
+        parsed.scheme not in {"https", "http"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(status_code=400, detail="The passkey origin is invalid.")
+    is_loopback = hostname == "localhost"
+    if parsed.scheme != "https" and not is_loopback:
+        raise HTTPException(status_code=403, detail="Passkeys require HTTPS outside localhost.")
+    if hostname != "localhost":
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            raise HTTPException(status_code=403, detail="IP-address origins are not supported for passkeys.")
+    normalized_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    allowed = WEBAUTHN_ALLOWED_ORIGINS | {WEBAUTHN_ORIGIN.rstrip("/")}
+    if normalized_origin not in allowed:
+        raise HTTPException(status_code=403, detail="This passkey origin is not configured as trusted.")
+    return hostname, normalized_origin
+
+
+def passkey_token_signing_key() -> bytes:
+    key = (
+        os.getenv("GENIE_PASSKEY_SIGNING_KEY", "")
+        or SESSION_SIGNING_KEY
+        or ADMIN_SIGNING_KEY
+    ).encode("utf-8")
+    if len(key) < 32:
+        raise HTTPException(status_code=503, detail="Persistent passkey signing is not configured.")
+    return key
+
+
+def issue_passkey_token(user_sub: str, credential_id: bytes, rp_id: str) -> str:
+    payload = {
+        "typ": "genie_passkey",
+        "sub": user_sub,
+        "credential_id": base64.urlsafe_b64encode(credential_id).decode("ascii").rstrip("="),
+        "rp_id": rp_id,
+        "exp": int(time.time()) + 10 * 365 * 24 * 60 * 60,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = hmac.new(passkey_token_signing_key(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def save_challenge(
+    user_sub: str,
+    challenge: bytes,
+    purpose: str,
+    rp_id: str,
+    origin: str,
+) -> None:
     with closing(database()) as connection:
         connection.execute("DELETE FROM passkey_challenges WHERE expires_at < ?", (int(time.time()),))
         connection.execute(
-            "INSERT INTO passkey_challenges(id, user_sub, challenge, purpose, expires_at) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), user_sub, challenge, purpose, int(time.time()) + 300),
+            """
+            INSERT INTO passkey_challenges(id, user_sub, challenge, purpose, rp_id, origin, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), user_sub, challenge, purpose, rp_id, origin, int(time.time()) + 300),
         )
         connection.commit()
 
 
-def consume_challenge(user_sub: str, purpose: str) -> bytes:
+def consume_challenge(user_sub: str, purpose: str) -> tuple[bytes, str, str]:
     with closing(database()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             """
-            SELECT id, challenge FROM passkey_challenges
+            SELECT id, challenge, rp_id, origin FROM passkey_challenges
             WHERE user_sub = ? AND purpose = ? AND expires_at > ?
             ORDER BY expires_at DESC LIMIT 1
             """,
@@ -3815,13 +4341,21 @@ def consume_challenge(user_sub: str, purpose: str) -> bytes:
         if row:
             connection.execute("DELETE FROM passkey_challenges WHERE id = ?", (row["id"],))
             connection.commit()
-            return bytes(row["challenge"])
+            return (
+                bytes(row["challenge"]),
+                str(row["rp_id"] or WEBAUTHN_RP_ID),
+                str(row["origin"] or WEBAUTHN_ORIGIN),
+            )
         connection.rollback()
     raise HTTPException(status_code=400, detail="Passkey challenge expired or was already used.")
 
 
 @app.post("/api/auth/passkeys/enroll/options")
-async def user_passkey_enrollment_options(identity: dict[str, str] = Depends(current_identity)):
+async def user_passkey_enrollment_options(
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    rp_id, origin = webauthn_origin_context(web_request)
     (
         _,
         generate_registration_options,
@@ -3844,7 +4378,7 @@ async def user_passkey_enrollment_options(identity: dict[str, str] = Depends(cur
     if not user or not user["registration_complete"]:
         raise HTTPException(status_code=403, detail="Complete registration before adding a passkey.")
     options = generate_registration_options(
-        rp_id=WEBAUTHN_RP_ID,
+        rp_id=rp_id,
         rp_name=WEBAUTHN_RP_NAME,
         user_id=identity["sub"].encode("utf-8"),
         user_name=user["email"],
@@ -3858,21 +4392,26 @@ async def user_passkey_enrollment_options(identity: dict[str, str] = Depends(cur
             for row in existing
         ],
     )
-    save_challenge(identity["sub"], bytes(options.challenge), "user_registration")
+    save_challenge(identity["sub"], bytes(options.challenge), "user_registration", rp_id, origin)
     return JSONResponse(content=json.loads(options_to_json(options)), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/auth/passkeys/enroll/verify")
 async def user_passkey_enrollment_verify(
-    request: PasskeyCredential, identity: dict[str, str] = Depends(current_identity)
+    request: PasskeyCredential,
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
 ):
-    challenge = consume_challenge(identity["sub"], "user_registration")
+    challenge, rp_id, origin = consume_challenge(identity["sub"], "user_registration")
+    if webauthn_origin_context(web_request) != (rp_id, origin):
+        raise HTTPException(status_code=400, detail="Passkey origin changed during registration.")
+    passkey_token_signing_key()
     try:
         result = _web_authn()[3](
             credential=request.credential,
             expected_challenge=challenge,
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
             require_user_verification=True,
         )
     except Exception as error:
@@ -3885,8 +4424,8 @@ async def user_passkey_enrollment_verify(
         try:
             connection.execute(
                 """
-                INSERT INTO passkeys(credential_id, user_sub, public_key, sign_count, transports, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO passkeys(credential_id, user_sub, public_key, sign_count, transports, rp_id, origin, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result.credential_id,
@@ -3894,18 +4433,27 @@ async def user_passkey_enrollment_verify(
                     result.credential_public_key,
                     result.sign_count,
                     json.dumps(transports),
+                    rp_id,
+                    origin,
                     utc_now(),
                 ),
             )
             connection.commit()
         except sqlite3.IntegrityError as error:
             raise HTTPException(status_code=409, detail="This passkey is already registered.") from error
-    return {"registered": True}
+    return {
+        "registered": True,
+        "passkey_token": issue_passkey_token(identity["sub"], result.credential_id, rp_id),
+    }
 
 
 @app.post("/api/auth/passkeys/login/options")
-async def user_passkey_login_options(request: PasskeyLoginEmail):
+async def user_passkey_login_options(
+    request: PasskeyLoginEmail,
+    web_request: Request,
+):
     email = request.email.strip().casefold()
+    rp_id, origin = webauthn_origin_context(web_request)
     (
         generate_authentication_options,
         _,
@@ -3927,8 +4475,9 @@ async def user_passkey_login_options(request: PasskeyLoginEmail):
             SELECT p.credential_id, p.transports
             FROM passkeys p JOIN users u ON u.user_sub = p.user_sub
             WHERE u.email = ? AND u.registration_complete = 1
+              AND COALESCE(p.rp_id, ?) = ?
             """,
-            (email,),
+            (email, WEBAUTHN_RP_ID, rp_id),
         ).fetchall()
     if not user or not rows:
         raise HTTPException(status_code=404, detail="No active account passkey was found for that email.")
@@ -3940,16 +4489,16 @@ async def user_passkey_login_options(request: PasskeyLoginEmail):
         for row in rows
     ]
     options = generate_authentication_options(
-        rp_id=WEBAUTHN_RP_ID,
+        rp_id=rp_id,
         allow_credentials=credentials,
         user_verification=UserVerificationRequirement.REQUIRED,
     )
-    save_challenge(user["user_sub"], bytes(options.challenge), "user_authentication")
+    save_challenge(user["user_sub"], bytes(options.challenge), "user_authentication", rp_id, origin)
     return JSONResponse(content=json.loads(options_to_json(options)), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/auth/passkeys/login/verify")
-async def user_passkey_login_verify(request: PasskeyLoginCredential):
+async def user_passkey_login_verify(request: PasskeyLoginCredential, web_request: Request):
     email = request.email.strip().casefold()
     credential_id = request.credential.get("id")
     if not isinstance(credential_id, str):
@@ -3962,7 +4511,7 @@ async def user_passkey_login_verify(request: PasskeyLoginCredential):
         user = connection.execute(
             """
             SELECT u.user_sub, u.email, u.user_name, u.display_name, u.picture_url,
-                   u.custom_picture_data, p.public_key, p.sign_count
+                   u.custom_picture_data, p.public_key, p.sign_count, p.rp_id, p.origin
             FROM users u JOIN passkeys p ON p.user_sub = u.user_sub
             WHERE u.email = ? AND u.registration_complete = 1 AND p.credential_id = ?
             """,
@@ -3970,13 +4519,17 @@ async def user_passkey_login_verify(request: PasskeyLoginCredential):
         ).fetchone()
     if not user:
         raise HTTPException(status_code=401, detail="This passkey is not registered to an active account.")
-    challenge = consume_challenge(user["user_sub"], "user_authentication")
+    challenge, rp_id, origin = consume_challenge(user["user_sub"], "user_authentication")
+    if webauthn_origin_context(web_request) != (rp_id, origin):
+        raise HTTPException(status_code=400, detail="Passkey origin changed during authentication.")
+    if user["rp_id"] and user["rp_id"] != rp_id:
+        raise HTTPException(status_code=401, detail="This passkey belongs to a different site.")
     try:
         result = _web_authn()[2](
             credential=request.credential,
             expected_challenge=challenge,
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
             credential_public_key=bytes(user["public_key"]),
             credential_current_sign_count=user["sign_count"],
             require_user_verification=True,
@@ -4002,8 +4555,12 @@ async def user_passkey_login_verify(request: PasskeyLoginCredential):
 
 
 @app.post("/api/admin/passkeys/enroll/options")
-async def passkey_enrollment_options(identity: dict[str, str] = Depends(current_identity)):
+async def passkey_enrollment_options(
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
+):
     require_super_admin(identity)
+    rp_id, origin = webauthn_origin_context(web_request)
     (
         _,
         generate_registration_options,
@@ -4017,10 +4574,11 @@ async def passkey_enrollment_options(identity: dict[str, str] = Depends(current_
     ) = _web_authn()
     with closing(database()) as connection:
         existing = connection.execute(
-            "SELECT credential_id FROM passkeys WHERE user_sub = ?", (identity["sub"],)
+            "SELECT credential_id FROM passkeys WHERE user_sub = ? AND COALESCE(rp_id, ?) = ?",
+            (identity["sub"], WEBAUTHN_RP_ID, rp_id),
         ).fetchall()
     options = generate_registration_options(
-        rp_id=WEBAUTHN_RP_ID,
+        rp_id=rp_id,
         rp_name=WEBAUTHN_RP_NAME,
         user_id=identity["sub"].encode("utf-8"),
         user_name=identity["email"],
@@ -4033,23 +4591,28 @@ async def passkey_enrollment_options(identity: dict[str, str] = Depends(current_
             _web_authn()[6](id=bytes(row["credential_id"])) for row in existing
         ],
     )
-    save_challenge(identity["sub"], bytes(options.challenge), "registration")
+    save_challenge(identity["sub"], bytes(options.challenge), "registration", rp_id, origin)
     return JSONResponse(content=json.loads(options_to_json(options)), headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/admin/passkeys/enroll/verify")
 async def passkey_enrollment_verify(
-    request: PasskeyCredential, identity: dict[str, str] = Depends(current_identity)
+    request: PasskeyCredential,
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
 ):
     require_super_admin(identity)
     verifier = _web_authn()[3]
-    challenge = consume_challenge(identity["sub"], "registration")
+    challenge, rp_id, origin = consume_challenge(identity["sub"], "registration")
+    if webauthn_origin_context(web_request) != (rp_id, origin):
+        raise HTTPException(status_code=400, detail="Passkey origin changed during registration.")
+    passkey_token_signing_key()
     try:
         result = verifier(
             credential=request.credential,
             expected_challenge=challenge,
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
             require_user_verification=True,
         )
     except Exception as error:
@@ -4059,10 +4622,11 @@ async def passkey_enrollment_verify(
     with closing(database()) as connection:
         connection.execute(
             """
-            INSERT INTO passkeys(credential_id, user_sub, public_key, sign_count, transports, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO passkeys(credential_id, user_sub, public_key, sign_count, transports, rp_id, origin, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(credential_id) DO UPDATE SET public_key = excluded.public_key,
-                sign_count = excluded.sign_count, transports = excluded.transports
+                sign_count = excluded.sign_count, transports = excluded.transports,
+                rp_id = excluded.rp_id, origin = excluded.origin
             """,
             (
                 result.credential_id,
@@ -4070,16 +4634,25 @@ async def passkey_enrollment_verify(
                 result.credential_public_key,
                 result.sign_count,
                 json.dumps(transports),
+                rp_id,
+                origin,
                 utc_now(),
             ),
         )
         connection.commit()
-    return {"registered": True}
+    return {
+        "registered": True,
+        "passkey_token": issue_passkey_token(identity["sub"], result.credential_id, rp_id),
+    }
 
 
 @app.post("/api/admin/passkeys/auth/options")
-async def passkey_auth_options(identity: dict[str, str] = Depends(current_identity)):
+async def passkey_auth_options(
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
+):
     require_super_admin(identity)
+    rp_id, origin = webauthn_origin_context(web_request)
     (
         generate_authentication_options,
         _,
@@ -4093,8 +4666,11 @@ async def passkey_auth_options(identity: dict[str, str] = Depends(current_identi
     ) = _web_authn()
     with closing(database()) as connection:
         rows = connection.execute(
-            "SELECT credential_id, transports FROM passkeys WHERE user_sub = ?",
-            (identity["sub"],),
+            """
+            SELECT credential_id, transports FROM passkeys
+            WHERE user_sub = ? AND COALESCE(rp_id, ?) = ?
+            """,
+            (identity["sub"], WEBAUTHN_RP_ID, rp_id),
         ).fetchall()
     if not rows:
         raise HTTPException(status_code=404, detail="Enroll a device passkey before unlocking admin.")
@@ -4106,11 +4682,11 @@ async def passkey_auth_options(identity: dict[str, str] = Depends(current_identi
         for row in rows
     ]
     options = generate_authentication_options(
-        rp_id=WEBAUTHN_RP_ID,
+        rp_id=rp_id,
         allow_credentials=credentials,
         user_verification=UserVerificationRequirement.REQUIRED,
     )
-    save_challenge(identity["sub"], bytes(options.challenge), "authentication")
+    save_challenge(identity["sub"], bytes(options.challenge), "authentication", rp_id, origin)
     return JSONResponse(content=json.loads(options_to_json(options)), headers={"Cache-Control": "no-store"})
 
 
@@ -4146,10 +4722,16 @@ def verify_admin_session(token: str) -> dict[str, Any]:
 
 
 @app.post("/api/admin/passkeys/auth/verify")
-async def passkey_auth_verify(request: PasskeyCredential, identity: dict[str, str] = Depends(current_identity)):
+async def passkey_auth_verify(
+    request: PasskeyCredential,
+    web_request: Request,
+    identity: dict[str, str] = Depends(current_identity),
+):
     require_super_admin(identity)
     verifier = _web_authn()[2]
-    challenge = consume_challenge(identity["sub"], "authentication")
+    challenge, rp_id, origin = consume_challenge(identity["sub"], "authentication")
+    if webauthn_origin_context(web_request) != (rp_id, origin):
+        raise HTTPException(status_code=400, detail="Passkey origin changed during authentication.")
     credential_id = request.credential.get("id")
     if not isinstance(credential_id, str):
         raise HTTPException(status_code=400, detail="Passkey credential identifier is invalid.")
@@ -4159,17 +4741,19 @@ async def passkey_auth_verify(request: PasskeyCredential, identity: dict[str, st
         raise HTTPException(status_code=400, detail="Passkey credential identifier is invalid.") from error
     with closing(database()) as connection:
         saved = connection.execute(
-            "SELECT public_key, sign_count FROM passkeys WHERE credential_id = ? AND user_sub = ?",
+            "SELECT public_key, sign_count, rp_id FROM passkeys WHERE credential_id = ? AND user_sub = ?",
             (credential_id_bytes, identity["sub"]),
         ).fetchone()
     if not saved:
         raise HTTPException(status_code=401, detail="This device passkey is not registered.")
+    if saved["rp_id"] and saved["rp_id"] != rp_id:
+        raise HTTPException(status_code=401, detail="This passkey belongs to a different site.")
     try:
         result = verifier(
             credential=request.credential,
             expected_challenge=challenge,
-            expected_rp_id=WEBAUTHN_RP_ID,
-            expected_origin=WEBAUTHN_ORIGIN,
+            expected_rp_id=rp_id,
+            expected_origin=origin,
             credential_public_key=bytes(saved["public_key"]),
             credential_current_sign_count=saved["sign_count"],
             require_user_verification=True,
@@ -4279,6 +4863,513 @@ async def decide_admin_pool_overflow(
     return {"id": request_id, "status": "accepted" if request.accept else "rejected"}
 
 
+def _accepted_friend_ids(connection: sqlite3.Connection, user_sub: str) -> set[str]:
+    rows = connection.execute(
+        "SELECT user_a, user_b FROM friendships WHERE user_a = ? OR user_b = ?",
+        (user_sub, user_sub),
+    ).fetchall()
+    return {
+        str(row["user_b"] if row["user_a"] == user_sub else row["user_a"])
+        for row in rows
+    }
+
+
+def _library_item_payload(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["related_item_ids"] = json.loads(item["related_item_ids"] or "[]")
+    item["provenance"] = json.loads(item["provenance"] or "{}")
+    return item
+
+
+def _seed_starter_library(connection: sqlite3.Connection, user_sub: str) -> None:
+    existing = connection.execute(
+        "SELECT 1 FROM library_items WHERE owner_sub = ? LIMIT 1",
+        (user_sub,),
+    ).fetchone()
+    if existing:
+        return
+    now = utc_now()
+    starters = (
+        ("Welcome to your Living Library", "Save useful prompts, decisions, projects, and lessons here.", "thread"),
+        ("A clear next step", "Break your next goal into one small action you can complete today.", "goal"),
+        ("Project workspace", "Collect project notes, decisions, and related resources in one place.", "project"),
+        ("Decision journal", "Record important choices and the reasoning behind them.", "decision"),
+        ("Learning notes", "Capture lessons you want your future self to remember.", "lesson"),
+    )
+    for title, content, item_type in starters:
+        connection.execute(
+            """
+            INSERT INTO library_items(
+                id, owner_sub, title, content, item_type, visibility, related_item_ids,
+                provenance, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'private', '[]', ?, 'ready', ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                user_sub,
+                title,
+                content,
+                item_type,
+                json.dumps({"source": "starter_library", "created_by": "Personal AI Genie"}),
+                now,
+                now,
+            ),
+        )
+
+
+def _visible_library_items(
+    connection: sqlite3.Connection,
+    user_sub: str,
+    *,
+    item_type: str | None = None,
+    status: str | None = None,
+    room_id: str | None = None,
+) -> list[dict[str, Any]]:
+    friend_ids = _accepted_friend_ids(connection, user_sub)
+    query = "SELECT * FROM library_items WHERE status = ? AND revoked_at IS NULL"
+    parameters: list[Any] = [status or "ready"]
+    if item_type:
+        query += " AND item_type = ?"
+        parameters.append(item_type)
+    query += " ORDER BY created_at DESC LIMIT 500"
+    visible: list[dict[str, Any]] = []
+    for row in connection.execute(query, parameters).fetchall():
+        owner_sub = str(row["owner_sub"])
+        visibility = str(row["visibility"])
+        allowed = owner_sub == user_sub or (visibility == "public" and row["status"] == "ready")
+        if not allowed and row["status"] == "ready" and visibility == "friends" and owner_sub in friend_ids:
+            allowed = True
+        if not allowed and row["status"] == "ready" and visibility == "room" and room_id and row["room_id"] == room_id:
+            member = connection.execute(
+                "SELECT 1 FROM room_members WHERE room_id = ? AND user_sub = ?",
+                (room_id, user_sub),
+            ).fetchone()
+            allowed = bool(member)
+        if allowed:
+            visible.append(_library_item_payload(row))
+    return visible
+
+
+@app.get("/api/library")
+async def list_library_items(
+    item_type: str | None = None,
+    status: Literal["pending_approval", "ready"] | None = None,
+    room_id: str | None = None,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    allowed_types = {
+        "prompt", "article", "code", "game", "thread", "social_embed", "goal",
+        "project", "decision", "lesson", "skill_capsule", "memory_node",
+    }
+    if item_type and item_type not in allowed_types:
+        raise HTTPException(status_code=422, detail="Unsupported library item type.")
+    with closing(database()) as connection:
+        _seed_starter_library(connection, identity["sub"])
+        connection.commit()
+        items = _visible_library_items(
+            connection,
+            identity["sub"],
+            item_type=item_type,
+            status=status,
+            room_id=room_id,
+        )
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/library")
+async def create_library_item(
+    request: LibraryItemCreate,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    if request.visibility == "room":
+        if not request.room_id:
+            raise HTTPException(status_code=422, detail="Room-visible items require a room_id.")
+        room_member(request.room_id, identity)
+    item_id = str(uuid.uuid4())
+    now = utc_now()
+    provenance = {
+        **request.provenance,
+        "created_by": identity["sub"],
+        "created_at": now,
+    }
+    with closing(database()) as connection:
+        connection.execute(
+            """
+            INSERT INTO library_items(
+                id, owner_sub, title, content, item_type, visibility, room_id,
+                related_item_ids, provenance, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                identity["sub"],
+                request.title,
+                request.content,
+                request.item_type,
+                request.visibility,
+                request.room_id,
+                json.dumps(request.related_item_ids),
+                json.dumps(provenance),
+                request.status,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+        row = connection.execute("SELECT * FROM library_items WHERE id = ?", (item_id,)).fetchone()
+    return {"item": _library_item_payload(row)}
+
+
+@app.delete("/api/library/{item_id}")
+async def delete_library_item(
+    item_id: str,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    with closing(database()) as connection:
+        result = connection.execute(
+            "DELETE FROM library_items WHERE id = ? AND owner_sub = ?",
+            (item_id, identity["sub"]),
+        )
+        connection.commit()
+    if not result.rowcount:
+        raise HTTPException(status_code=404, detail="Library item not found.")
+    return {"id": item_id, "deleted": True}
+
+
+@app.post("/api/library/memory-sieve/approve")
+async def approve_memory_sieve_candidate(
+    request: MemoryApprovalRequest,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    try:
+        candidate = master_brain.memory_sieve.verify_token(
+            request.pending_action_token,
+            identity["sub"],
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    item_id = str(uuid.uuid4())
+    now = utc_now()
+    category = str(candidate["category"])
+    item_type = {
+        "Decision": "decision",
+        "Task": "project",
+        "Goal": "goal",
+        "Lesson": "lesson",
+    }[category]
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        prior = connection.execute(
+            "SELECT 1 FROM memory_approvals WHERE token_id = ?",
+            (candidate["id"],),
+        ).fetchone()
+        if prior:
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="This memory candidate has already been approved.")
+        connection.execute(
+            """
+            INSERT INTO library_items(
+                id, owner_sub, title, content, item_type, visibility, related_item_ids,
+                provenance, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'private', '[]', ?, 'ready', ?, ?)
+            """,
+            (
+                item_id,
+                identity["sub"],
+                f"{category}: {str(candidate['content'])[:160]}",
+                candidate["content"],
+                item_type,
+                json.dumps({"source": "memory_sieve", "candidate_id": candidate["id"]}),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO memory_approvals(token_id, owner_sub, item_id, approved_at) VALUES (?, ?, ?, ?)",
+            (candidate["id"], identity["sub"], item_id, now),
+        )
+        connection.commit()
+    return {"approved": True, "item_id": item_id, "status": "ready"}
+
+
+@app.post("/api/v1/workspace/library/grounded-ask")
+async def grounded_library_ask(
+    request: GroundedLibraryAsk,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    with closing(database()) as connection:
+        items = _visible_library_items(connection, identity["sub"])
+    if request.item_ids:
+        selected = set(request.item_ids)
+        items = [item for item in items if item["id"] in selected]
+    items = items[:8]
+    if not items:
+        return {
+            "reply": "There are no accessible, ready Library items to ground this response. Save or share an item first.",
+            "citations": [],
+            "actions": ["ask", "summarize", "translate", "explain"],
+            "action": request.action,
+            "source": "library-empty",
+            "verified": True,
+        }
+    sources = "\n\n".join(
+        f"[{index}] {item['title']}\n{str(item['content'])[:3500]}"
+        for index, item in enumerate(items, start=1)
+    )
+    action_instructions = {
+        "ask": "Answer the question using only the supplied Library sources.",
+        "summarize": "Summarize only the supplied Library sources and emphasize key takeaways.",
+        "translate": f"Translate the relevant source content into {request.language}, preserving meaning.",
+        "explain": "Explain the question using only the supplied Library sources.",
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a grounded Library assistant. Use only the numbered sources below. "
+                "Cite every factual claim with its source number, and say when the sources do not answer. "
+                "Keep the response under 1200 output tokens.\n\n"
+                f"Sources:\n{sources}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"{action_instructions[request.action]}\n\n{request.question}",
+        },
+    ]
+    try:
+        reply, provider = await multi_pool_router.complete(messages, max_tokens=1200)
+    except Exception as error:
+        LOGGER.warning("Grounded Library provider waterfall exhausted (%s)", type(error).__name__)
+        reply = (
+            "I could not reach a language model. Accessible source excerpts follow for your review:\n\n"
+            + "\n\n".join(f"- {item['title']}: {str(item['content'])[:500]}" for item in items)
+        )
+        provider = "source-excerpts"
+    citations = [
+        {
+            "item_id": item["id"],
+            "title": item["title"],
+            "provenance": item["provenance"],
+        }
+        for item in items
+    ]
+    return {
+        "reply": reply,
+        "citations": citations,
+        "actions": ["ask", "summarize", "translate", "explain"],
+        "action": request.action,
+        "source": provider,
+        "verified": provider == "source-excerpts" or all(item["provenance"] is not None for item in items),
+    }
+
+
+@app.get("/api/v1/genie-daily/editions/current")
+async def current_genie_daily_edition(
+    identity: dict[str, str] = Depends(current_identity),
+):
+    pillars = {
+        "Knowledge": {"article", "code", "prompt"},
+        "Work & Goals": {"project", "goal", "skill_capsule"},
+        "Decisions": {"decision"},
+        "Lessons": {"lesson", "memory_node"},
+        "Community & Creativity": {"thread", "game", "social_embed"},
+    }
+    with closing(database()) as connection:
+        friend_ids = _accepted_friend_ids(connection, identity["sub"])
+        own_rows = connection.execute(
+            """
+            SELECT * FROM library_items
+            WHERE owner_sub = ? AND status = 'ready' AND revoked_at IS NULL AND read_at IS NULL
+            ORDER BY created_at DESC LIMIT 100
+            """,
+            (identity["sub"],),
+        ).fetchall()
+        friend_rows: list[sqlite3.Row] = []
+        if friend_ids:
+            placeholders = ",".join("?" for _ in friend_ids)
+            friend_rows = connection.execute(
+                f"""
+                SELECT * FROM library_items
+                WHERE owner_sub IN ({placeholders})
+                    AND visibility IN ('friends', 'public')
+                    AND status = 'ready' AND revoked_at IS NULL AND read_at IS NULL
+                ORDER BY created_at DESC LIMIT 100
+                """,
+                tuple(friend_ids),
+            ).fetchall()
+        own_items = [_library_item_payload(row) for row in own_rows]
+        friend_items = [_library_item_payload(row) for row in friend_rows]
+    editions = []
+    for pillar, item_types in pillars.items():
+        selected = [
+            item for item in own_items + friend_items
+            if item["item_type"] in item_types
+        ]
+        editions.append(
+            {
+                "pillar": pillar,
+                "items": selected[:10],
+                "source_order": "own_unread_then_accepted_friends",
+            }
+        )
+    return {
+        "date": datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat(),
+        "title": "Genie Daily",
+        "pillars": editions,
+    }
+
+
+@app.get("/api/skills/capsules")
+async def list_skill_capsules(identity: dict[str, str] = Depends(current_identity)):
+    with closing(database()) as connection:
+        capsules = connection.execute(
+            "SELECT * FROM skill_capsules WHERE user_sub = ? ORDER BY created_at DESC LIMIT 100",
+            (identity["sub"],),
+        ).fetchall()
+        dna = connection.execute(
+            "SELECT skill_id, completed_capsules, updated_at FROM skill_dna WHERE user_sub = ? ORDER BY completed_capsules DESC",
+            (identity["sub"],),
+        ).fetchall()
+        credits = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM time_credit_ledger WHERE user_sub = ?",
+            (identity["sub"],),
+        ).fetchone()["total"]
+    return {
+        "capsules": [dict(row) for row in capsules],
+        "skill_dna": [dict(row) for row in dna],
+        "time_credits": int(credits),
+        "available_skills": skill_registry.list_skills(),
+    }
+
+
+@app.post("/api/skills/capsules")
+async def create_skill_capsule(
+    request: SkillCapsuleCreate,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    skill = skill_registry.skill(request.skill_id)
+    if not skill:
+        raise HTTPException(status_code=422, detail="Unknown skill capsule skill_id.")
+    capsule_id = str(uuid.uuid4())
+    now = utc_now()
+    title = request.title or request.skill_id.replace("_", " ").title()
+    with closing(database()) as connection:
+        connection.execute(
+            """
+            INSERT INTO skill_capsules(id, user_sub, skill_id, title, objective, duration_minutes, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 10, 'active', ?)
+            """,
+            (capsule_id, identity["sub"], request.skill_id, title, request.objective, now),
+        )
+        connection.commit()
+        capsule = connection.execute("SELECT * FROM skill_capsules WHERE id = ?", (capsule_id,)).fetchone()
+    return {"capsule": dict(capsule), "skill": skill}
+
+
+@app.post("/api/skills/capsules/{capsule_id}/complete")
+async def complete_skill_capsule(
+    capsule_id: str,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    now = utc_now()
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        capsule = connection.execute(
+            "SELECT * FROM skill_capsules WHERE id = ? AND user_sub = ?",
+            (capsule_id, identity["sub"]),
+        ).fetchone()
+        if not capsule:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="Skill capsule not found.")
+        if capsule["status"] != "active":
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="Skill capsule is not active.")
+        connection.execute(
+            "UPDATE skill_capsules SET status = 'completed', completed_at = ? WHERE id = ?",
+            (now, capsule_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO time_credit_ledger(id, user_sub, capsule_id, amount, created_at)
+            VALUES (?, ?, ?, 10, ?)
+            """,
+            (str(uuid.uuid4()), identity["sub"], capsule_id, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO skill_dna(user_sub, skill_id, completed_capsules, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(user_sub, skill_id) DO UPDATE SET
+                completed_capsules = completed_capsules + 1,
+                updated_at = excluded.updated_at
+            """,
+            (identity["sub"], capsule["skill_id"], now),
+        )
+        connection.commit()
+        credits = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM time_credit_ledger WHERE user_sub = ?",
+            (identity["sub"],),
+        ).fetchone()["total"]
+    return {
+        "id": capsule_id,
+        "status": "completed",
+        "credits_awarded": 10,
+        "time_credits": int(credits),
+        "skill_id": capsule["skill_id"],
+    }
+
+
+@app.get("/api/library/trust")
+async def get_library_trust(identity: dict[str, str] = Depends(current_identity)):
+    with closing(database()) as connection:
+        rows = connection.execute(
+            "SELECT * FROM library_items WHERE owner_sub = ? ORDER BY updated_at DESC LIMIT 500",
+            (identity["sub"],),
+        ).fetchall()
+    return {"items": [_library_item_payload(row) for row in rows]}
+
+
+@app.post("/api/library/trust")
+async def library_trust_action(
+    request: LibraryTrustAction,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    with closing(database()) as connection:
+        if request.action == "export":
+            rows = connection.execute(
+                "SELECT * FROM library_items WHERE owner_sub = ? ORDER BY created_at DESC",
+                (identity["sub"],),
+            ).fetchall()
+            return {
+                "exported_at": utc_now(),
+                "items": [_library_item_payload(row) for row in rows],
+            }
+        if not request.item_id:
+            raise HTTPException(status_code=422, detail="item_id is required for this trust action.")
+        if request.action == "delete":
+            result = connection.execute(
+                "DELETE FROM library_items WHERE id = ? AND owner_sub = ?",
+                (request.item_id, identity["sub"]),
+            )
+            connection.commit()
+            if not result.rowcount:
+                raise HTTPException(status_code=404, detail="Library item not found.")
+            return {"item_id": request.item_id, "deleted": True}
+        result = connection.execute(
+            """
+            UPDATE library_items
+            SET visibility = 'private', revoked_at = ?, updated_at = ?
+            WHERE id = ? AND owner_sub = ?
+            """,
+            (utc_now(), utc_now(), request.item_id, identity["sub"]),
+        )
+        connection.commit()
+    if not result.rowcount:
+        raise HTTPException(status_code=404, detail="Library item not found.")
+    return {"item_id": request.item_id, "share_revoked": True, "visibility": "private"}
+
+
 @app.get("/api/admin/telemetry")
 async def admin_telemetry(
     identity: dict[str, str] = Depends(current_identity),
@@ -4309,6 +5400,15 @@ async def admin_telemetry(
             """,
             ((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),),
         ).fetchone()["total"]
+        library_items = connection.execute(
+            "SELECT COUNT(*) AS total FROM library_items WHERE status = 'ready' AND revoked_at IS NULL"
+        ).fetchone()["total"]
+        completed_capsules = connection.execute(
+            "SELECT COUNT(*) AS total FROM skill_capsules WHERE status = 'completed'"
+        ).fetchone()["total"]
+        time_credits = connection.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM time_credit_ledger"
+        ).fetchone()["total"]
     free_keys = len(gemini_pool.free_keys)
     available_keys = int(gemini_pool.availability()["free_keys_available"])
     free_capacity_estimate = 13_500_000
@@ -4330,6 +5430,11 @@ async def admin_telemetry(
         "vip_passes_claimed": int(vip["claimed"] or 0),
         "vip_passes_active": int(vip["active"] or 0),
         "vip_passes_paused": int(vip["paused"] or 0),
+        "investor_impact": {
+            "library_items": int(library_items),
+            "completed_skill_capsules": int(completed_capsules),
+            "non_cash_time_credits_earned": int(time_credits),
+        },
     }
 
 
