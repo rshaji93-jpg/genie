@@ -21,6 +21,7 @@ import TeamsMessageReactions from "@/components/genie/modules/TeamsMessageReacti
 import PinnableChatHeader from "@/components/genie/modules/PinnableChatHeader";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import type { ReactNode } from "react";
+import type { ChatMode } from "@/modules/composer/OptionAComposer";
 
 export type TickStatus = "sent" | "delivered" | "read_no_ai" | "yellow_no_ai" | "ai_review_active" | "ai_verified";
 
@@ -74,6 +75,11 @@ interface ChatCanvasProps {
   loading: boolean;
   activeRoom: boolean;
   mySub: string;
+  chatMode?: ChatMode;
+  onChatModeChange?: (mode: ChatMode) => void;
+  onShowPeople?: () => void;
+  onOpenFriends?: () => void;
+  onOpenSettings?: () => void;
   conversationName?: string;
   temporaryChat?: boolean;
   momEmailEnabled?: boolean;
@@ -405,6 +411,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
     <main className="chat-canvas">
       <PinnableChatHeader
         group={props.activeRoom}
+        chatMode={props.chatMode}
         initial={(props.conversationName || "Genie").trim().slice(0, 1).toLocaleUpperCase()}
         title={props.conversationName || "Genie"}
         momEmailEnabled={props.momEmailEnabled ?? false}
@@ -412,6 +419,10 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         onDownloadTranscript={props.onDownloadTranscript ?? (() => undefined)}
         onLeaveGroup={props.onLeaveGroup}
         onMomEmailChange={props.onMomEmailChange ?? (() => undefined)}
+        onChatModeChange={props.onChatModeChange}
+        onShowPeople={props.onShowPeople}
+        onOpenFriends={props.onOpenFriends}
+        onOpenSettings={props.onOpenSettings}
         onSearch={setMessageSearch}
         onShare={props.onShareConversation ?? (() => undefined)}
         onTemporaryChange={props.onTemporaryChatChange ?? (() => undefined)}

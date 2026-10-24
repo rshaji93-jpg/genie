@@ -41,6 +41,19 @@ export interface DeletedThreadItem extends ThreadItem {
   deleted_at: string;
 }
 
+const placeholderConversationNames = new Set([
+  "private room",
+  "group 1",
+  "group 2",
+  "group 3",
+  "group 4",
+  "group 5",
+]);
+
+function isPlaceholderConversationName(name: string): boolean {
+  return placeholderConversationNames.has(name.trim().replace(/\.+$/, "").toLocaleLowerCase());
+}
+
 interface SidebarProps {
   collapsed: boolean;
   mobileOpen: boolean;
@@ -243,7 +256,7 @@ export default function Sidebar(props: SidebarProps) {
             </div>
           </div>
           <div className="thread-list">
-            {props.rooms.map((room) => (
+            {props.rooms.filter((room) => !isPlaceholderConversationName(room.name)).map((room) => (
               <div className="sidebar-thread-row" key={`room:${room.id}`}>
                 <button
                   className={`thread-item ${room.id === props.currentRoomId ? "selected" : ""}`}
@@ -259,7 +272,7 @@ export default function Sidebar(props: SidebarProps) {
                 )}
               </div>
             ))}
-            {props.threads.map((thread) => (
+            {props.threads.filter((thread) => !isPlaceholderConversationName(thread.title)).map((thread) => (
               <div className="sidebar-thread-row" key={thread.id}>
                 <button
                   className={`thread-item ${props.selectedThreadId === thread.id ? "selected" : ""}`}

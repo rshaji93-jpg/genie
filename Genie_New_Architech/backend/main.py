@@ -441,7 +441,8 @@ def ensure_public_username(connection: sqlite3.Connection, user_sub: str) -> str
 
 def initialize_database() -> None:
     with closing(database()) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
+        journal_mode = "DELETE" if DATABASE_PATH.as_posix().startswith("/app/data/") else "WAL"
+        connection.execute(f"PRAGMA journal_mode = {journal_mode}")
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS rooms (
@@ -757,6 +758,13 @@ def initialize_database() -> None:
 
 flush_legacy_answer_cache()
 initialize_database()
+
+
+def recover_social_get_schema() -> None:
+    try:
+        initialize_database()
+    except sqlite3.Error:
+        LOGGER.exception("Could not recover social tables for a read request.")
 
 app = FastAPI(title="Personal AI Genie — Isolated Architecture", version="1.0.0")
 app.add_middleware(
@@ -2872,19 +2880,24 @@ async def create_room(
 
 @app.get("/api/rooms")
 async def list_rooms(identity: dict[str, str] = Depends(current_identity)):
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT r.id, r.name, r.owner_sub, r.voice_dialect, r.created_at,
-                   COALESCE(r.group_icon, '') AS group_icon,
-                   r.group_slot, r.auto_saved,
-                   (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count
-            FROM rooms r JOIN room_members m ON m.room_id = r.id
-            WHERE m.user_sub = ? ORDER BY r.created_at DESC LIMIT 100
-            """,
-            (identity["sub"],),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT r.id, r.name, r.owner_sub, r.voice_dialect, r.created_at,
+                       COALESCE(r.group_icon, '') AS group_icon,
+                       r.group_slot, r.auto_saved,
+                       (SELECT COUNT(*) FROM room_members m WHERE m.room_id = r.id) AS member_count
+                FROM rooms r JOIN room_members m ON m.room_id = r.id
+                WHERE m.user_sub = ? ORDER BY r.created_at DESC LIMIT 100
+                """,
+                (identity["sub"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        LOGGER.exception("Could not load rooms; attempting database schema recovery.")
+        recover_social_get_schema()
+        return []
 
 
 @app.post("/api/rooms/{room_id}/invites")
@@ -3108,36 +3121,41 @@ async def list_room_members(
     room_id: str, identity: dict[str, str] = Depends(current_identity)
 ):
     room_member(room_id, identity)
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT rm.user_sub, rm.user_name, rm.joined_at, u.username,
-                   u.custom_picture_data, u.last_seen_at
-            FROM room_members rm
-            LEFT JOIN users u ON u.user_sub = rm.user_sub
-            WHERE rm.room_id = ? ORDER BY rm.joined_at
-            """,
-            (room_id,),
-        ).fetchall()
-        online_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
-        members = [
-            {
-                "user_sub": row["user_sub"],
-                "user_name": row["user_name"],
-                "joined_at": row["joined_at"],
-                "username": row["username"],
-                "avatar_data_url": row["custom_picture_data"],
-                "online_elsewhere": bool(
-                    row["last_seen_at"] and row["last_seen_at"] >= online_cutoff
-                ),
-            }
-            for row in rows
-        ]
-        for member in members:
-            if not member["username"]:
-                member["username"] = ensure_public_username(connection, member["user_sub"])
-        connection.commit()
-    return members
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT rm.user_sub, rm.user_name, rm.joined_at, u.username,
+                       u.custom_picture_data, u.last_seen_at
+                FROM room_members rm
+                LEFT JOIN users u ON u.user_sub = rm.user_sub
+                WHERE rm.room_id = ? ORDER BY rm.joined_at
+                """,
+                (room_id,),
+            ).fetchall()
+            online_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat()
+            members = [
+                {
+                    "user_sub": row["user_sub"],
+                    "user_name": row["user_name"],
+                    "joined_at": row["joined_at"],
+                    "username": row["username"],
+                    "avatar_data_url": row["custom_picture_data"],
+                    "online_elsewhere": bool(
+                        row["last_seen_at"] and row["last_seen_at"] >= online_cutoff
+                    ),
+                }
+                for row in rows
+            ]
+            for member in members:
+                if not member["username"]:
+                    member["username"] = ensure_public_username(connection, member["user_sub"])
+            connection.commit()
+        return members
+    except sqlite3.Error:
+        LOGGER.exception("Could not load room members; attempting database schema recovery.")
+        recover_social_get_schema()
+        return []
 
 
 @app.post("/api/rooms/{room_id}/share-tokens")
@@ -3567,61 +3585,80 @@ async def inline_push_reply(request: InlinePushReply):
     return {"message_id": message_id, "tick_status": "yellow_no_ai", "tokens_burned": 0}
 
 
+@app.get("/api/py/social/friends")
 @app.get("/api/social/friends")
 async def list_friends(identity: dict[str, str] = Depends(current_identity)):
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT u.user_sub, COALESCE(u.display_name, u.user_name) AS user_name, u.username,
-                   COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url
-            FROM friendships f
-            JOIN users u ON u.user_sub = CASE WHEN f.user_a = ? THEN f.user_b ELSE f.user_a END
-            WHERE f.user_a = ? OR f.user_b = ?
-            ORDER BY u.user_name COLLATE NOCASE
-            """,
-            (identity["sub"], identity["sub"], identity["sub"]),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT u.user_sub, COALESCE(u.display_name, u.user_name) AS user_name, u.username,
+                       COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url
+                FROM friendships f
+                JOIN users u ON u.user_sub = CASE WHEN f.user_a = ? THEN f.user_b ELSE f.user_a END
+                WHERE f.user_a = ? OR f.user_b = ?
+                ORDER BY u.user_name COLLATE NOCASE
+                """,
+                (identity["sub"], identity["sub"], identity["sub"]),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        LOGGER.exception("Could not load the friend list; attempting social schema recovery.")
+        recover_social_get_schema()
+        return []
 
 
+@app.get("/api/py/social/requests")
 @app.get("/api/social/requests")
 async def list_friend_requests(identity: dict[str, str] = Depends(current_identity)):
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT f.id, f.sender_sub, f.receiver_sub,
-                   COALESCE(u.display_name, u.user_name) AS sender_name,
-                   u.username AS sender_username,
-                   COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url,
-                   f.created_at
-            FROM friend_requests f JOIN users u ON u.user_sub = f.sender_sub
-            WHERE f.receiver_sub = ? AND f.status = 'pending'
-            ORDER BY f.created_at DESC LIMIT 100
-            """,
-            (identity["sub"],),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT f.id, f.sender_sub, f.receiver_sub,
+                       COALESCE(u.display_name, u.user_name) AS sender_name,
+                       u.username AS sender_username,
+                       COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url,
+                       f.created_at
+                FROM friend_requests f JOIN users u ON u.user_sub = f.sender_sub
+                WHERE f.receiver_sub = ? AND f.status = 'pending'
+                ORDER BY f.created_at DESC LIMIT 100
+                """,
+                (identity["sub"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        LOGGER.exception("Could not load friend requests; attempting social schema recovery.")
+        recover_social_get_schema()
+        return {"ok": True, "requests": [], "invitations": []}
 
 
+@app.get("/api/py/social/requests/outgoing")
 @app.get("/api/social/requests/outgoing")
 async def list_outgoing_friend_requests(identity: dict[str, str] = Depends(current_identity)):
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT f.id, f.sender_sub, f.receiver_sub,
-                   COALESCE(u.display_name, u.user_name) AS receiver_name,
-                   u.username AS receiver_username,
-                   COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url,
-                   f.created_at
-            FROM friend_requests f JOIN users u ON u.user_sub = f.receiver_sub
-            WHERE f.sender_sub = ? AND f.status = 'pending'
-            ORDER BY f.created_at DESC LIMIT 100
-            """,
-            (identity["sub"],),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT f.id, f.sender_sub, f.receiver_sub,
+                       COALESCE(u.display_name, u.user_name) AS receiver_name,
+                       u.username AS receiver_username,
+                       COALESCE(u.custom_picture_data, u.picture_url) AS avatar_data_url,
+                       f.created_at
+                FROM friend_requests f JOIN users u ON u.user_sub = f.receiver_sub
+                WHERE f.sender_sub = ? AND f.status = 'pending'
+                ORDER BY f.created_at DESC LIMIT 100
+                """,
+                (identity["sub"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error:
+        LOGGER.exception("Could not load outgoing requests; attempting social schema recovery.")
+        recover_social_get_schema()
+        return []
 
 
+@app.get("/api/py/social/directory")
 @app.get("/api/social/directory")
 async def search_friend_directory(
     query: str = "",
@@ -3631,23 +3668,28 @@ async def search_friend_directory(
     username_term = search_term.removeprefix("@")
     if len(search_term) > 254:
         return []
-    with closing(database()) as connection:
-        rows = connection.execute(
-            """
-            SELECT user_sub, user_name, display_name, username, email,
-                   geo_region_hash, lookup_visibility,
-                   COALESCE(custom_picture_data, picture_url) AS avatar_data_url
-            FROM users
-            WHERE user_sub != ? AND discoverable = 1 AND profile_completed = 1
-              AND registration_complete = 1
-              AND (? = '' OR username LIKE ? OR display_name LIKE ? OR email LIKE ?)
-            ORDER BY display_name COLLATE NOCASE, user_name COLLATE NOCASE LIMIT 50
-            """,
-            (
-                identity["sub"], search_term,
-                f"%{username_term}%", f"%{search_term}%", f"%{search_term}%",
-            ),
-        ).fetchall()
+    try:
+        with closing(database()) as connection:
+            rows = connection.execute(
+                """
+                SELECT user_sub, user_name, display_name, username, email,
+                       geo_region_hash, lookup_visibility,
+                       COALESCE(custom_picture_data, picture_url) AS avatar_data_url
+                FROM users
+                WHERE user_sub != ? AND discoverable = 1 AND profile_completed = 1
+                  AND registration_complete = 1
+                  AND (? = '' OR username LIKE ? OR display_name LIKE ? OR email LIKE ?)
+                ORDER BY display_name COLLATE NOCASE, user_name COLLATE NOCASE LIMIT 50
+                """,
+                (
+                    identity["sub"], search_term,
+                    f"%{username_term}%", f"%{search_term}%", f"%{search_term}%",
+                ),
+            ).fetchall()
+    except sqlite3.Error:
+        LOGGER.exception("Could not load member directory; attempting social schema recovery.")
+        recover_social_get_schema()
+        return []
     return [
         {
             "user_sub": row["user_sub"],

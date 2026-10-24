@@ -320,6 +320,27 @@ function readStored<T>(key: string, fallback: T): T {
   }
 }
 
+const PLACEHOLDER_CONVERSATION_NAMES = new Set([
+  "private room",
+  "group 1",
+  "group 2",
+  "group 3",
+  "group 4",
+  "group 5",
+]);
+
+function isPlaceholderConversationName(name: string): boolean {
+  return PLACEHOLDER_CONVERSATION_NAMES.has(name.trim().replace(/\.+$/, "").toLocaleLowerCase());
+}
+
+function cleanRecentThreads(threads: ThreadRecord[]): ThreadRecord[] {
+  return threads.filter((thread) => !isPlaceholderConversationName(thread.title));
+}
+
+function cleanRecentRooms(rooms: Room[]): Room[] {
+  return rooms.filter((room) => !isPlaceholderConversationName(room.name));
+}
+
 function parseRoomFragment(hash: string): { key: string; invite: string } {
   const fragment = hash.replace(/^#/, "");
   if (fragment.includes("=")) {
@@ -537,11 +558,11 @@ export default function Home() {
     if (!credential || !identity) return;
     let disposed = false;
     const refreshIncomingRequests = () => {
-      void apiFetch<FriendRequestItem[]>("/api/social/requests", credential)
-        .then((requests) => {
+      void apiFetch<FriendRequestItem[] | { requests?: FriendRequestItem[] }>("/api/social/requests", credential)
+        .then((result) => {
           if (!disposed) {
             friendRefreshErrorShown.current = false;
-            setFriendRequests(requests);
+            setFriendRequests(Array.isArray(result) ? result : result.requests || []);
           }
         })
         .catch(() => {
@@ -562,8 +583,14 @@ export default function Home() {
     if (!credential || !identity) return;
     let disposed = false;
     const refresh = () => {
-      void apiFetch<GroupInvitationItem[]>("/api/group-invitations/pending", credential)
-        .then((invitations) => { if (!disposed) setPendingGroupInvitations(invitations); })
+      void apiFetch<GroupInvitationItem[] | { invitations?: GroupInvitationItem[] }>(
+        "/api/group-invitations/pending",
+        credential,
+      )
+        .then((result) => {
+          const invitations = Array.isArray(result) ? result : result.invitations || [];
+          if (!disposed) setPendingGroupInvitations(invitations);
+        })
         .catch((error: unknown) => {
           if (!disposed) setToast(error instanceof Error ? error.message : "Group invitations could not be loaded.");
         });
@@ -840,10 +867,13 @@ export default function Home() {
       setSelectedVoiceId(savedVoice);
       setProfilePreferences((current) => ({ ...current, selected_voice_id: savedVoice }));
     }
-    setThreads(readStored<ThreadRecord[]>(userStorageKey(THREAD_STORAGE, identity.sub), []));
+    const localThreads = cleanRecentThreads(readStored<ThreadRecord[]>(userStorageKey(THREAD_STORAGE, identity.sub), []));
+    localStorage.setItem(userStorageKey(THREAD_STORAGE, identity.sub), JSON.stringify(localThreads));
+    setThreads(localThreads);
     setDeletedThreads(readStored<DeletedThreadRecord[]>(userStorageKey(TRASH_STORAGE, identity.sub), []));
     setLibrary(readStored<SavedItem[]>(userStorageKey(LIBRARY_STORAGE, identity.sub), []));
-    const localRooms = readStored<Room[]>(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), []);
+    const localRooms = cleanRecentRooms(readStored<Room[]>(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), []));
+    localStorage.setItem(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), JSON.stringify(localRooms));
     const localRequests = readStored<FriendRequestItem[]>(userStorageKey(LOCAL_REQUESTS_STORAGE, identity.sub), []);
     const localOutgoingRequests = readStored<OutgoingFriendRequestItem[]>(userStorageKey("genie_local_outgoing_friend_requests", identity.sub), []);
     const localFriends = readStored<FriendItem[]>(userStorageKey(LOCAL_FRIENDS_STORAGE, identity.sub), []);
@@ -855,7 +885,9 @@ export default function Home() {
     setLoadedThreadsFor(identity.sub);
     void Promise.all([
       apiFetch<Room[]>("/api/rooms", credential).catch(() => [] as Room[]),
-      apiFetch<FriendRequestItem[]>("/api/social/requests", credential).catch(() => [] as FriendRequestItem[]),
+      apiFetch<FriendRequestItem[] | { requests?: FriendRequestItem[] }>("/api/social/requests", credential)
+        .then((result) => Array.isArray(result) ? result : result.requests || [])
+        .catch(() => [] as FriendRequestItem[]),
       apiFetch<OutgoingFriendRequestItem[]>("/api/social/requests/outgoing", credential).catch(() => [] as OutgoingFriendRequestItem[]),
       apiFetch<FriendItem[]>("/api/social/friends", credential).catch(() => [] as FriendItem[]),
       apiFetch<ProfileResponse>("/api/profile", credential).catch((): ProfileResponse => ({
@@ -885,7 +917,7 @@ export default function Home() {
         setSelectedVoiceId(profileVoice);
         localStorage.setItem(userStorageKey(LOCAL_VOICE_STORAGE, identity.sub), profileVoice);
       }
-      setRooms(Array.from(new Map([...localRooms, ...roomList].map((item) => [item.id, item] as const)).values()));
+      setRooms(Array.from(new Map([...localRooms, ...cleanRecentRooms(roomList)].map((item) => [item.id, item] as const)).values()));
       setFriendRequests(Array.from(new Map([...localRequests, ...requests].map((item) => [item.id, item] as const)).values()));
       setOutgoingFriendRequests(Array.from(new Map([...localOutgoingRequests, ...outgoingRequests].map((item) => [item.id, item] as const)).values()));
       setFriends(Array.from(new Map([...localFriends, ...friendList].map((item) => [item.user_sub, item] as const)).values()));
@@ -991,8 +1023,10 @@ export default function Home() {
   }, [credential ?? "", identity?.sub ?? ""]);
 
   useEffect(() => {
-    if (identity?.sub && loadedThreadsFor === identity.sub && threads.length) {
-      localStorage.setItem(userStorageKey(THREAD_STORAGE, identity.sub), JSON.stringify(threads));
+    if (identity?.sub && loadedThreadsFor === identity.sub) {
+      const cleaned = cleanRecentThreads(threads);
+      if (cleaned.length !== threads.length) setThreads(cleaned);
+      localStorage.setItem(userStorageKey(THREAD_STORAGE, identity.sub), JSON.stringify(cleaned));
     }
   }, [identity?.sub, loadedThreadsFor, threads]);
   useEffect(() => {
@@ -1007,7 +1041,9 @@ export default function Home() {
   }, [identity?.sub, loadedThreadsFor, library]);
   useEffect(() => {
     if (!identity?.sub || loadedThreadsFor !== identity.sub) return;
-    localStorage.setItem(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), JSON.stringify(rooms));
+    const cleaned = cleanRecentRooms(rooms);
+    if (cleaned.length !== rooms.length) setRooms(cleaned);
+    localStorage.setItem(userStorageKey(LOCAL_ROOMS_STORAGE, identity.sub), JSON.stringify(cleaned));
     localStorage.setItem(userStorageKey(LOCAL_REQUESTS_STORAGE, identity.sub), JSON.stringify(friendRequests));
     localStorage.setItem(userStorageKey("genie_local_outgoing_friend_requests", identity.sub), JSON.stringify(outgoingFriendRequests));
     localStorage.setItem(userStorageKey(LOCAL_FRIENDS_STORAGE, identity.sub), JSON.stringify(friends));
@@ -1309,7 +1345,8 @@ export default function Home() {
     let disposed = false;
     const checkIncomingRequests = async () => {
       try {
-        const requests = await apiFetch<FriendRequestItem[]>("/api/social/requests", credential);
+        const requestResult = await apiFetch<FriendRequestItem[] | { requests?: FriendRequestItem[] }>("/api/social/requests", credential);
+        const requests = Array.isArray(requestResult) ? requestResult : requestResult.requests || [];
         if (disposed) return;
         if (friendRequestNoticeInitialized.current) {
           const newRequest = requests.find((request) => !friendRequestIdsRef.current.has(request.id));
@@ -3017,7 +3054,9 @@ export default function Home() {
   async function refreshSocial() {
     if (!credential) return;
     const [requestList, outgoingRequestList, friendList, roomList] = await Promise.all([
-      apiFetch<FriendRequestItem[]>("/api/social/requests", credential).catch(() => [] as FriendRequestItem[]),
+      apiFetch<FriendRequestItem[] | { requests?: FriendRequestItem[] }>("/api/social/requests", credential)
+        .then((result) => Array.isArray(result) ? result : result.requests || [])
+        .catch(() => [] as FriendRequestItem[]),
       apiFetch<OutgoingFriendRequestItem[]>("/api/social/requests/outgoing", credential).catch(() => [] as OutgoingFriendRequestItem[]),
       apiFetch<FriendItem[]>("/api/social/friends", credential).catch(() => [] as FriendItem[]),
       apiFetch<Room[]>("/api/rooms", credential).catch(() => [] as Room[]),
@@ -3516,7 +3555,7 @@ export default function Home() {
         />
       )}
       <div className="workspace-main">
-        <header className="workspace-topbar">
+        <header className="workspace-topbar" style={{ display: "none" }}>
           <div className="workspace-heading">
             <button
               aria-expanded={mobileSidebarOpen}
@@ -3678,6 +3717,17 @@ export default function Home() {
             loading={sending}
             activeRoom={Boolean(room)}
             mySub={identity.sub}
+            chatMode={chatMode}
+            onChatModeChange={(mode) => {
+              if (mode === "friends_only" && !room) {
+                setToast("Join an encrypted room before switching to Friends Only.");
+                return;
+              }
+              setChatMode(mode);
+            }}
+            onShowPeople={() => setRailOpen(true)}
+            onOpenFriends={() => setView("friends")}
+            onOpenSettings={() => setSettingsOpen(true)}
             conversationName={room?.name || threads.find((thread) => thread.id === threadId)?.title || "Genie"}
             temporaryChat={temporaryChatActive}
             momEmailEnabled={momEmailEnabled}

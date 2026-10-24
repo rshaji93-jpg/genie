@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from contextlib import closing
 from datetime import datetime, timezone
+
+LOGGER = logging.getLogger(__name__)
 
 
 def create_groups_router(database_factory, identity_dependency):
@@ -137,43 +140,64 @@ def create_groups_router(database_factory, identity_dependency):
         room_id: str,
         identity: dict[str, str] = Depends(identity_dependency),
     ):
-        with closing(database_factory()) as connection:
-            ensure_schema(connection)
-            room_member = connection.execute(
-                "SELECT 1 FROM room_members WHERE room_id = ? AND user_sub = ?",
-                (room_id, identity["sub"]),
-            ).fetchone()
-            if not room_member:
-                raise HTTPException(status_code=403, detail="Room membership is required.")
-            rows = connection.execute(
-                """
-                SELECT i.id, i.invitee_sub, i.status, i.created_at, u.user_name
-                FROM group_invitations i JOIN users u ON u.user_sub = i.invitee_sub
-                WHERE i.room_id = ? ORDER BY i.created_at DESC
-                """,
-                (room_id,),
-            ).fetchall()
-        return {"invitations": [dict(row) for row in rows]}
+        try:
+            with closing(database_factory()) as connection:
+                ensure_schema(connection)
+                room_member = connection.execute(
+                    "SELECT 1 FROM room_members WHERE room_id = ? AND user_sub = ?",
+                    (room_id, identity["sub"]),
+                ).fetchone()
+                if not room_member:
+                    raise HTTPException(status_code=403, detail="Room membership is required.")
+                rows = connection.execute(
+                    """
+                    SELECT i.id, i.invitee_sub, i.status, i.created_at, u.user_name
+                    FROM group_invitations i JOIN users u ON u.user_sub = i.invitee_sub
+                    WHERE i.room_id = ? ORDER BY i.created_at DESC
+                    """,
+                    (room_id,),
+                ).fetchall()
+            return {"invitations": [dict(row) for row in rows]}
+        except sqlite3.Error:
+            try:
+                with closing(database_factory()) as connection:
+                    ensure_schema(connection)
+                    connection.commit()
+            except sqlite3.Error:
+                LOGGER.exception("Could not recover group invitation tables.")
+            return {"ok": True, "requests": [], "invitations": []}
 
+    @router.get("/api/py/group-invitations")
+    @router.get("/api/py/group-invitations/pending")
+    @router.get("/api/group-invitations")
     @router.get("/api/group-invitations/pending")
     async def list_pending_group_invitations(
         identity: dict[str, str] = Depends(identity_dependency),
     ):
-        with closing(database_factory()) as connection:
-            ensure_schema(connection)
-            rows = connection.execute(
-                """
-                SELECT i.id, i.room_id, i.created_at, r.name AS group_name,
-                       u.user_name AS inviter_name
-                FROM group_invitations i
-                JOIN rooms r ON r.id = i.room_id
-                JOIN users u ON u.user_sub = i.inviter_sub
-                WHERE i.invitee_sub = ? AND i.status = 'pending'
-                ORDER BY i.created_at DESC
-                """,
-                (identity["sub"],),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        try:
+            with closing(database_factory()) as connection:
+                ensure_schema(connection)
+                rows = connection.execute(
+                    """
+                    SELECT i.id, i.room_id, i.created_at, r.name AS group_name,
+                           u.user_name AS inviter_name
+                    FROM group_invitations i
+                    JOIN rooms r ON r.id = i.room_id
+                    JOIN users u ON u.user_sub = i.inviter_sub
+                    WHERE i.invitee_sub = ? AND i.status = 'pending'
+                    ORDER BY i.created_at DESC
+                    """,
+                    (identity["sub"],),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error:
+            try:
+                with closing(database_factory()) as connection:
+                    ensure_schema(connection)
+                    connection.commit()
+            except sqlite3.Error:
+                LOGGER.exception("Could not recover pending group invitation tables.")
+            return {"ok": True, "requests": [], "invitations": []}
 
     @router.post("/api/group-invitations/{invitation_id}/respond")
     async def respond_group_invitation(

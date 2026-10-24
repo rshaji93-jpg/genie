@@ -184,6 +184,15 @@ export default function OmniComposer(props: OmniComposerProps) {
           aria-pressed={props.useLibrary}
           className={`use-library-toggle ${props.useLibrary ? "active" : ""}`}
           onClick={props.onToggleUseLibrary}
+          style={{
+            padding: "4px 10px",
+            borderRadius: "999px",
+            fontSize: "12px",
+            fontWeight: 500,
+            whiteSpace: "nowrap",
+            border: "1px solid rgba(0,0,0,0.14)",
+            lineHeight: 1.35,
+          }}
           title="Use your Library for this request only"
           type="button"
         >Use Library</button>

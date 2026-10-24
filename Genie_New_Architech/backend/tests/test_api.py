@@ -78,6 +78,19 @@ class BackendApiTests(unittest.TestCase):
             }.issubset(registered_routes)
         )
 
+    def test_python_social_requests_fall_back_to_empty_lists_on_sqlite_errors(self):
+        with (
+            patch.object(main, "database", side_effect=main.sqlite3.OperationalError("no such table")),
+            patch.object(main, "initialize_database", side_effect=main.sqlite3.OperationalError("database unavailable")),
+        ):
+            response = self.client.get("/api/py/social/requests")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json(),
+            {"ok": True, "requests": [], "invitations": []},
+        )
+
     def test_privacy_settings_and_block_list_are_persisted_per_user(self):
         settings = self.client.put(
             "/api/privacy/settings",
