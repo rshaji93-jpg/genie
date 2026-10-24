@@ -20,6 +20,13 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+try:
+    from .modules.bone_router import is_general_query, lookup_muscle
+    from .modules.muscle_engine import get_muscle_engine
+except ImportError:
+    from modules.bone_router import is_general_query, lookup_muscle
+    from modules.muscle_engine import get_muscle_engine
+
 LOGGER = logging.getLogger("genie.master_brain")
 REGISTRY_PATH = Path(__file__).resolve().parent / "ai_muscle" / "registry.json"
 MAX_CALLS_NORMAL = 1
@@ -108,6 +115,10 @@ def clean_human_response(text: str) -> str:
             "",
             cleaned,
         )
+        cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", cleaned)
+        cleaned = cleaned.replace("**", "").replace("__", "")
+        cleaned = re.sub(r"(?m)^\s*[-*]\s+", "- ", cleaned)
+        cleaned = cleaned.replace("`", "").replace("*", "")
         lines = []
         for line in cleaned.splitlines(keepends=True):
             content = line.rstrip("\r\n")
@@ -598,6 +609,7 @@ class MasterBrain:
         room_mode: bool = False,
         max_tokens: int = 4096,
         public_cache_allowed: bool = True,
+        bypass_local_cache: bool = False,
     ) -> dict[str, Any]:
         local = self.deterministic_reply(messages)
         if local is not None:
@@ -609,19 +621,19 @@ class MasterBrain:
                 "proposed_memory": None,
             }
 
-        master = model_tier == "genie-master" or future_self
-        cache_key = (
-            _public_query_key(messages, model_tier)
-            if public_cache_allowed and not master and not room_mode
-            else None
-        )
         latest = next(
             (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
             "",
         )
+        master = model_tier == "genie-master" or future_self
+        cache_key = (
+            _public_query_key(messages, model_tier)
+            if public_cache_allowed and not master and not room_mode and not bypass_local_cache
+            else None
+        )
         personal_cache_key = (
             _personal_query_key(messages, model_tier, user_sub)
-            if not master and not room_mode
+            if not master and not room_mode and not bypass_local_cache
             else None
         )
         with _PUBLIC_CACHE_LOCK:
@@ -656,6 +668,19 @@ class MasterBrain:
             record_public_cache_lookup(False)
         elif personal_cache_key:
             record_public_cache_lookup(False)
+
+        if not future_self and not bypass_local_cache:
+            match = lookup_muscle(latest, room_mode=room_mode, model_tier=model_tier)
+            if match is not None:
+                return {
+                    "reply": clean_human_response(match["answer"]),
+                    "source": "pool0-muscle",
+                    "sub_agents": [],
+                    "verified": True,
+                    "proposed_memory": None,
+                    "tokens_burned": 0,
+                    "muscle_confidence": match["confidence"],
+                }
 
         prior_context = [
             {
@@ -708,6 +733,8 @@ class MasterBrain:
                 _PUBLIC_CACHE.move_to_end(cache_key)
                 while len(_PUBLIC_CACHE) > PUBLIC_CACHE_MAX_ENTRIES:
                     _PUBLIC_CACHE.popitem(last=False)
+        if verification["verified"] and is_general_query(latest, room_mode):
+            get_muscle_engine().learn(latest, reply)
         elif personal_cache_key and verification["verified"]:
             with _PUBLIC_CACHE_LOCK:
                 _PERSONAL_CACHE[personal_cache_key] = (time.monotonic(), reply)

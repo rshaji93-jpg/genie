@@ -86,6 +86,7 @@ export interface LiveAgentCallDockProps extends SpeechPacingCallbacks {
 export default function LiveAgentCallDock(props: LiveAgentCallDockProps) {
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [screenError, setScreenError] = useState("");
+  const [wakeLockNotice, setWakeLockNotice] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
   const pacingAbortRef = useRef<AbortController | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
@@ -102,6 +103,23 @@ export default function LiveAgentCallDock(props: LiveAgentCallDockProps) {
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = props.cameraStream ?? null;
   }, [props.cameraStream]);
+
+  useEffect(() => {
+    let active = true;
+    let sentinel: WakeLockSentinel | undefined;
+    const wakeLock = navigator.wakeLock;
+    if (!wakeLock) return;
+    void wakeLock.request("screen").then((requested) => {
+      if (active) sentinel = requested;
+      else void requested.release();
+    }).catch(() => {
+      if (active) setWakeLockNotice("Keep the device awake for uninterrupted pocket audio.");
+    });
+    return () => {
+      active = false;
+      if (sentinel) void sentinel.release();
+    };
+  }, []);
 
   useEffect(() => () => {
     if (screenStreamRef.current) {
@@ -205,6 +223,7 @@ export default function LiveAgentCallDock(props: LiveAgentCallDockProps) {
       </div>
 
       {screenError && <p className="live-agent-call-dock-error" role="alert">{screenError}</p>}
+      {wakeLockNotice && <p className="live-agent-call-dock-error" role="status">{wakeLockNotice}</p>}
       <div aria-label="Call actions" className="live-agent-call-dock-actions" role="group">
         <button aria-pressed={!props.audioEnabled} className="live-agent-call-dock-control" onClick={props.onToggleAudio} type="button">
           {props.audioEnabled ? <Mic aria-hidden="true" /> : <MicOff aria-hidden="true" />}

@@ -17,8 +17,7 @@ export interface FixedGroups5x5ModalProps {
   roomTitle: string;
   roomIcon: string;
   onClose: () => void;
-  onSaveName: (name: string) => void | Promise<void>;
-  onSaveIcon: (icon: string) => void | Promise<void>;
+  onSaveSettings: (name: string, icon: string) => void | Promise<void>;
   onUpdateMembers: (memberIds: string[]) => void | Promise<void>;
 }
 
@@ -68,11 +67,8 @@ export default function FixedGroups5x5Modal(props: FixedGroups5x5ModalProps) {
     setSaving(true);
     setError("");
     try {
-      await Promise.all([
-        props.onSaveName(title.trim()),
-        props.onSaveIcon(icon.trim()),
-        props.onUpdateMembers(memberIds),
-      ]);
+      await props.onSaveSettings(title.trim(), icon.trim());
+      await props.onUpdateMembers(memberIds.filter((id) => id !== props.currentUserId));
       props.onClose();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The group could not be saved.");

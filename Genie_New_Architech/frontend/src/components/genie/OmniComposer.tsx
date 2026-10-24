@@ -23,6 +23,8 @@ interface OmniComposerProps {
   participants: string[];
   model: string;
   chatMode: ChatMode;
+  useLibrary: boolean;
+  onToggleUseLibrary: () => void;
   sending: boolean;
   availabilityError?: string;
   aiAvailability?: {
@@ -40,7 +42,6 @@ interface OmniComposerProps {
   ) => void;
   onPdfScanned?: (pdfBase64: string) => void;
   onAttachmentFile: (file: File) => void;
-  onThinkHarder: () => void;
   onOpenPrivacy?: () => void;
   quoteText?: string;
   onClearQuote?: () => void;
@@ -136,7 +137,7 @@ export default function OmniComposer(props: OmniComposerProps) {
     const last = text.slice(text.lastIndexOf(" ") + 1);
     if (!last.startsWith("@")) return [];
     const query = last.slice(1).toLocaleLowerCase();
-    return ["Genie", "Genie Lite", "Genie Pro", "Genie Master", ...props.participants]
+    return ["Genie", ...props.participants]
       .filter((name) => name.toLocaleLowerCase().includes(query))
       .slice(0, 6);
   }
@@ -166,7 +167,7 @@ export default function OmniComposer(props: OmniComposerProps) {
               <button aria-label={`Remove ${props.queuedAttachmentPreview.name}`} onClick={props.onRemoveQueuedAttachment} type="button"><X size={13} /></button>
             </div>
           )}
-          <button className="composer-attachment-send" onClick={props.onSendQueuedAttachment} type="button">Send with {props.model === "genie-master" ? "Genie Master" : "Genie"}</button>
+          <button className="composer-attachment-send" onClick={props.onSendQueuedAttachment} type="button">Send with Genie</button>
         </div>
       )}
       {attachment && (
@@ -177,9 +178,15 @@ export default function OmniComposer(props: OmniComposerProps) {
         <PlusAttachmentMenu
           onFile={props.onAttachmentFile}
           onScan={() => setScannerOpen(true)}
-          onThinkHarder={props.onThinkHarder}
           onRelayToPeers={multi ? relayToPeers : undefined}
         />
+        <button
+          aria-pressed={props.useLibrary}
+          className={`use-library-toggle ${props.useLibrary ? "active" : ""}`}
+          onClick={props.onToggleUseLibrary}
+          title="Use your Library for this request only"
+          type="button"
+        >Use Library</button>
         <EmojiPicker onSelect={(emoji) => setText((value) => `${value}${value ? " " : ""}${emoji}`)} />
         <textarea
           ref={inputRef}
@@ -222,7 +229,7 @@ export default function OmniComposer(props: OmniComposerProps) {
             <Headphones size={17} />
           </button>
         )}
-        <button type="submit" className="send-button" disabled={props.sending || (!text.trim() && !attachment)} aria-label="Send to selected AI agent" title="Send to selected AI agent">
+        <button type="submit" className="send-button" disabled={props.sending || (!text.trim() && !attachment)} aria-label="Send to Genie" title="Send to Genie">
           <ArrowUp size={17} />
         </button>
       </form>

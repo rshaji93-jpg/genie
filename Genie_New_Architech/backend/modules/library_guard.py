@@ -277,7 +277,13 @@ def rank_and_filter_library_context(
         named_retrieval = kind == "saved_note" and _is_named_retrieval(query, item)
         text = _item_text(item)
         item_tokens = _tokens(text)
-        if named_retrieval:
+        scoped_preference_match = (
+            kind == "scoped_preference"
+            and item_conversation == conversation_id
+            and bool(re.search(r"\b(format|style|tone|length|paragraph|answer|respond)\b", query, re.IGNORECASE))
+            and bool(re.search(r"\b(short|long|brief|concise|paragraph|bullet|formal|casual|tone|style)\b", text, re.IGNORECASE))
+        )
+        if named_retrieval or scoped_preference_match:
             score = 1.0
         elif not item_tokens:
             continue

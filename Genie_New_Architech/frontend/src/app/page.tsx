@@ -11,6 +11,12 @@ import ChatCanvas, { type ChatMessage } from "@/components/genie/ChatCanvas";
 import CommandSearchModal from "@/components/genie/CommandSearchModal";
 import OmniComposer, { type Attachment, type ChatMode, type SubmitTarget } from "@/modules/composer/OptionAComposer";
 import RightSideRail, { type CallSignal, type RoomPerson } from "@/components/genie/RightSideRail";
+import FixedGroups5x5Modal, { type FixedGroupFriend } from "@/components/genie/modules/FixedGroups5x5Modal";
+import PrivacySecurityModal, {
+  type BlockedPrivacyUser,
+  type FriendRequestSetting,
+  type ProfileVisibility,
+} from "@/components/genie/modules/PrivacySecurityModal";
 import SettingsDialog from "@/components/genie/SettingsDialog";
 import RoomInviteModal from "@/components/genie/RoomInviteModal";
 import Sidebar, { type DeletedThreadItem, type ThreadItem, type WorkspaceView } from "@/components/genie/Sidebar";
@@ -53,7 +59,14 @@ interface Room {
   voice_dialect?: string;
   member_count?: number;
   group_slot?: number | null;
+  group_icon?: string;
   auto_saved?: boolean;
+}
+interface PrivacySettings {
+  profile_visibility: ProfileVisibility;
+  friend_request_setting: FriendRequestSetting;
+  friends_only_calls: boolean;
+  prompt_before_screen_share: boolean;
 }
 interface ThreadRecord extends ThreadItem {
   messages: ChatMessage[];
@@ -63,6 +76,12 @@ interface SavedItem { id: string; content: string; createdAt: string }
 interface FriendRequestItem { id: string; sender_name: string; sender_username: string; sender_sub?: string; receiver_sub?: string }
 interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string; sender_sub?: string; receiver_sub?: string }
 interface FriendItem { user_sub: string; user_name: string; username: string | null; avatar_data_url?: string | null }
+interface GroupInvitationItem {
+  id: string;
+  room_id: string;
+  group_name: string;
+  inviter_name: string;
+}
 interface AIAvailability {
   genie_pro_configured: boolean;
   genie_pro_available: boolean;
@@ -270,16 +289,6 @@ function isGenieVoiceId(value: unknown): value is GenieVoiceId {
 const PHOTO_CREATION_INTENT = /\b(?:create|generate|make|draw|produce)\b.{0,40}\b(?:photo|image|picture|portrait|artwork)\b|\b(?:photo|image|picture|portrait)\b.{0,40}\b(?:create|generate|make|draw|produce)\b/i;
 const PROHIBITED_PHOTO_CONTENT = /\b(?:nudity|nsfw|explicit|porn|adult|erotic|sexual|uncensored)\b|18\s*\+/i;
 const PHOTO_POLICY_MESSAGE = "⚠️ Policy Restriction: Photo creation involving explicit or 18+ adult content is strictly prohibited on Personal AI Genie.";
-const MODEL_OPTIONS = [
-  { label: "Genie Lite", tier: "genie-lite", description: "Fast answers right away" },
-  { label: "Genie Pro", tier: "genie-pro", description: "Balanced reasoning & productivity" },
-  { label: "Genie Master", tier: "genie-master", description: "Deep agentic workflows & sub-agents" },
-] as const;
-type ModelTier = (typeof MODEL_OPTIONS)[number]["tier"];
-
-function tierForModel(label: string): ModelTier {
-  return MODEL_OPTIONS.find((model) => model.label === label)?.tier || "genie-pro";
-}
 
 function userStorageKey(base: string, userSub: string): string {
   return `${base}_${encodeURIComponent(userSub)}`;
@@ -403,19 +412,26 @@ export default function Home() {
   const [temporaryChatMode, setTemporaryChatMode] = useState<TemporaryChatMode>(null);
   const [chatMode, setChatMode] = useState<ChatMode>("ai_room");
   const [privacyMenuOpen, setPrivacyMenuOpen] = useState(false);
-  const [forceMaster, setForceMaster] = useState(false);
   const wakeMessageIdsRef = useRef(new Set<string>());
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceSubsRef = useRef<string[]>([]);
-  const sendMessageRef = useRef<(text: string, secret: boolean, attachment?: Attachment, model?: string, thinkingLevel?: string, target?: SubmitTarget, transcriptContext?: ChatMessage, voiceReply?: boolean, voiceDialect?: string, regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] }) => Promise<void>>(async () => {});
+  const sendMessageRef = useRef<(text: string, secret: boolean, attachment?: Attachment, model?: string, thinkingLevel?: string, target?: SubmitTarget, transcriptContext?: ChatMessage, voiceReply?: boolean, voiceDialect?: string, regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] }, requestChatMode?: ChatMode, liveCallResponse?: boolean, useLibraryForRequest?: boolean) => Promise<void>>(async () => {});
   const [queuedAttachment, setQueuedAttachment] = useState<QueuedAttachment | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [view, setView] = useState<WorkspaceView>("chat");
-  const [activeModel, setActiveModel] = useState("Genie Pro");
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [privacyModalOpen, setPrivacyModalOpen] = useState(false);
+  const [privacySettings, setPrivacySettings] = useState<PrivacySettings>({
+    profile_visibility: "friends",
+    friend_request_setting: "everyone",
+    friends_only_calls: true,
+    prompt_before_screen_share: true,
+  });
+  const [blockedPrivacyUsers, setBlockedPrivacyUsers] = useState<BlockedPrivacyUser[]>([]);
+  const [useLibrary, setUseLibrary] = useState(false);
+  const [momEmailEnabled, setMomEmailEnabled] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
   const [invitePasscode, setInvitePasscode] = useState("");
@@ -437,6 +453,8 @@ export default function Home() {
   const socketRef = useRef<WebSocket | null>(null);
   const [roomStatus, setRoomStatus] = useState("");
   const [rooms, setRooms] = useState<Room[]>([]);
+  const [groupEditorRoom, setGroupEditorRoom] = useState<Room | null>(null);
+  const [pendingGroupInvitations, setPendingGroupInvitations] = useState<GroupInvitationItem[]>([]);
   const [members, setMembers] = useState<RoomPerson[]>([]);
   const [onlineSubs, setOnlineSubs] = useState<string[]>([]);
   const [voiceSubs, setVoiceSubs] = useState<string[]>([]);
@@ -540,6 +558,35 @@ export default function Home() {
       window.clearInterval(timer);
     };
   }, [credential, identity?.sub]);
+  useEffect(() => {
+    if (!credential || !identity) return;
+    let disposed = false;
+    const refresh = () => {
+      void apiFetch<GroupInvitationItem[]>("/api/group-invitations/pending", credential)
+        .then((invitations) => { if (!disposed) setPendingGroupInvitations(invitations); })
+        .catch((error: unknown) => {
+          if (!disposed) setToast(error instanceof Error ? error.message : "Group invitations could not be loaded.");
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 15_000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [credential, identity?.sub]);
+  useEffect(() => {
+    if (!credential || !identity) return;
+    let disposed = false;
+    void Promise.all([
+      apiFetch<PrivacySettings>("/api/privacy/settings", credential),
+      apiFetch<BlockedPrivacyUser[]>("/api/privacy/blocked-users", credential),
+    ]).then(([settings, blockedUsers]) => {
+      if (disposed) return;
+      setPrivacySettings(settings);
+      setBlockedPrivacyUsers(blockedUsers);
+    }).catch((error: unknown) => {
+      if (!disposed) setToast(error instanceof Error ? error.message : "Privacy settings could not be loaded.");
+    });
+    return () => { disposed = true; };
+  }, [credential, identity?.sub]);
   const [quoteText, setQuoteText] = useState("");
   const [forwardingMessage, setForwardingMessage] = useState<ChatMessage | null>(null);
   const [pdfArtifactUrl, setPdfArtifactUrl] = useState("");
@@ -563,7 +610,6 @@ export default function Home() {
       }
       if (event.key === "Escape") {
         setSearchOpen(false);
-        setModelMenuOpen(false);
         setMobileSidebarOpen(false);
       }
     };
@@ -576,14 +622,12 @@ export default function Home() {
       setPrivacyMenuOpen(false);
     };
     const closeIfOutside = (event: Event) => {
-      if (event.target instanceof Element && event.target.closest(".header-actions-menu, .model-selector, .privacy-mode-selector")) return;
+      if (event.target instanceof Element && event.target.closest(".header-actions-menu, .privacy-mode-selector")) return;
       closeHeaderMenu();
-      setModelMenuOpen(false);
     };
     const closeOnKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         closeHeaderMenu();
-        setModelMenuOpen(false);
         setPrivacyMenuOpen(false);
         setMobileSidebarOpen(false);
       }
@@ -1679,6 +1723,25 @@ export default function Home() {
     setInvitePasscode(result.passcode);
   }
 
+  async function respondGroupInvitation(invitationId: string, accept: boolean) {
+    if (!credential) return;
+    try {
+      const result = await apiFetch<{ room_id: string; accepted: boolean }>(
+        `/api/group-invitations/${encodeURIComponent(invitationId)}/respond`,
+        credential,
+        { method: "POST", body: JSON.stringify({ accept }) },
+      );
+      setPendingGroupInvitations((current) => current.filter((item) => item.id !== invitationId));
+      if (result.accepted) {
+        const refreshedRooms = await apiFetch<Room[]>("/api/rooms", credential);
+        setRooms(refreshedRooms);
+        await openRoom(result.room_id);
+      }
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Group invitation could not be updated.");
+    }
+  }
+
   async function joinRoom(inviteInput: string) {
     if (!credential) return;
     let invite = inviteInput.trim();
@@ -1788,6 +1851,7 @@ export default function Home() {
     regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] },
     requestChatMode: ChatMode = "ai_room",
     liveCallResponse = false,
+    useLibraryForRequest = false,
   ) {
     if (!identity || !credential) return;
     const content = secret ? `${SECRET_MARKER}${text}` : text;
@@ -1898,7 +1962,7 @@ export default function Home() {
         chat_mode: requestChatMode,
       }]);
     setSending(true);
-    const modelTier: ModelTier = model === "genie-master"
+    const modelTier: "genie-pro" | "genie-lite" | "genie-master" = model === "genie-master"
       ? "genie-master"
       : model === "genie-lite"
         ? "genie-lite"
@@ -1923,6 +1987,7 @@ export default function Home() {
       response_visibility: regenerate?.visibility || (room && requestChatMode === "ai_room" ? "group" : "private"),
       is_secret: false,
       room_id: room?.id,
+      use_library: useLibraryForRequest,
     };
 
     try {
@@ -2531,8 +2596,8 @@ export default function Home() {
         name: "scanned-document.pdf",
         document_data: { mime_type: "application/pdf", name: "scanned-document.pdf", data: pdfBase64 },
       },
-      model: forceMaster ? "genie-master" : tierForModel(activeModel),
-      thinkingLevel: forceMaster ? "deep" : activeModel === "Genie Lite" ? "light" : activeModel === "Genie Master" ? "deep" : "pro",
+      model: "genie-pro",
+      thinkingLevel: "pro",
       target: "agent",
     });
   }
@@ -2576,8 +2641,8 @@ export default function Home() {
         text: `Analyze the attached document: ${file.name}`,
         secret: false,
         attachment: documentAttachment,
-        model: forceMaster ? "genie-master" : tierForModel(activeModel),
-        thinkingLevel: forceMaster ? "deep" : activeModel === "Genie Lite" ? "light" : activeModel === "Genie Master" ? "deep" : "pro",
+        model: "genie-pro",
+        thinkingLevel: "pro",
         target: "agent",
       });
     } catch (error) {
@@ -2607,8 +2672,8 @@ export default function Home() {
           text: `Review the attached image: ${file.name}`,
           secret: false,
           attachment,
-          model: forceMaster ? "genie-master" : tierForModel(activeModel),
-          thinkingLevel: forceMaster ? "deep" : activeModel === "Genie Lite" ? "light" : activeModel === "Genie Master" ? "deep" : "pro",
+          model: "genie-pro",
+          thinkingLevel: "pro",
           target: "agent",
         });
       } catch (error) {
@@ -2647,11 +2712,7 @@ export default function Home() {
     const asksGenieInStandby = chatMode === "friends_only" && /@genie\b/i.test(text);
     const effectiveTarget: SubmitTarget = asksGenieInStandby ? "agent" : target;
     const effectiveChatMode: ChatMode = asksGenieInStandby || isLiveCallResponse ? "ai_room" : chatMode;
-    const selectedModel = forceMaster ? "genie-master" : model;
-    if (forceMaster) {
-      setActiveModel("Genie Master");
-      setForceMaster(false);
-    }
+    const selectedModel = model === "genie-lite" || model === "genie-master" ? "genie-pro" : model;
     if (attachment && !secret && effectiveTarget === "agent" && selectedModel !== "genie-master") {
       setQueuedAttachment({ text, secret, attachment, model: selectedModel, thinkingLevel, target: effectiveTarget });
       return;
@@ -2661,7 +2722,7 @@ export default function Home() {
       secret,
       attachment,
       selectedModel,
-      forceMaster ? "deep" : thinkingLevel,
+      "pro",
       effectiveTarget,
       undefined,
       isLiveCallResponse,
@@ -2669,7 +2730,9 @@ export default function Home() {
       undefined,
       effectiveChatMode,
       isLiveCallResponse,
+      useLibrary,
     );
+    setUseLibrary(false);
   }
 
   function downloadScannedPdf() {
@@ -2774,6 +2837,107 @@ export default function Home() {
     }
   }
 
+  async function sendResponseFeedback(message: ChatMessage, rating: "up" | "down") {
+      try {
+        await apiFetch("/api/feedback", credential, {
+          method: "POST",
+          body: JSON.stringify({
+            message_id: message.id,
+            rating,
+            question: messages.find((item) => item.role === "user")?.content || "",
+          }),
+        });
+        setToast(rating === "up" ? "Thanks for the feedback." : "Thanks. We’ll avoid reusing that answer.");
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Feedback could not be saved.");
+      }
+  }
+
+  async function downloadCurrentTranscript() {
+      if (!identity) {
+        setToast("Sign in before downloading a transcript.");
+        return;
+      }
+      const conversationId = room?.id || `solo:${identity.sub}`;
+      try {
+        const response = await apiRequest(`/api/calls/${encodeURIComponent(conversationId)}/transcript-download`, {
+          headers: credential ? { Authorization: `Bearer ${credential}` } : {},
+        });
+        if (!response.ok) throw new ApiError("Transcript download failed.", response.status);
+        const objectUrl = URL.createObjectURL(await response.blob());
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = `genie-mom-${conversationId.slice(0, 30)}.txt`;
+        link.click();
+        URL.revokeObjectURL(objectUrl);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Transcript download failed.");
+      }
+  }
+
+  async function setMomEmailPreference(enabled: boolean) {
+      if (!identity) {
+        setToast("Sign in before changing MOM email preferences.");
+        return;
+      }
+      const conversationId = room?.id || `solo:${identity.sub}`;
+      try {
+        await apiFetch(`/api/calls/${encodeURIComponent(conversationId)}/mom-email-preference`, credential, {
+          method: "PUT",
+          body: JSON.stringify({ enabled }),
+        });
+        setMomEmailEnabled(enabled);
+        setToast(`MOM email opt-in ${enabled ? "enabled" : "disabled"}.`);
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "MOM email preference could not be saved.");
+    }
+  }
+
+  async function updatePrivacySettings(patch: Partial<PrivacySettings>) {
+    if (!credential) {
+    setToast("Sign in before changing privacy settings.");
+    return;
+    }
+    const next = { ...privacySettings, ...patch };
+    try {
+    const saved = await apiFetch<PrivacySettings>("/api/privacy/settings", credential, {
+      method: "PUT",
+      body: JSON.stringify(next),
+    });
+    setPrivacySettings(saved);
+    } catch (error) {
+    setToast(error instanceof Error ? error.message : "Privacy settings could not be saved.");
+    }
+  }
+
+  async function blockPrivacyUser(user: BlockedPrivacyUser) {
+    if (!credential) return;
+    try {
+    const blocked = await apiFetch<BlockedPrivacyUser>("/api/privacy/blocked-users", credential, {
+      method: "POST",
+      body: JSON.stringify({ user_id: user.id, user_name: user.name }),
+    });
+    setBlockedPrivacyUsers((current) => [
+      blocked,
+      ...current.filter((item) => item.id !== blocked.id),
+    ]);
+    } catch (error) {
+    setToast(error instanceof Error ? error.message : "That user could not be blocked.");
+    }
+  }
+
+  async function unblockPrivacyUser(userId: string) {
+    if (!credential) return;
+    try {
+    await apiFetch(`/api/privacy/blocked-users/${encodeURIComponent(userId)}`, credential, {
+      method: "DELETE",
+    });
+    setBlockedPrivacyUsers((current) => current.filter((item) => item.id !== userId));
+    } catch (error) {
+    setToast(error instanceof Error ? error.message : "That user could not be unblocked.");
+    }
+  }
+
   async function toggleRoomAiResponseVisibility(message: ChatMessage) {
     if (!room || !credential || message.sender_sub !== identity?.sub) return;
     if (message.is_group_shared_ai_response) {
@@ -2814,7 +2978,7 @@ export default function Home() {
       prompt.content,
       false,
       attachment,
-      tierForModel(activeModel),
+      "genie-pro",
       "pro",
       "agent",
       undefined,
@@ -2994,7 +3158,7 @@ export default function Home() {
           transcript,
           false,
           undefined,
-          tierForModel(activeModel),
+          "genie-pro",
           "pro",
           "agent",
           undefined,
@@ -3272,7 +3436,6 @@ export default function Home() {
         displayName={profileDetails.display_name || identity.name}
         pictureUrl={profileDetails.custom_picture_data || identity.picture}
         incomingRequestCount={friendRequests.length}
-        activeModel={activeModel}
         onToggle={() => {
           if (mobileSidebarOpen) setMobileSidebarOpen(false);
           else setSidebarCollapsed((current) => !current);
@@ -3293,6 +3456,56 @@ export default function Home() {
         onAvatarSelected={(file) => { void uploadProfileAvatar(file).catch((error: unknown) => setToast(error instanceof Error ? error.message : "Profile picture could not be saved.")); }}
         onOpenRoom={(id) => void openRoom(id)}
         onCreateGroupSlot={(slot) => void createRoom(slot)}
+        onEditGroup={(sidebarRoom) => {
+          const selected = rooms.find((candidate) => candidate.id === sidebarRoom.id);
+          if (selected) {
+            void openRoom(selected.id).then(() => setGroupEditorRoom(selected));
+          }
+        }}
+      />
+      <FixedGroups5x5Modal
+        open={Boolean(groupEditorRoom)}
+        friends={friends.map((friend): FixedGroupFriend => ({
+          id: friend.user_sub,
+          name: friend.username ? `@${friend.username}` : friend.user_name,
+          avatarUrl: friend.avatar_data_url || undefined,
+        }))}
+        currentMembers={members
+          .filter((member) => member.user_sub !== identity.sub)
+          .map((member) => ({
+            id: member.user_sub,
+            name: member.username ? `@${member.username}` : member.user_name,
+            avatarUrl: member.avatar_data_url || undefined,
+          }))}
+        currentUserId={identity.sub}
+        roomTitle={groupEditorRoom?.name || ""}
+        roomIcon={groupEditorRoom?.group_icon || ""}
+        onClose={() => setGroupEditorRoom(null)}
+        onSaveSettings={async (name, icon) => {
+          if (!groupEditorRoom) return;
+          await apiFetch(`/api/rooms/${encodeURIComponent(groupEditorRoom.id)}/settings`, credential, {
+            method: "PATCH",
+            body: JSON.stringify({ name, icon }),
+          });
+          setRooms((current) => current.map((candidate) => candidate.id === groupEditorRoom.id
+            ? { ...candidate, name, group_icon: icon }
+            : candidate));
+          setRoom((current) => current?.id === groupEditorRoom.id
+            ? { ...current, name, group_icon: icon }
+            : current);
+        }}
+        onUpdateMembers={async (memberIds) => {
+          if (!groupEditorRoom) return;
+          await apiFetch(`/api/rooms/${encodeURIComponent(groupEditorRoom.id)}/members`, credential, {
+            method: "PUT",
+            body: JSON.stringify({ member_ids: memberIds }),
+          });
+          const updatedMembers = await apiFetch<RoomPerson[]>(
+            `/api/rooms/${encodeURIComponent(groupEditorRoom.id)}/members`,
+            credential,
+          );
+          setMembers(updatedMembers);
+        }}
       />
       {mobileSidebarOpen && (
         <button
@@ -3313,42 +3526,9 @@ export default function Home() {
               type="button"
             ><Menu size={19} /></button>
             <div className="workspace-location">
-              <span>{room ? room.name : "Personal AI Genie"}</span>
-              {room && <><span>·</span><span className={`presence-light ${roomStatus.startsWith("Connected") ? "green" : "yellow"}`} /><span>{roomStatus || "Connecting…"}</span></>}
+              <span>{room ? room.name : "Genie"}</span>
             </div>
             <div className="model-control-group">
-              <div className="model-selector">
-                <button
-                  aria-expanded={modelMenuOpen}
-                  aria-haspopup="listbox"
-                  className="model-selector-trigger"
-                  onClick={() => setModelMenuOpen((open) => !open)}
-                  type="button"
-                >
-                  {activeModel}<ChevronDown size={14} />
-                </button>
-                {modelMenuOpen && (
-                  <div className="model-selector-popover" role="listbox" aria-label="Choose Genie model">
-                    {MODEL_OPTIONS.map((option) => (
-                      <button
-                        aria-selected={activeModel === option.label}
-                        className="model-selector-option"
-                        key={option.tier}
-                        onClick={() => {
-                          setActiveModel(option.label);
-                          setForceMaster(false);
-                          setModelMenuOpen(false);
-                        }}
-                        role="option"
-                        type="button"
-                      >
-                        <span><strong>{option.label}</strong><small>{option.description}</small></span>
-                        {activeModel === option.label && <Check size={16} aria-hidden="true" />}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
               <div className="privacy-mode-selector">
                 <button
                   aria-expanded={privacyMenuOpen}
@@ -3397,8 +3577,8 @@ export default function Home() {
                 setHeaderMenuOpen(false);
                 setRailOpen(false);
                 setRosterOpen((open) => !open);
-              }} aria-expanded={rosterOpen} aria-label={`Room participants, ${members.length} total`}>
-                <UsersRound size={15} /><span>{members.filter((member) => member.user_sub === identity.sub || onlineSubs.includes(member.user_sub)).length}/{members.length} active</span>
+              }} aria-expanded={rosterOpen} aria-label="Show conversation people">
+                <UsersRound size={15} /><span>People</span>
               </button>
               {rosterOpen && <div className="room-roster-popover" role="list" aria-label="Active room members">
                 {members.map((member) => {
@@ -3429,11 +3609,23 @@ export default function Home() {
                 }}><Trash2 size={15} /> Delete Chat</button>
                 <button role="menuitem" onClick={() => { setSettingsOpen(true); setHeaderMenuOpen(false); }}><span aria-hidden="true">☁</span> Cloud Backup Vault</button>
                 <button role="menuitem" onClick={() => { setView("friends"); setHeaderMenuOpen(false); }}><UsersRound size={15} /> Friend Requests</button>
-                <button role="menuitem" onClick={() => { setSettingsOpen(true); setHeaderMenuOpen(false); }}><ShieldCheck size={15} /> Trust &amp; privacy</button>
+                <button role="menuitem" onClick={() => { setPrivacyModalOpen(true); setHeaderMenuOpen(false); }}><ShieldCheck size={15} /> Trust &amp; privacy</button>
               </div>}
             </div>
           </div>
         </header>
+        {pendingGroupInvitations.length > 0 && (
+          <section aria-label="Pending group invitations" className="mx-auto mt-3 flex w-full max-w-[850px] flex-wrap items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-950">
+            <strong>Group invitations</strong>
+            {pendingGroupInvitations.map((invitation) => (
+              <span className="inline-flex flex-wrap items-center gap-2" key={invitation.id}>
+                {invitation.inviter_name} invited you to {invitation.group_name}.
+                <button className="utility-trigger" onClick={() => void respondGroupInvitation(invitation.id, true)} type="button">Accept</button>
+                <button className="utility-trigger" onClick={() => void respondGroupInvitation(invitation.id, false)} type="button">Decline</button>
+              </span>
+            ))}
+          </section>
+        )}
         {temporaryChatActive && (
           <div className="mx-auto mt-2 flex w-full max-w-[850px] items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-stone-800">
             <span>Temporary chat · {temporaryChatMode === "personalized" ? "Personalized" : "Unpersonalized"} · this device session only</span>
@@ -3486,9 +3678,26 @@ export default function Home() {
             loading={sending}
             activeRoom={Boolean(room)}
             mySub={identity.sub}
-            myName={identity.name}
-            myPictureUrl={socialProfile.avatar_data_url || identity.picture}
-            credential={credential}
+            conversationName={room?.name || threads.find((thread) => thread.id === threadId)?.title || "Genie"}
+            temporaryChat={temporaryChatActive}
+            momEmailEnabled={momEmailEnabled}
+            onTemporaryChatChange={(enabled) => {
+              setTemporaryChatActive(enabled);
+              setToast(enabled ? "Temporary chat is on for this conversation." : "Temporary chat is off.");
+            }}
+            onShareConversation={() => {
+              if (room) void shareCurrentRoom();
+              else setToast("Open or create a group conversation to share an invite.");
+            }}
+            onClearConversation={clearCurrentChat}
+            onDownloadTranscript={() => void downloadCurrentTranscript()}
+            onMomEmailChange={(enabled) => void setMomEmailPreference(enabled)}
+            onLeaveGroup={() => {
+              if (!room) return;
+              void apiFetch(`/api/rooms/${encodeURIComponent(room.id)}/members/me`, credential, { method: "DELETE" })
+                .then(() => { setRoom(null); setMessages([]); setToast("You left the group."); })
+                .catch((error: unknown) => setToast(error instanceof Error ? error.message : "Could not leave the group."));
+            }}
             onReview={(id) => void reviewMessage(id)}
             onVerify={(id) => void verifyMessage(id)}
             onRefine={() => setToast("Each room message can receive one AI review. The current review remains available above.")}
@@ -3505,6 +3714,7 @@ export default function Home() {
             onFutureSelf={addResponseToFutureSelf}
             reactionCounts={reactionCounts}
             onReact={(message, target, emoji) => void reactToChatMessage(message, target, emoji)}
+            onFeedback={(message, rating) => void sendResponseFeedback(message, rating)}
             onReadAloud={(message) => void speakGenieReply(message.content)}
             onCopyResponse={(message) => {
               void navigator.clipboard.writeText(message.content)
@@ -3557,7 +3767,7 @@ export default function Home() {
               isMultiUserRoom={Boolean(room)}
               memberCount={room ? members.length : 1}
               participants={members.filter((member) => member.user_sub !== identity.sub).map((member) => member.user_name)}
-              model={tierForModel(activeModel)}
+              model="genie-pro"
               onTranscribeAudio={transcribeVoiceAudio}
               sharedAudioStream={callAudioStream}
               onOpenCall={() => {
@@ -3573,9 +3783,11 @@ export default function Home() {
                 mime_type: queuedAttachment.attachment.mime_type,
                 data: queuedAttachment.attachment.data,
               } : undefined}
-              onSendQueuedAttachment={() => sendQueuedAttachment(tierForModel(activeModel))}
+              onSendQueuedAttachment={() => sendQueuedAttachment("genie-pro")}
               onRemoveQueuedAttachment={() => setQueuedAttachment(null)}
               chatMode={chatMode}
+              useLibrary={useLibrary}
+              onToggleUseLibrary={() => setUseLibrary((enabled) => !enabled)}
               sending={sending}
               aiAvailability={aiAvailability || undefined}
               availabilityError={aiAvailabilityError || undefined}
@@ -3588,8 +3800,8 @@ export default function Home() {
                   text,
                   false,
                   undefined,
-                  tierForModel(activeModel),
-                  activeModel === "Genie Master" ? "deep" : activeModel === "Genie Lite" ? "light" : "pro",
+                  "genie-pro",
+                  "pro",
                   "agent",
                   undefined,
                   true,
@@ -3600,11 +3812,6 @@ export default function Home() {
               onActivity={broadcastActivity}
               onPdfScanned={setScannedPdf}
               onAttachmentFile={(file) => void choosePlusAttachment(file)}
-              onThinkHarder={() => {
-                setForceMaster(true);
-                setActiveModel("Genie Master");
-                setToast("Genie Master is selected for your next response.");
-              }}
               transcribeRequest={transcribeRequest}
               onCallTranscript={(text) => { callSummonTranscript.current = text.trim(); }}
               externalTranscription={studioDictationText}
@@ -3642,6 +3849,21 @@ export default function Home() {
         gmailAddress={identity.email}
         onImportBackup={importChatBackup}
         onOpenVoiceStudio={() => setVoiceStudioOpen(true)}
+      />
+      <PrivacySecurityModal
+        open={privacyModalOpen}
+        profileVisibility={privacySettings.profile_visibility}
+        friendRequestSetting={privacySettings.friend_request_setting}
+        friendsOnlyCalls={privacySettings.friends_only_calls}
+        promptBeforeScreenShare={privacySettings.prompt_before_screen_share}
+        blockedUsers={blockedPrivacyUsers}
+        onClose={() => setPrivacyModalOpen(false)}
+        onProfileVisibilityChange={(profile_visibility) => void updatePrivacySettings({ profile_visibility })}
+        onFriendRequestSettingChange={(friend_request_setting) => void updatePrivacySettings({ friend_request_setting })}
+        onFriendsOnlyCallsChange={(friends_only_calls) => void updatePrivacySettings({ friends_only_calls })}
+        onPromptBeforeScreenShareChange={(prompt_before_screen_share) => void updatePrivacySettings({ prompt_before_screen_share })}
+        onBlockUser={blockPrivacyUser}
+        onUnblockUser={unblockPrivacyUser}
       />
       <VoiceStudioModal
         open={voiceStudioOpen}

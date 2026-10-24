@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 _test_data = tempfile.TemporaryDirectory(prefix="genie-new-arch-tests-")
 os.environ["GENIE_DB_PATH"] = str(Path(_test_data.name) / "test.sqlite3")
+os.environ["GENIE_MUSCLE_DB_PATH"] = str(Path(_test_data.name) / "muscle.sqlite3")
 os.environ["GENIE_GOOGLE_CLIENT_ID"] = "test-client"
 
 from fastapi.testclient import TestClient
@@ -25,6 +26,10 @@ class BackendApiTests(unittest.TestCase):
         self.actor = {"sub": "test-user-123", "name": "Test User", "email": "test@example.com"}
         with orchestrator._PUBLIC_CACHE_LOCK:
             orchestrator._PUBLIC_CACHE.clear()
+        with orchestrator.get_muscle_engine().connect() as connection:
+            connection.execute("DELETE FROM learned_synapses")
+            connection.execute("DELETE FROM synapse_search")
+            connection.commit()
         with closing(main.database()) as connection:
             connection.execute("DELETE FROM master_quota_windows")
             connection.execute("DELETE FROM vip_pass_requests")
@@ -72,6 +77,29 @@ class BackendApiTests(unittest.TestCase):
                 "/api/auth/register",
             }.issubset(registered_routes)
         )
+
+    def test_privacy_settings_and_block_list_are_persisted_per_user(self):
+        settings = self.client.put(
+            "/api/privacy/settings",
+            json={
+                "profile_visibility": "private",
+                "friend_request_setting": "mutuals",
+                "friends_only_calls": True,
+                "prompt_before_screen_share": False,
+            },
+        )
+        self.assertEqual(settings.status_code, 200, settings.text)
+        self.assertEqual(self.client.get("/api/privacy/settings").json(), settings.json())
+
+        blocked = self.client.post(
+            "/api/privacy/blocked-users",
+            json={"user_id": "blocked-user", "user_name": "Blocked User"},
+        )
+        self.assertEqual(blocked.status_code, 200, blocked.text)
+        self.assertEqual(self.client.get("/api/privacy/blocked-users").json(), [blocked.json()])
+        unblocked = self.client.delete("/api/privacy/blocked-users/blocked-user")
+        self.assertEqual(unblocked.status_code, 200, unblocked.text)
+        self.assertEqual(self.client.get("/api/privacy/blocked-users").json(), [])
 
     def test_health_aliases_and_status_proxy_return_success(self):
         for path in ("/health", "/api/health", "/api/py/ai/status"):

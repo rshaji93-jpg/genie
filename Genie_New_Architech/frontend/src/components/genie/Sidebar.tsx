@@ -3,7 +3,6 @@
 import {
   CalendarClock,
   ChevronLeft,
-  ChevronDown,
   Library,
   MessageCircle,
   MoreHorizontal,
@@ -33,6 +32,7 @@ export interface SidebarRoom {
   id: string;
   name: string;
   group_slot?: number | null;
+  group_icon?: string;
   member_count?: number;
   auto_saved?: boolean;
 }
@@ -54,7 +54,6 @@ interface SidebarProps {
   displayName: string;
   pictureUrl?: string;
   incomingRequestCount: number;
-  activeModel: string;
   onToggle: () => void;
   onViewChange: (view: WorkspaceView) => void;
   onNewChat: () => void;
@@ -72,6 +71,7 @@ interface SidebarProps {
   onAvatarSelected: (file: File) => void;
   onOpenRoom: (id: string) => void;
   onCreateGroupSlot: (slot: number) => void;
+  onEditGroup?: (room: SidebarRoom) => void;
 }
 
 interface GovernanceMenuState {
@@ -89,7 +89,6 @@ const navigation = [
 export default function Sidebar(props: SidebarProps) {
   const [presenceOpen, setPresenceOpen] = useState(false);
   const [trashOpen, setTrashOpen] = useState(false);
-  const [groupChatsOpen, setGroupChatsOpen] = useState(true);
   const [governanceMenu, setGovernanceMenu] = useState<GovernanceMenuState | null>(null);
   const avatarInput = useRef<HTMLInputElement>(null);
   const width = props.collapsed ? "sidebar collapsed" : "sidebar";
@@ -243,38 +242,23 @@ export default function Sidebar(props: SidebarProps) {
               {governanceMenu?.key === "recent" && renderGovernanceMenu()}
             </div>
           </div>
-          <section className="group-chat-slots">
-            <button
-              className="group-chat-heading"
-              aria-expanded={groupChatsOpen}
-              onClick={() => setGroupChatsOpen((open) => !open)}
-              type="button"
-            >
-              <UsersRound size={14} />
-              <span>Group Chats</span>
-              <ChevronDown className={groupChatsOpen ? "" : "group-chat-chevron-collapsed"} size={14} />
-            </button>
-            {groupChatsOpen && Array.from({ length: 5 }, (_, index) => {
-              const slot = index + 1;
-              const room = props.rooms.find((item) => item.group_slot === slot);
-              return (
+          <div className="thread-list">
+            {props.rooms.map((room) => (
+              <div className="sidebar-thread-row" key={`room:${room.id}`}>
                 <button
-                  className={`group-chat-slot ${room?.id === props.currentRoomId ? "selected" : ""}`}
-                  key={slot}
-                  onClick={() => room ? props.onOpenRoom(room.id) : props.onCreateGroupSlot(slot)}
-                  title={room ? `Open ${room.name}` : `Create Group ${slot}`}
+                  className={`thread-item ${room.id === props.currentRoomId ? "selected" : ""}`}
+                  onClick={() => props.onOpenRoom(room.id)}
+                  title={room.name}
                   type="button"
                 >
-                  <span className="group-chat-slot-name">{room?.name || `Group ${slot}`}</span>
-                  {room
-                    ? <span className="group-chat-seat-badge">{Math.min(room.member_count || 1, 5)}/5</span>
-                    : <span className="group-chat-seat-badge">1/5</span>}
-                  {room?.auto_saved && <span className="group-chat-saved" title="Auto-saved">●</span>}
+                  <span aria-hidden="true" className="sidebar-thread-avatar">{room.group_icon || room.name.trim().slice(0, 1).toLocaleUpperCase()}</span>
+                  <span>{room.name}</span>
                 </button>
-              );
-            })}
-          </section>
-          <div className="thread-list">
+                {room.group_slot && props.onEditGroup && (
+                  <button className="thread-menu-trigger" aria-label={`Edit ${room.name}`} onClick={() => props.onEditGroup?.(room)} title="Edit group" type="button"><Pencil size={14} /></button>
+                )}
+              </div>
+            ))}
             {props.threads.map((thread) => (
               <div className="sidebar-thread-row" key={thread.id}>
                 <button
@@ -282,7 +266,7 @@ export default function Sidebar(props: SidebarProps) {
                   onClick={() => props.onThreadSelect(thread.id)}
                   title={thread.title}
                 >
-                  <MessageCircle size={14} /><span>{thread.title}</span>
+                  <span aria-hidden="true" className="sidebar-thread-avatar">{thread.title.trim().slice(0, 1).toLocaleUpperCase()}</span><span>{thread.title}</span>
                 </button>
                 <div className="sidebar-menu-anchor">
                   <button
@@ -297,8 +281,15 @@ export default function Sidebar(props: SidebarProps) {
                 </div>
               </div>
             ))}
-            {!props.threads.length && <p className="sidebar-empty">Your recent chats will appear here.</p>}
+            {!props.rooms.length && !props.threads.length && <p className="sidebar-empty">Your conversations will appear here.</p>}
           </div>
+          {props.rooms.length < 5 && (
+            <button className="nav-item sidebar-create-group" onClick={() => {
+              const occupied = new Set(props.rooms.map((room) => room.group_slot).filter((slot): slot is number => typeof slot === "number"));
+              const nextSlot = [1, 2, 3, 4, 5].find((slot) => !occupied.has(slot));
+              if (nextSlot) props.onCreateGroupSlot(nextSlot);
+            }} type="button"><Plus size={15} /> Create group</button>
+          )}
           <section className="sidebar-trash">
             <button
               aria-expanded={trashOpen}
@@ -325,7 +316,6 @@ export default function Sidebar(props: SidebarProps) {
             <ProfileFooter
               name={props.displayName}
               picture={props.pictureUrl}
-              tier={props.activeModel}
               onAvatarClick={() => avatarInput.current?.click()}
               onProfileTap={props.onProfileTap}
             />

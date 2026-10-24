@@ -1,19 +1,17 @@
 "use client";
 
-import { Camera, FileUp, Image, Brain, Plus, ScanLine, UsersRound } from "lucide-react";
+import { Camera, FileUp, Image, Plus, ScanLine, UsersRound } from "lucide-react";
 import { useRef, useState, type ChangeEvent } from "react";
 
 interface PlusAttachmentMenuProps {
   onFile: (file: File) => void;
   onScan: () => void;
-  onThinkHarder: () => void;
   onRelayToPeers?: () => void;
 }
 
 export default function PlusAttachmentMenu({
   onFile,
   onScan,
-  onThinkHarder,
   onRelayToPeers,
 }: PlusAttachmentMenuProps) {
   const [open, setOpen] = useState(false);
@@ -56,7 +54,6 @@ export default function PlusAttachmentMenu({
           <button onClick={() => photosInput.current?.click()} role="menuitem" type="button"><Image size={15} /> Photos</button>
           <button onClick={() => filesInput.current?.click()} role="menuitem" type="button"><FileUp size={15} /> Files / Upload Document</button>
           <button onClick={() => { setOpen(false); onScan(); }} role="menuitem" type="button"><ScanLine size={15} /> Scan to PDF</button>
-          <button onClick={() => { setOpen(false); onThinkHarder(); }} role="menuitem" type="button"><Brain size={15} /> Think harder</button>
           {onRelayToPeers && <button onClick={() => { setOpen(false); onRelayToPeers(); }} role="menuitem" type="button"><UsersRound size={15} /> Send encrypted to room</button>}
         </div>
       )}

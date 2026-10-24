@@ -2,11 +2,9 @@
 
 import { CircleUserRound } from "lucide-react";
 
-export default function ProfileFooter({ name, picture, tier, vip = false, onAvatarClick, onProfileTap }: {
+export default function ProfileFooter({ name, picture, onAvatarClick, onProfileTap }: {
   name: string;
   picture?: string;
-  tier: string;
-  vip?: boolean;
   onAvatarClick: () => void;
   onProfileTap: () => void;
 }) {
@@ -16,7 +14,7 @@ export default function ProfileFooter({ name, picture, tier, vip = false, onAvat
         {picture ? <img alt="" src={picture} /> : <CircleUserRound size={18} />}
       </button>
       <button className="profile-footer-details" onClick={onProfileTap} aria-label="Open profile" type="button">
-        <strong>{name}</strong><small>{tier}{vip && " · ✦ VIP"}</small>
+        <strong>{name}</strong>
       </button>
     </span>
   );

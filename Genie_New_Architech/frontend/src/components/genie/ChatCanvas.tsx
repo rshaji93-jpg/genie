@@ -18,8 +18,8 @@ import ArrowActionToolbar from "@/modules/messages_arrows/ArrowActionToolbar";
 import InlineMessageEditor from "@/modules/messages_arrows/InlineMessageEditor";
 import MessageInfoLedgerModal from "@/modules/messages_arrows/MessageInfoLedgerModal";
 import TeamsMessageReactions from "@/components/genie/modules/TeamsMessageReactions";
+import PinnableChatHeader from "@/components/genie/modules/PinnableChatHeader";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
-import { requestVipPass, type MasterQuota } from "@/lib/api";
 import type { ReactNode } from "react";
 
 export type TickStatus = "sent" | "delivered" | "read_no_ai" | "yellow_no_ai" | "ai_review_active" | "ai_verified";
@@ -58,7 +58,15 @@ export interface ChatMessage {
   proposed_memory_id?: string;
   memory_status?: "pending" | "approved" | "rejected";
   is_live_call_response?: boolean;
-  master_quota?: MasterQuota;
+  master_quota?: {
+    used: number;
+    limit: number;
+    remaining: number;
+    reset_in_seconds: number;
+    vip_active: boolean;
+    downgraded_to?: string;
+    can_request_vip?: boolean;
+  };
 }
 
 interface ChatCanvasProps {
@@ -66,9 +74,16 @@ interface ChatCanvasProps {
   loading: boolean;
   activeRoom: boolean;
   mySub: string;
-  myName: string;
-  myPictureUrl?: string;
-  credential: string;
+  conversationName?: string;
+  temporaryChat?: boolean;
+  momEmailEnabled?: boolean;
+  onTemporaryChatChange?: (enabled: boolean) => void;
+  onHeaderSearch?: (query: string) => void;
+  onShareConversation?: () => void;
+  onClearConversation?: () => void;
+  onDownloadTranscript?: () => void;
+  onMomEmailChange?: (enabled: boolean) => void;
+  onLeaveGroup?: () => void;
   onReview: (messageId: string) => void;
   onVerify: (messageId: string) => void;
   onRefine: (messageId: string) => void;
@@ -293,7 +308,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
   const [unreadCount, setUnreadCount] = useState(0);
   const [pendingResponseAction, setPendingResponseAction] = useState<string | null>(null);
   const [completedResponseActions, setCompletedResponseActions] = useState<Set<string>>(() => new Set());
-  const [vipRequestStatus, setVipRequestStatus] = useState("");
+  const [messageSearch, setMessageSearch] = useState("");
 
   async function runResponseAction(
     action: "memory" | "library" | "future-self",
@@ -348,31 +363,6 @@ export default function ChatCanvas(props: ChatCanvasProps) {
     setUnreadCount(0);
   }
 
-  const latestMasterQuota = [...props.messages]
-    .reverse()
-    .find((message) => message.master_quota)?.master_quota;
-  const showMasterQuota = Boolean(
-    latestMasterQuota
-      && !latestMasterQuota.vip_active
-      && (latestMasterQuota.downgraded_to === "genie-pro" || latestMasterQuota.remaining === 0),
-  );
-  const resetHours = Math.floor((latestMasterQuota?.reset_in_seconds || 0) / 3600);
-  const resetMinutes = Math.floor(((latestMasterQuota?.reset_in_seconds || 0) % 3600) / 60);
-
-  async function submitVipRequest() {
-    setVipRequestStatus("");
-    try {
-      await requestVipPass(
-        props.credential,
-        props.myName,
-        "I would like Genie Master access through the VIP pass program.",
-      );
-      setVipRequestStatus("VIP pass request submitted.");
-    } catch (error) {
-      setVipRequestStatus(error instanceof Error ? error.message : "VIP pass request could not be submitted.");
-    }
-  }
-
   useEffect(() => {
     const closeOnOutside = (event: Event) => {
       if (event.target instanceof Element && event.target.closest(".message-actions-popover")) return;
@@ -413,21 +403,30 @@ export default function ChatCanvas(props: ChatCanvasProps) {
 
   return (
     <main className="chat-canvas">
-      <div className="canvas-topline">
-        <div className="canvas-heading">
-          <span className="eyebrow">{props.activeRoom ? "ENCRYPTED ROOM" : "PERSONAL WORKSPACE"}</span>
-          <h1>{props.activeRoom ? "Room conversation" : "Good to see you."}</h1>
-        </div>
-      </div>
+      <PinnableChatHeader
+        group={props.activeRoom}
+        initial={(props.conversationName || "Genie").trim().slice(0, 1).toLocaleUpperCase()}
+        title={props.conversationName || "Genie"}
+        momEmailEnabled={props.momEmailEnabled ?? false}
+        onClear={props.onClearConversation ?? (() => undefined)}
+        onDownloadTranscript={props.onDownloadTranscript ?? (() => undefined)}
+        onLeaveGroup={props.onLeaveGroup}
+        onMomEmailChange={props.onMomEmailChange ?? (() => undefined)}
+        onSearch={setMessageSearch}
+        onShare={props.onShareConversation ?? (() => undefined)}
+        onTemporaryChange={props.onTemporaryChatChange ?? (() => undefined)}
+        temporary={props.temporaryChat ?? false}
+      />
       <section className="message-scroll" aria-live="polite" onScroll={updateScrollPosition} ref={messageScrollRef}>
         {!props.messages.length && (
           <div className="welcome-card">
             <div className="welcome-sparkle"><IdealGLogo size={42} /></div>
             <h2>What would you like to work on?</h2>
-            <p>Ask Genie, share an encrypted room message, or use Secret mode for content that never leaves this device for AI.</p>
           </div>
         )}
-        {props.messages.map((message) => {
+        {props.messages.filter((message) =>
+          !messageSearch.trim() || message.content.toLocaleLowerCase().includes(messageSearch.trim().toLocaleLowerCase()),
+        ).map((message) => {
           const status = message.tick_status || "sent";
           const hasReview = Boolean(message.ai_reply);
           const canVerify = message.review_triggered_by === props.mySub && status === "ai_review_active";
@@ -488,13 +487,9 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                   setActionsPosition({ x: event.clientX, y: event.clientY });
                 }}
               >
-                <div className="message-sender">
-                  {message.role === "user"
-                    && (!props.activeRoom || message.sender_sub === props.mySub)
-                    && props.myPictureUrl
-                    && <img className="chat-profile-avatar" src={props.myPictureUrl} alt="" />}
-                  {message.sender_name || (message.role === "assistant" ? "✨ Genie AI" : "You")}
-                </div>
+                {props.activeRoom && message.sender_name && (
+                  <div className="message-sender">{message.sender_name}</div>
+                )}
                 {message.is_secret && <div className="secret-label">🔒 Secret · not sent to AI</div>}
                 {message.role === "assistant" && message.chat_mode === "private_ai" && !message.is_group_shared_ai_response && (
                   <div className="private-response-badge">🔒 Only You</div>
@@ -715,15 +710,6 @@ export default function ChatCanvas(props: ChatCanvasProps) {
       )}
       {auditMessage && <MessageInfoLedgerModal message={auditMessage} onClose={() => setAuditMessage(null)} />}
       <div className="composer-wrap pb-[env(safe-area-inset-bottom)]">
-        {showMasterQuota && (
-          <div className="mx-auto mb-2 flex w-full max-w-[850px] flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950" role="status">
-            <span>⏳ Genie Master 4/4 window used (Resets in {resetHours}h {resetMinutes}m · Answered via Genie Pro)</span>
-            <button className="passkey-secondary" onClick={() => void submitVipRequest()} type="button">
-              🎫 Request VIP Pass
-            </button>
-            {vipRequestStatus && <span aria-live="polite">{vipRequestStatus}</span>}
-          </div>
-        )}
         {props.children}
       </div>
     </main>

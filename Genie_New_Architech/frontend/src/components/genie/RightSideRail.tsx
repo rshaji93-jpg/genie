@@ -8,6 +8,8 @@ export interface RoomPerson {
   user_sub: string;
   user_name: string;
   username?: string;
+  avatar_data_url?: string | null;
+  online_elsewhere?: boolean;
 }
 
 export interface CallSignal {
@@ -409,28 +411,40 @@ export default function RightSideRail(props: RightSideRailProps) {
           </section>
         </div>
       )}
-      {props.open && <button className="call-picker-backdrop" onClick={props.onClose} aria-label="Close call picker" />}
-      {props.open && <aside className="call-picker-popover" aria-label="Selective room call">
+      {props.open && <button className="call-picker-backdrop presence-rail-backdrop" onClick={props.onClose} aria-label="Close presence rail" />}
+      {props.open && <aside className="call-picker-popover presence-rail" aria-label="Room presence and calls">
         <div className="rail-heading">
-          <div><span className="eyebrow">LIVE ROOM</span><h2>Call room members</h2></div>
-          <button className="icon-button" onClick={props.onClose} aria-label="Close call picker"><X size={17} /></button>
+          <div><span className="eyebrow">PEOPLE</span><h2>In this conversation</h2></div>
+          <button className="icon-button" onClick={props.onClose} aria-label="Close presence rail"><X size={17} /></button>
         </div>
-        <div className="call-member-picker" aria-label="Choose room members to call">
-          <strong>Choose who to ring</strong>
-          {props.members.filter((member) => member.user_sub !== props.mySub).map((member) => (
-            <label key={member.user_sub}>
-              <input
-                checked={selectedCallMembers.includes(member.user_sub)}
-                disabled={!props.onlineSubs.includes(member.user_sub)}
-                onChange={(event) => setSelectedCallMembers((current) => event.target.checked
-                  ? [...current, member.user_sub]
-                  : current.filter((sub) => sub !== member.user_sub))}
-                type="checkbox"
-              />
-              <span>{member.user_name}</span>
-              <small>{props.onlineSubs.includes(member.user_sub) ? "Online" : "Offline"}</small>
-            </label>
-          ))}
+        <div className="presence-rail-members" aria-label="Conversation members">
+          {props.members.map((member) => {
+            const hereNow = member.user_sub === props.mySub || props.onlineSubs.includes(member.user_sub);
+            const elsewhere = !hereNow && Boolean(member.online_elsewhere);
+            const presence = hereNow ? "active here now" : elsewhere ? "online in another chat" : "offline";
+            return (
+              <div className="presence-rail-member" key={member.user_sub} title={`${member.user_name}: ${presence}`}>
+                <span className="presence-rail-avatar">
+                  {member.avatar_data_url
+                    ? <img alt="" src={member.avatar_data_url} />
+                    : member.user_name.trim().slice(0, 1).toLocaleUpperCase()}
+                  <i className={hereNow ? "green" : elsewhere ? "red" : "yellow"} />
+                </span>
+                <span><strong>{member.user_name}</strong><small>{presence}</small></span>
+                {member.user_sub !== props.mySub && (
+                  <input
+                    aria-label={`Select ${member.user_name} for a call`}
+                    checked={selectedCallMembers.includes(member.user_sub)}
+                    disabled={!hereNow}
+                    onChange={(event) => setSelectedCallMembers((current) => event.target.checked
+                      ? [...current, member.user_sub]
+                      : current.filter((sub) => sub !== member.user_sub))}
+                    type="checkbox"
+                  />
+                )}
+              </div>
+            );
+          })}
         </div>
         <div className="call-picker-actions">
           <button type="button" onClick={() => void startCall()} disabled={!props.roomId || selectedCallMembers.length === 0}>
