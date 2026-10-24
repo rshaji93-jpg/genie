@@ -4,6 +4,8 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   getLibrarySection,
   removeLibraryItem,
+  type SocialProfile,
+  type SocialProfileUpdate,
   type LibraryRecord,
   type LibrarySection,
 } from "@/lib/api";
@@ -12,9 +14,9 @@ import type { WorkspaceView } from "./Sidebar";
 interface SavedItem { id: string; content: string; createdAt: string }
 interface ScheduleItem { id: string; title: string; at: string; notified?: boolean }
 interface RoomSummary { id: string; name: string; member_count?: number }
-interface FriendRequestItem { id: string; sender_name: string; sender_username: string }
-interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string }
-interface FriendItem { user_sub: string; user_name: string; username: string }
+interface FriendRequestItem { id: string; sender_name: string; sender_username: string; sender_sub?: string; avatar_data_url?: string | null }
+interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string; receiver_sub?: string; avatar_data_url?: string | null }
+interface FriendItem { user_sub: string; user_name: string; username: string | null; avatar_data_url?: string | null }
 interface ActiveRoomMember { user_sub: string; user_name: string; username?: string }
 
 interface WorkspacePanelProps {
@@ -29,6 +31,10 @@ interface WorkspacePanelProps {
   friends: FriendItem[];
   activeMembers: ActiveRoomMember[];
   currentUserSub: string;
+  profile: SocialProfile;
+  onSaveProfile: (profile: SocialProfileUpdate) => Promise<void>;
+  onAvatarSelected: (file: File) => Promise<void>;
+  onCallFriend: (userSub: string) => void;
   onAcceptRequest: (id: string) => Promise<void>;
   onRejectRequest: (id: string) => Promise<void>;
   onCancelRequest: (id: string) => Promise<void>;
@@ -55,6 +61,12 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
   const [friendUsername, setFriendUsername] = useState("");
   const [directoryQuery, setDirectoryQuery] = useState("");
   const [directoryResults, setDirectoryResults] = useState<FriendItem[]>([]);
+  const [friendTab, setFriendTab] = useState<"incoming" | "friends" | "sent" | "discover">("incoming");
+  const [profileName, setProfileName] = useState(props.profile.display_name);
+  const [profileUsername, setProfileUsername] = useState(props.profile.username || "");
+  const [profileDiscoverable, setProfileDiscoverable] = useState(props.profile.discoverable);
+  const [profileBio, setProfileBio] = useState(props.profile.bio);
+  const [profileSkills, setProfileSkills] = useState(props.profile.skills_offered.join(", "));
   const [inviteCode, setInviteCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -73,6 +85,14 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
   useEffect(() => {
     setSchedule(storageRead<ScheduleItem[]>("genie_new_schedule", []));
   }, []);
+
+  useEffect(() => {
+    setProfileName(props.profile.display_name);
+    setProfileUsername(props.profile.username || "");
+    setProfileDiscoverable(props.profile.discoverable);
+    setProfileBio(props.profile.bio);
+    setProfileSkills(props.profile.skills_offered.join(", "));
+  }, [props.profile]);
 
   useEffect(() => {
     if (props.view !== "library" || !props.credential) return;
@@ -171,6 +191,38 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
     }
   }
 
+  async function saveProfile(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await props.onSaveProfile({
+        display_name: profileName.trim(),
+        username: profileUsername.trim().replace(/^@/, ""),
+        avatar_data_url: props.profile.avatar_data_url,
+        bio: profileBio.trim(),
+        skills_offered: profileSkills.split(",").map((skill) => skill.trim()).filter(Boolean),
+        discoverable: profileDiscoverable,
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Your social profile could not be saved.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function uploadAvatar(file: File) {
+    setBusy(true);
+    setError("");
+    try {
+      await props.onAvatarSelected(file);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Profile picture could not be saved.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function respondToFriendRequest(id: string, accept: boolean) {
     setBusy(true);
     setError("");
@@ -196,10 +248,23 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
     }
   }
 
+  async function requestMember(username: string) {
+    setBusy(true);
+    setError("");
+    try {
+      await props.onSendFriendRequest(username);
+      setDirectoryResults(await props.onSearchDirectory(directoryQuery));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Friend request failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const titles = {
     library: ["Library", "A private collection of answers you chose to keep."],
     scheduled: ["Scheduled", "Reminders stay in this browser. Genie does not receive them."],
-    friends: ["Friends", "Find friends and manage invitations using public @usernames."],
+    friends: ["Friends", "Complete your profile, then find and connect with discoverable members."],
   } as const;
   const [title, description] = titles[props.view];
 
@@ -277,55 +342,145 @@ export default function WorkspacePanel(props: WorkspacePanelProps) {
       {props.view === "friends" && (
         <div className="friends-grid">
           <div className="section-card">
-            <h2>Friend requests</h2>
-            {props.activeMembers.length > 0 && (
+            <h2>Complete Your Social Profile to Connect with Friends</h2>
+            <p className="muted-copy">Your profile is visible in member search only when you opt in to discovery.</p>
+            <form className="social-profile-form" onSubmit={(event) => void saveProfile(event)}>
+              <div className="social-profile-avatar">
+                <button type="button" onClick={() => document.getElementById("social-profile-avatar-input")?.click()} aria-label="Upload profile picture">
+                  {props.profile.avatar_data_url
+                    ? <img src={props.profile.avatar_data_url} alt="" />
+                    : <span>{profileName.slice(0, 1).toUpperCase() || "?"}</span>}
+                </button>
+                <input
+                  id="social-profile-avatar-input"
+                  accept="image/*"
+                  className="visually-hidden"
+                  type="file"
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (file) void uploadAvatar(file);
+                    event.currentTarget.value = "";
+                  }}
+                />
+                <span>Upload a profile picture</span>
+              </div>
+              <label>Display name<input value={profileName} onChange={(event) => setProfileName(event.target.value)} maxLength={100} required /></label>
+              <label>@Username<input value={profileUsername} onChange={(event) => setProfileUsername(event.target.value)} maxLength={32} pattern="[A-Za-z0-9_]{2,32}" placeholder="your_username" required /></label>
+              <label>Bio<textarea value={profileBio} onChange={(event) => setProfileBio(event.target.value)} maxLength={500} rows={2} /></label>
+              <label>Skills offered<input value={profileSkills} onChange={(event) => setProfileSkills(event.target.value)} maxLength={1800} placeholder="Design, tutoring, coding" /></label>
+              <label className="discoverability-toggle">
+                <input type="checkbox" checked={profileDiscoverable} onChange={(event) => setProfileDiscoverable(event.target.checked)} />
+                Allow friends to discover my profile
+              </label>
+              <button className="primary-button" disabled={busy}>Save social profile</button>
+              {props.profile.profile_completed && <span className="profile-complete-label">Profile complete</span>}
+            </form>
+            {props.profile.profile_completed && (
               <>
-                <h3>Active room members</h3>
-                {props.activeMembers
-                  .filter((member) => member.user_sub !== props.currentUserSub)
-                  .map((member) => {
-                    const isFriend = props.friends.some((friend) => friend.user_sub === member.user_sub);
-                    return (
-                      <div className="request-row" key={member.user_sub}>
-                        <span><strong>{member.user_name}</strong><small>{member.username ? `@${member.username}` : "Username unavailable"}</small></span>
-                        <button
-                          className="primary-button compact"
-                          disabled={busy || isFriend || !member.username}
-                          onClick={() => member.username && void requestRoomMember(member.username)}
-                          type="button"
-                        >{isFriend ? "Already friends" : "Send Friend Request"}</button>
+                <div className="friend-tabs" role="tablist" aria-label="Friends">
+                  <button type="button" role="tab" aria-selected={friendTab === "incoming"} onClick={() => setFriendTab("incoming")}>Incoming Requests ({props.requests.length})</button>
+                  <button type="button" role="tab" aria-selected={friendTab === "friends"} onClick={() => setFriendTab("friends")}>My Friends ({props.friends.length})</button>
+                  <button type="button" role="tab" aria-selected={friendTab === "sent"} onClick={() => setFriendTab("sent")}>Sent Requests ({props.outgoingRequests.length})</button>
+                  <button type="button" role="tab" aria-selected={friendTab === "discover"} onClick={() => {
+                    setFriendTab("discover");
+                    void props.onSearchDirectory("").then(setDirectoryResults).catch(() => setError("Member directory could not be loaded."));
+                  }}>Find &amp; Discover Members</button>
+                </div>
+                {friendTab === "incoming" && (
+                  <div>
+                    {props.requests.map((request) => (
+                      <div className="request-row" key={request.id}>
+                        {request.avatar_data_url && <img className="friend-avatar" src={request.avatar_data_url} alt="" />}
+                        <span><strong>{request.sender_name}</strong><small>@{request.sender_username}</small></span>
+                        <span><button className="primary-button compact" disabled={busy} onClick={() => void respondToFriendRequest(request.id, true)}>✓ Accept</button><button className="subtle-button" disabled={busy} onClick={() => void respondToFriendRequest(request.id, false)}>✕ Decline</button></span>
                       </div>
-                    );
-                  })}
+                    ))}
+                    {!props.requests.length && <p className="muted-copy">No incoming requests.</p>}
+                  </div>
+                )}
+                {friendTab === "friends" && (
+                  <div>
+                    {props.friends.map((friend) => (
+                      <div className="friend-row" key={friend.user_sub}>
+                        {friend.avatar_data_url
+                          ? <img className="friend-avatar" src={friend.avatar_data_url} alt="" />
+                          : <span className="friend-avatar friend-avatar-fallback">{friend.user_name.slice(0, 1).toUpperCase()}</span>}
+                        <span className={`presence-light ${props.activeMembers.some((member) => member.user_sub === friend.user_sub) ? "green" : "slate"}`} />
+                        <span>{friend.user_name}</span><small>{friend.username ? `@${friend.username}` : "Username unavailable"}</small>
+                        <span className="friends-actions">
+                          <button className="subtle-button" disabled={!props.rooms.length} onClick={() => props.rooms[0] && props.onOpenRoom(props.rooms[0].id)} type="button">💬 Invite to Group Chat</button>
+                          <button className="subtle-button" onClick={() => props.onCallFriend(friend.user_sub)} type="button">📞 Call</button>
+                        </span>
+                      </div>
+                    ))}
+                    {!props.friends.length && <p className="muted-copy">Your accepted friends will appear here.</p>}
+                  </div>
+                )}
+                {friendTab === "sent" && (
+                  <div>
+                    {props.outgoingRequests.map((request) => (
+                      <div className="request-row" key={request.id}>
+                        <span><strong>{request.receiver_name}</strong><small>@{request.receiver_username}</small></span>
+                        <span className="outgoing-request-actions">
+                          <span className="request-sent-label">⏳ Waiting for approval</span>
+                          <button className="subtle-button" disabled={busy} onClick={() => void props.onCancelRequest(request.id)} type="button">✕ Cancel</button>
+                        </span>
+                      </div>
+                    ))}
+                    {!props.outgoingRequests.length && <p className="muted-copy">No sent requests.</p>}
+                  </div>
+                )}
+                {friendTab === "discover" && (
+                  <div>
+                    <form className="inline-form" onSubmit={(event) => void searchDirectory(event)}>
+                      <input value={directoryQuery} onChange={(event) => setDirectoryQuery(event.target.value)} placeholder="Search name, @username, or email" maxLength={254} />
+                      <button className="primary-button compact" disabled={busy}>Search</button>
+                    </form>
+                    <h3>Verified discoverable members</h3>
+                    {directoryResults.map((friend) => {
+                      const incoming = props.requests.find((item) => item.sender_sub === friend.user_sub);
+                      const outgoing = props.outgoingRequests.find((item) => item.receiver_sub === friend.user_sub);
+                      const isFriend = props.friends.some((item) => item.user_sub === friend.user_sub);
+                      return (
+                        <div className="friend-row" key={friend.user_sub}>
+                          {friend.avatar_data_url && <img className="friend-avatar" src={friend.avatar_data_url} alt="" />}
+                          <span>{friend.user_name}</span><small>{friend.username ? `@${friend.username}` : "Username unavailable"}</small>
+                          {isFriend
+                            ? <span className="friends-state-badge">✅ Friends</span>
+                            : incoming
+                              ? <span className="friends-actions">
+                                <button className="primary-button compact" disabled={busy} onClick={() => void respondToFriendRequest(incoming.id, true)}>✓ Accept</button>
+                                <button className="subtle-button" disabled={busy} onClick={() => void respondToFriendRequest(incoming.id, false)}>✕ Decline</button>
+                              </span>
+                              : outgoing
+                                ? <span className="outgoing-request-actions">
+                                  <span className="request-sent-label">⏳ Request Sent</span>
+                                  <button className="subtle-button" disabled={busy} onClick={() => void props.onCancelRequest(outgoing.id)} type="button">✕ Cancel</button>
+                                </span>
+                                : <button className="primary-button compact" disabled={busy || !friend.username} onClick={() => friend.username && void requestMember(friend.username)} type="button">➕ Add Friend</button>}
+                        </div>
+                      );
+                    })}
+                    {!directoryResults.length && <p className="muted-copy">No verified discoverable members found.</p>}
+                    <form className="inline-form" onSubmit={(event) => void submitFriend(event)}>
+                      <input value={friendUsername} onChange={(event) => setFriendUsername(event.target.value)} placeholder="Add by @username" pattern="@?[A-Za-z0-9_]{2,32}" required />
+                      <button className="primary-button compact" disabled={busy}>Add Friend</button>
+                    </form>
+                    {props.activeMembers.length > 0 && (
+                      <>
+                        <h3>Active room members</h3>
+                        {props.activeMembers.filter((member) => member.user_sub !== props.currentUserSub).map((member) => (
+                          <div className="request-row" key={member.user_sub}>
+                            <span><strong>{member.user_name}</strong><small>{member.username ? `@${member.username}` : "Username unavailable"}</small></span>
+                            <button className="primary-button compact" disabled={busy || !member.username || props.friends.some((item) => item.user_sub === member.user_sub)} onClick={() => member.username && void requestRoomMember(member.username)} type="button">➕ Add Friend</button>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
               </>
             )}
-            {props.requests.map((request) => (
-              <div className="request-row" key={request.id}><span><strong>{request.sender_name}</strong><small>@{request.sender_username}</small></span><span><button className="primary-button compact" disabled={busy} onClick={() => void respondToFriendRequest(request.id, true)}>Accept</button><button className="subtle-button" disabled={busy} onClick={() => void respondToFriendRequest(request.id, false)}>Decline</button></span></div>
-            ))}
-            {!props.requests.length && <p className="muted-copy">No pending requests.</p>}
-            <h3>Requests you sent</h3>
-            {props.outgoingRequests.map((request) => (
-              <div className="request-row" key={request.id}>
-                <span><strong>{request.receiver_name}</strong><small>@{request.receiver_username}</small></span>
-                <span className="outgoing-request-actions">
-                  <span className="request-sent-label">⏳ Request Sent</span>
-                  <button className="subtle-button" disabled={busy} onClick={() => void props.onCancelRequest(request.id)} type="button">✕ Cancel</button>
-                </span>
-              </div>
-            ))}
-            {!props.outgoingRequests.length && <p className="muted-copy">No outgoing requests.</p>}
-            <h3>Your friends</h3>
-            {props.friends.map((friend) => <div className="friend-row" key={friend.user_sub}><span className="presence-light green" /><span>{friend.user_name}</span><small>@{friend.username}</small></div>)}
-            <form className="inline-form" onSubmit={(event) => void submitFriend(event)}>
-              <input value={friendUsername} onChange={(event) => setFriendUsername(event.target.value)} placeholder="Send request to @username" pattern="@?[A-Za-z0-9_]{2,32}" required />
-              <button className="primary-button compact" disabled={busy}>Send</button>
-            </form>
-            <h3>Find a Genie username</h3>
-            <form className="inline-form" onSubmit={(event) => void searchDirectory(event)}>
-              <input value={directoryQuery} onChange={(event) => setDirectoryQuery(event.target.value)} placeholder="Search exact @username" pattern="@?[A-Za-z0-9_]{2,32}" required />
-              <button className="primary-button compact" disabled={busy}>Search</button>
-            </form>
-            {directoryResults.map((friend) => <div className="friend-row" key={friend.user_sub}><span>{friend.user_name}</span><small>@{friend.username}</small><button className="subtle-button" onClick={() => { setFriendUsername(`@${friend.username}`); }}>Invite</button></div>)}
           </div>
           <div className="section-card">
             <h2>Rooms</h2>

@@ -83,6 +83,9 @@ def initialize_archive_schema(connection: sqlite3.Connection) -> None:
             "presence_visibility": "TEXT NOT NULL DEFAULT 'mutuals'",
             "directory_visibility": "TEXT NOT NULL DEFAULT 'mutuals'",
             "preview_profile": "INTEGER NOT NULL DEFAULT 0",
+            "discoverable": "INTEGER NOT NULL DEFAULT 0",
+            "profile_completed": "INTEGER NOT NULL DEFAULT 0",
+            "skills_offered": "TEXT NOT NULL DEFAULT '[]'",
         },
     )
     _add_columns(
@@ -110,7 +113,18 @@ def initialize_archive_schema(connection: sqlite3.Connection) -> None:
             "sender_attested_at": "TEXT",
             "receiver_attested_personal": "INTEGER NOT NULL DEFAULT 0",
             "receiver_attested_at": "TEXT",
+            "pair_key": "TEXT",
         },
+    )
+    connection.execute(
+        """
+        UPDATE friend_requests
+        SET pair_key = CASE
+            WHEN sender_sub < receiver_sub THEN sender_sub || '__' || receiver_sub
+            ELSE receiver_sub || '__' || sender_sub
+        END
+        WHERE pair_key IS NULL
+        """
     )
     _remove_message_reaction_room_message_foreign_key(connection)
     connection.executescript(

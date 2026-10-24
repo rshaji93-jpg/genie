@@ -66,6 +66,7 @@ interface ChatCanvasProps {
   activeRoom: boolean;
   mySub: string;
   myName: string;
+  myPictureUrl?: string;
   credential: string;
   onReview: (messageId: string) => void;
   onVerify: (messageId: string) => void;
@@ -486,6 +487,10 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                 }}
               >
                 <div className="message-sender">
+                  {message.role === "user"
+                    && (!props.activeRoom || message.sender_sub === props.mySub)
+                    && props.myPictureUrl
+                    && <img className="chat-profile-avatar" src={props.myPictureUrl} alt="" />}
                   {message.sender_name || (message.role === "assistant" ? "✨ Genie AI" : "You")}
                 </div>
                 {message.is_secret && <div className="secret-label">🔒 Secret · not sent to AI</div>}

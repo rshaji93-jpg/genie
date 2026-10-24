@@ -48,6 +48,70 @@ export interface VipQueue {
   pending: VipRequest[];
 }
 
+export interface SocialProfile {
+  user_id: string;
+  email: string;
+  username: string | null;
+  display_name: string;
+  avatar_data_url: string | null;
+  bio: string;
+  skills_offered: string[];
+  discoverable: boolean;
+  profile_completed: boolean;
+}
+
+export interface SocialProfileUpdate {
+  display_name: string;
+  username: string;
+  avatar_data_url: string | null;
+  bio: string;
+  skills_offered: string[];
+  discoverable: boolean;
+}
+
+export async function compressProfileAvatar(file: File): Promise<string> {
+  if (!file.type.startsWith("image/") || file.size > 10_000_000) {
+    throw new Error("Choose an image smaller than 10 MB.");
+  }
+  const image = new Image();
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("The selected image could not be read."));
+      image.src = objectUrl;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = 160;
+    canvas.height = 160;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Image processing is unavailable in this browser.");
+    const side = Math.min(image.naturalWidth, image.naturalHeight);
+    const sourceX = (image.naturalWidth - side) / 2;
+    const sourceY = (image.naturalHeight - side) / 2;
+    context.drawImage(image, sourceX, sourceY, side, side, 0, 0, 160, 160);
+    let quality = 0.82;
+    let dataUrl = canvas.toDataURL("image/jpeg", quality);
+    while (dataUrl.length > 11_000 && quality > 0.35) {
+      quality -= 0.1;
+      dataUrl = canvas.toDataURL("image/jpeg", quality);
+    }
+    return dataUrl;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+export function saveSocialProfile(
+  profile: SocialProfileUpdate,
+  credential: string,
+): Promise<SocialProfile> {
+  return apiFetch<SocialProfile>("/api/profile", credential, {
+    method: "POST",
+    body: JSON.stringify(profile),
+  });
+}
+
 function getUserProfileHeaders(): Record<string, string> {
   if (typeof window === "undefined") return {};
 

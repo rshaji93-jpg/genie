@@ -21,10 +21,14 @@ import {
   apiFetchWithFallback,
   apiRequest,
   approveProposedMemory,
+  compressProfileAvatar,
   createFutureSelfEntry,
   randomToken,
   requestVoiceTts,
   saveLibraryItem,
+  saveSocialProfile,
+  type SocialProfile,
+  type SocialProfileUpdate,
   websocketUrl,
 } from "@/lib/api";
 import { decryptRoomMessage, encryptRoomMessage } from "@/lib/roomCrypto";
@@ -58,7 +62,7 @@ type DeletedThreadRecord = ThreadRecord & DeletedThreadItem;
 interface SavedItem { id: string; content: string; createdAt: string }
 interface FriendRequestItem { id: string; sender_name: string; sender_username: string; sender_sub?: string; receiver_sub?: string }
 interface OutgoingFriendRequestItem { id: string; receiver_name: string; receiver_username: string; sender_sub?: string; receiver_sub?: string }
-interface FriendItem { user_sub: string; user_name: string; username: string }
+interface FriendItem { user_sub: string; user_name: string; username: string | null; avatar_data_url?: string | null }
 interface AIAvailability {
   genie_pro_configured: boolean;
   genie_pro_available: boolean;
@@ -130,6 +134,9 @@ interface WireMessage {
 }
 interface RoomEvent {
   type: string;
+  request_id?: string;
+  sender?: { id?: string; user_sub?: string; name?: string; username?: string | null };
+  receiver?: { id?: string; user_sub?: string; name?: string; username?: string | null };
   message?: WireMessage | string;
   messages?: WireMessage[];
   ai_responses?: {
@@ -236,6 +243,11 @@ interface ProfileResponse extends ProfilePreferences, ProfileDetails {
   picture_url?: string | null;
   phone?: string | null;
   selected_voice_id?: string;
+  username?: string | null;
+  discoverable?: boolean;
+  profile_completed?: boolean;
+  skills_offered?: string[];
+  avatar_data_url?: string | null;
 }
 
 const THREAD_STORAGE = "genie_new_threads";
@@ -440,6 +452,7 @@ export default function Home() {
   const [outgoingFriendRequests, setOutgoingFriendRequests] = useState<OutgoingFriendRequestItem[]>([]);
   const friendRequestNoticeInitialized = useRef(false);
   const friendRequestIdsRef = useRef(new Set<string>());
+  const friendRefreshErrorShown = useRef(false);
   const [friends, setFriends] = useState<FriendItem[]>([]);
   const [aiAvailability, setAIAvailability] = useState<AIAvailability | null>(null);
   const [aiAvailabilityError, setAIAvailabilityError] = useState("");
@@ -491,6 +504,42 @@ export default function Home() {
     default_dialect: "en-IN",
     preview_profile: false,
   });
+  const [socialProfile, setSocialProfile] = useState<SocialProfile>({
+    user_id: "",
+    email: "",
+    username: null,
+    display_name: "",
+    avatar_data_url: null,
+    bio: "",
+    skills_offered: [],
+    discoverable: false,
+    profile_completed: false,
+  });
+  useEffect(() => {
+    if (!credential || !identity) return;
+    let disposed = false;
+    const refreshIncomingRequests = () => {
+      void apiFetch<FriendRequestItem[]>("/api/social/requests", credential)
+        .then((requests) => {
+          if (!disposed) {
+            friendRefreshErrorShown.current = false;
+            setFriendRequests(requests);
+          }
+        })
+        .catch(() => {
+          if (!disposed && !friendRefreshErrorShown.current) {
+            friendRefreshErrorShown.current = true;
+            setToast("Incoming friend requests could not be refreshed.");
+          }
+        });
+    };
+    refreshIncomingRequests();
+    const timer = window.setInterval(refreshIncomingRequests, 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [credential, identity?.sub]);
   const [quoteText, setQuoteText] = useState("");
   const [forwardingMessage, setForwardingMessage] = useState<ChatMessage | null>(null);
   const [pdfArtifactUrl, setPdfArtifactUrl] = useState("");
@@ -765,16 +814,28 @@ export default function Home() {
       apiFetch<FriendRequestItem[]>("/api/social/requests", credential).catch(() => [] as FriendRequestItem[]),
       apiFetch<OutgoingFriendRequestItem[]>("/api/social/requests/outgoing", credential).catch(() => [] as OutgoingFriendRequestItem[]),
       apiFetch<FriendItem[]>("/api/social/friends", credential).catch(() => [] as FriendItem[]),
-      apiFetch<ProfileResponse>("/api/profile", credential).catch(() => ({
+      apiFetch<ProfileResponse>("/api/profile", credential).catch((): ProfileResponse => ({
         email: identity.email, user_name: identity.name, display_name: identity.name,
         registration_complete: false, geo_region_hash: null, friend_circle_mode: "mutuals_only",
         lookup_visibility: "mutual_contacts_only", allow_broader_discovery: false,
         default_dialect: "en-IN", presence_override: "online", telemetry_enabled: false,
         bio: "", city_region: "", custom_picture_data: null, profile_visibility: "mutuals",
         presence_visibility: "mutuals", directory_visibility: "mutuals", preview_profile: false,
-      } satisfies ProfileResponse)),
+      })),
     ]).then(([roomList, requests, outgoingRequests, friendList, profile]) => {
       const mergedProfile = { ...profile, ...localProfile };
+      const storedSocialProfile = profile.profile_completed !== undefined ? profile : mergedProfile;
+      setSocialProfile({
+        user_id: identity.sub,
+        email: storedSocialProfile.email || identity.email,
+        username: storedSocialProfile.username || null,
+        display_name: storedSocialProfile.display_name || storedSocialProfile.user_name || identity.name,
+        avatar_data_url: storedSocialProfile.avatar_data_url || storedSocialProfile.custom_picture_data || storedSocialProfile.picture_url || null,
+        bio: storedSocialProfile.bio || "",
+        skills_offered: storedSocialProfile.skills_offered || [],
+        discoverable: Boolean(storedSocialProfile.discoverable),
+        profile_completed: Boolean(storedSocialProfile.profile_completed),
+      });
       const profileVoice = mergedProfile.selected_voice_id;
       if (isGenieVoiceId(profileVoice)) {
         setSelectedVoiceId(profileVoice);
@@ -789,10 +850,10 @@ export default function Home() {
         telemetry_enabled: Boolean(mergedProfile.telemetry_enabled),
       });
       setProfileDetails({
-        display_name: mergedProfile.display_name || mergedProfile.user_name || identity.name,
-        bio: mergedProfile.bio || "",
+        display_name: storedSocialProfile.display_name || storedSocialProfile.user_name || identity.name,
+        bio: storedSocialProfile.bio || "",
         city_region: mergedProfile.city_region || "",
-        custom_picture_data: mergedProfile.custom_picture_data || null,
+        custom_picture_data: storedSocialProfile.avatar_data_url || storedSocialProfile.custom_picture_data || null,
         profile_visibility: mergedProfile.profile_visibility || "mutuals",
         presence_visibility: mergedProfile.presence_visibility || "mutuals",
         directory_visibility: mergedProfile.directory_visibility || "mutuals",
@@ -801,8 +862,8 @@ export default function Home() {
       });
       setIdentity((current) => current ? {
         ...current,
-        name: mergedProfile.display_name || mergedProfile.user_name || current.name,
-        picture: mergedProfile.custom_picture_data || mergedProfile.picture_url || current.picture,
+        name: storedSocialProfile.display_name || storedSocialProfile.user_name || current.name,
+        picture: storedSocialProfile.avatar_data_url || storedSocialProfile.custom_picture_data || storedSocialProfile.picture_url || current.picture,
       } : current);
       setRegistration((current) => ({
         ...current,
@@ -925,6 +986,27 @@ export default function Home() {
       socket.onmessage = (event) => {
         void (async () => {
           const incoming = JSON.parse(String(event.data)) as RoomEvent;
+          if (incoming.type === "friend_request_received" && incoming.request_id && incoming.sender) {
+            const requestId = incoming.request_id;
+            const sender = incoming.sender;
+            const senderSub = sender.user_sub || sender.id;
+            if (senderSub) {
+              setFriendRequests((current) => current.some((request) => request.id === requestId)
+                ? current
+                : [{
+                  id: requestId,
+                  sender_sub: senderSub,
+                  sender_name: sender.name || "Genie member",
+                  sender_username: sender.username || "",
+                }, ...current]);
+            }
+            return;
+          }
+          if (incoming.type === "friend_request_accepted") {
+            setOutgoingFriendRequests((current) => current.filter((request) => request.id !== incoming.request_id));
+            await refreshSocial();
+            return;
+          }
           if (incoming.type === "history" && incoming.messages) {
             if (incoming.voice_dialect) setRoomVoiceDialect(incoming.voice_dialect);
             const decoded: ChatMessage[] = [];
@@ -2167,6 +2249,61 @@ export default function Home() {
     }
   }
 
+  async function saveSocialProfileChanges(profile: SocialProfileUpdate) {
+    if (!credential || !identity) throw new Error("Sign in before saving your social profile.");
+    const optimistic: SocialProfile = {
+    user_id: identity.sub,
+    email: identity.email,
+    ...profile,
+    profile_completed: Boolean(profile.display_name.trim() && profile.username.trim()),
+    };
+    setSocialProfile(optimistic);
+    setProfileDetails((current) => ({
+    ...current,
+    display_name: optimistic.display_name,
+    bio: optimistic.bio,
+    custom_picture_data: optimistic.avatar_data_url,
+    }));
+    setIdentity((current) => current ? {
+    ...current,
+    name: optimistic.display_name,
+    picture: optimistic.avatar_data_url || current.picture,
+    } : current);
+    const stored = readStored<Partial<ProfileResponse>>(
+      userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub), {},
+    );
+    localStorage.setItem(userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub), JSON.stringify({
+      ...stored,
+      ...profile,
+      email: identity.email,
+      user_name: profile.display_name,
+      display_name: profile.display_name,
+      custom_picture_data: profile.avatar_data_url,
+      avatar_data_url: profile.avatar_data_url,
+      profile_completed: optimistic.profile_completed,
+      registration_complete: true,
+    }));
+    const saved = await saveSocialProfile(profile, credential);
+    setSocialProfile((current) => ({ ...current, profile_completed: saved.profile_completed }));
+    localStorage.setItem(userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub), JSON.stringify({
+      ...readStored<Partial<ProfileResponse>>(userStorageKey(LOCAL_PROFILE_STORAGE, identity.sub), {}),
+      profile_completed: saved.profile_completed,
+    }));
+    setToast("Social profile saved.");
+  }
+
+  async function uploadProfileAvatar(file: File) {
+    const avatar = await compressProfileAvatar(file);
+    await saveSocialProfileChanges({
+      display_name: socialProfile.display_name || identity?.name || "",
+      username: socialProfile.username || "",
+      avatar_data_url: avatar,
+      bio: socialProfile.bio,
+      skills_offered: socialProfile.skills_offered,
+      discoverable: socialProfile.discoverable,
+    });
+  }
+
   async function updateProfileDetails(details: ProfileDetails) {
     if (!credential) throw new Error("Sign in before updating your profile.");
     try {
@@ -2188,12 +2325,24 @@ export default function Home() {
         email: identity.email,
         user_name: details.display_name,
       }));
+      setIdentity((current) => current ? {
+        ...current,
+        name: details.display_name,
+        picture: details.custom_picture_data || current.picture,
+      } : current);
+      try {
+        await saveSocialProfileChanges({
+          display_name: details.display_name,
+          username: socialProfile.username || "",
+          avatar_data_url: details.custom_picture_data,
+          bio: details.bio,
+          skills_offered: socialProfile.skills_offered,
+          discoverable: socialProfile.discoverable,
+        });
+      } catch (error) {
+        setToast(error instanceof Error ? error.message : "Social profile details could not be synced.");
+      }
     }
-    setIdentity((current) => current ? {
-      ...current,
-      name: details.display_name,
-      picture: details.custom_picture_data || current.picture,
-    } : current);
   }
 
   async function submitRegistration(event: FormEvent<HTMLFormElement>) {
@@ -3119,6 +3268,7 @@ export default function Home() {
         currentRoomId={room?.id}
         displayName={profileDetails.display_name || identity.name}
         pictureUrl={profileDetails.custom_picture_data || identity.picture}
+        incomingRequestCount={friendRequests.length}
         activeModel={activeModel}
         onToggle={() => {
           if (mobileSidebarOpen) setMobileSidebarOpen(false);
@@ -3137,6 +3287,7 @@ export default function Home() {
         onInviteRoom={() => room ? void shareCurrentRoom() : void createRoom()}
         onOpenSettings={() => setSettingsOpen(true)}
         onProfileTap={handleAvatarTap}
+        onAvatarSelected={(file) => { void uploadProfileAvatar(file).catch((error: unknown) => setToast(error instanceof Error ? error.message : "Profile picture could not be saved.")); }}
         onOpenRoom={(id) => void openRoom(id)}
         onCreateGroupSlot={(slot) => void createRoom(slot)}
       />
@@ -3298,6 +3449,22 @@ export default function Home() {
               ? members.filter((member) => member.user_sub === identity.sub || onlineSubs.includes(member.user_sub))
               : []}
             currentUserSub={identity.sub}
+            profile={socialProfile}
+            onSaveProfile={saveSocialProfileChanges}
+            onAvatarSelected={uploadProfileAvatar}
+            onCallFriend={(userSub) => {
+              if (!room) {
+                setToast("Open an encrypted room with this friend to start a call.");
+                if (rooms[0]) void openRoom(rooms[0].id);
+                return;
+              }
+              if (!members.some((member) => member.user_sub === userSub)) {
+                setToast("Invite this friend into an encrypted room before calling.");
+                return;
+              }
+              setRailOpen(true);
+              setToast("Choose your friend in the call panel, then start the call.");
+            }}
             requests={friendRequests}
             outgoingRequests={outgoingFriendRequests}
             friends={friends}
@@ -3317,6 +3484,7 @@ export default function Home() {
             activeRoom={Boolean(room)}
             mySub={identity.sub}
             myName={identity.name}
+            myPictureUrl={socialProfile.avatar_data_url || identity.picture}
             credential={credential}
             onReview={(id) => void reviewMessage(id)}
             onVerify={(id) => void verifyMessage(id)}

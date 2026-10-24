@@ -1093,6 +1093,14 @@ class BackendApiTests(unittest.TestCase):
                     (receiver["email"], receiver["sub"], receiver["name"], main.utc_now()),
                 ],
             )
+            connection.execute(
+                "UPDATE users SET profile_completed = 1 WHERE user_sub = ?",
+                (self.actor["sub"],),
+            )
+            connection.execute(
+                "UPDATE users SET profile_completed = 1 WHERE user_sub = ?",
+                (self.actor["sub"],),
+            )
             connection.commit()
         with patch.object(main.room_hub, "send_user_event", new_callable=AsyncMock) as notification:
             pending = self.client.post("/api/social/requests", json={"email": receiver["email"]})
@@ -1128,6 +1136,119 @@ class BackendApiTests(unittest.TestCase):
         rejected = self.client.post("/api/social/requests/pending-rejection/reject", json={})
         self.assertEqual(rejected.status_code, 200)
         self.assertEqual(rejected.json()["status"], "rejected")
+
+    def test_social_profile_persists_avatar_privacy_and_skills(self):
+        with closing(main.database()) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO users(email, user_sub, user_name, last_seen_at) VALUES (?, ?, ?, ?)",
+                (self.actor["email"], self.actor["sub"], self.actor["name"], main.utc_now()),
+            )
+            connection.commit()
+        avatar = "data:image/jpeg;base64," + __import__("base64").b64encode(
+            b"\xff\xd8\xffavatar"
+        ).decode("ascii")
+        response = self.client.post(
+            "/api/profile",
+            json={
+                "display_name": "Test Social",
+                "username": "@test_social",
+                "avatar_data_url": avatar,
+                "bio": "Hello",
+                "skills_offered": ["Tutoring", "Coding"],
+                "discoverable": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["profile_completed"])
+        profile = self.client.get("/api/profile").json()
+        self.assertEqual(profile["username"], "test_social")
+        self.assertEqual(profile["avatar_data_url"], avatar)
+        self.assertEqual(profile["skills_offered"], ["Tutoring", "Coding"])
+        self.assertTrue(profile["discoverable"])
+
+    def test_friend_request_requires_completed_profile_and_directory_is_discoverable_only(self):
+        target = {"sub": "social-target", "name": "Discoverable Person", "email": "discover@example.com"}
+        hidden = {"sub": "social-hidden", "name": "Hidden Person", "email": "hidden@example.com"}
+        with closing(main.database()) as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO users(
+                    email, user_sub, user_name, username, last_seen_at, registration_complete,
+                    profile_completed, discoverable
+                ) VALUES (?, ?, ?, ?, ?, 1, 1, ?)
+                """,
+                [
+                    (self.actor["email"], self.actor["sub"], self.actor["name"], "actor_test", main.utc_now(), 0),
+                    (target["email"], target["sub"], target["name"], "discover_target", main.utc_now(), 1),
+                    (hidden["email"], hidden["sub"], hidden["name"], "hidden_target", main.utc_now(), 0),
+                ],
+            )
+            connection.execute(
+                "UPDATE users SET profile_completed = 0 WHERE user_sub = ?",
+                (self.actor["sub"],),
+            )
+            connection.commit()
+        gated = self.client.post("/api/social/requests", json={"username": "discover_target"})
+        self.assertEqual(gated.status_code, 409)
+        self.assertEqual(
+            [row["user_sub"] for row in self.client.get("/api/social/directory").json()],
+            [target["sub"]],
+        )
+
+    def test_inverse_friend_requests_auto_match_to_accepted(self):
+        receiver = {"sub": "auto-match-target", "name": "Auto Match", "email": "auto-match@example.com"}
+        with closing(main.database()) as connection:
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO users(
+                    email, user_sub, user_name, last_seen_at, profile_completed
+                ) VALUES (?, ?, ?, ?, 1)
+                """,
+                [
+                    (self.actor["email"], self.actor["sub"], self.actor["name"], main.utc_now()),
+                    (receiver["email"], receiver["sub"], receiver["name"], main.utc_now()),
+                ],
+            )
+            connection.execute(
+                "UPDATE users SET profile_completed = 1 WHERE user_sub = ?",
+                (self.actor["sub"],),
+            )
+            connection.execute(
+                """
+                INSERT INTO friend_requests(
+                    id, sender_sub, receiver_sub, status, created_at, pair_key
+                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    "inverse-pending", receiver["sub"], self.actor["sub"], main.utc_now(),
+                    "__".join(sorted((receiver["sub"], self.actor["sub"]))),
+                ),
+            )
+            connection.commit()
+        response = self.client.post("/api/social/requests", json={"email": receiver["email"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "accepted")
+        self.assertEqual(
+            self.client.get("/api/social/friends").json()[0]["user_sub"],
+            receiver["sub"],
+        )
+
+    def test_admin_telemetry_includes_grant_readiness_snapshot(self):
+        with patch.object(main, "require_genesis_owner"), patch.object(
+            main, "require_admin_session", return_value={"exp": 1}
+        ):
+            response = self.client.get(
+                "/api/admin/telemetry",
+                headers={"X-Genie-Admin-Session": "test-session"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        readiness = response.json()["grant_readiness"]
+        self.assertEqual(readiness["active_dau_mau_capacity"], "200,000 DAU @ 90% Cache")
+        self.assertEqual(readiness["average_cost_per_task_usd"], 0.0002)
+        self.assertEqual(
+            {program["name"] for program in readiness["grant_programs"]},
+            {"Google for Startups", "Microsoft Founders Hub", "Cloudflare Startup Plan"},
+        )
 
 
 if __name__ == "__main__":

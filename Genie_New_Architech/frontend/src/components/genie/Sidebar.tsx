@@ -17,7 +17,7 @@ import {
   Trash2,
   UsersRound,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import ProfileFooter from "@/modules/profile_settings/ProfileFooter";
 
@@ -53,6 +53,7 @@ interface SidebarProps {
   currentRoomId?: string;
   displayName: string;
   pictureUrl?: string;
+  incomingRequestCount: number;
   activeModel: string;
   onToggle: () => void;
   onViewChange: (view: WorkspaceView) => void;
@@ -68,6 +69,7 @@ interface SidebarProps {
   onSearch: () => void;
   onOpenSettings: () => void;
   onProfileTap: () => void;
+  onAvatarSelected: (file: File) => void;
   onOpenRoom: (id: string) => void;
   onCreateGroupSlot: (slot: number) => void;
 }
@@ -89,6 +91,7 @@ export default function Sidebar(props: SidebarProps) {
   const [trashOpen, setTrashOpen] = useState(false);
   const [groupChatsOpen, setGroupChatsOpen] = useState(true);
   const [governanceMenu, setGovernanceMenu] = useState<GovernanceMenuState | null>(null);
+  const avatarInput = useRef<HTMLInputElement>(null);
   const width = props.collapsed ? "sidebar collapsed" : "sidebar";
 
   function closeMenu() {
@@ -217,6 +220,11 @@ export default function Sidebar(props: SidebarProps) {
           title={label}
         >
           <Icon size={17} /> {!props.collapsed && label}
+          {id === "friends" && props.incomingRequestCount > 0 && (
+            <span className="sidebar-notification-badge" aria-label={`${props.incomingRequestCount} incoming requests`}>
+              {props.incomingRequestCount}
+            </span>
+          )}
         </button>
       ))}
       {!props.collapsed && (
@@ -314,9 +322,13 @@ export default function Sidebar(props: SidebarProps) {
             )}
           </section>
           <div className="sidebar-footer">
-            <button className="profile-footer-button" onClick={props.onProfileTap} aria-label="Open profile">
-              <ProfileFooter name={props.displayName} picture={props.pictureUrl} tier={props.activeModel} />
-            </button>
+            <ProfileFooter
+              name={props.displayName}
+              picture={props.pictureUrl}
+              tier={props.activeModel}
+              onAvatarClick={() => avatarInput.current?.click()}
+              onProfileTap={props.onProfileTap}
+            />
             <button className="icon-button" onClick={() => setPresenceOpen((open) => !open)} aria-label="MetaSync online presence" title="MetaSync online presence">
               <span className="presence-badge"><UsersRound size={15} /></span>
             </button>
@@ -335,7 +347,7 @@ export default function Sidebar(props: SidebarProps) {
           <button className="icon-button" onClick={props.onSearch} aria-label="Search chats" title="Search chats"><Search size={16} /></button>
           <button className="icon-button" onClick={() => setPresenceOpen((open) => !open)} aria-label={`MetaSync presence, ${props.onlineMembers.length} online`} title={`${props.onlineMembers.length} room members online`}><span className="presence-badge"><UsersRound size={15} /></span></button>
           <button className="icon-button" onClick={props.onOpenSettings} aria-label="Settings" title="Settings"><Settings size={16} /></button>
-          <button className="collapsed-profile" onClick={props.onProfileTap} aria-label="Open profile">
+          <button className="collapsed-profile" onClick={() => avatarInput.current?.click()} aria-label="Upload profile picture">
             {props.pictureUrl ? <img src={props.pictureUrl} alt="" /> : props.displayName.slice(0, 1).toUpperCase()}
           </button>
           {presenceOpen && <div className="presence-popover collapsed-presence-popover" role="status">
@@ -346,6 +358,17 @@ export default function Sidebar(props: SidebarProps) {
           </div>}
         </div>
       )}
+      <input
+        ref={avatarInput}
+        accept="image/*"
+        className="visually-hidden"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          if (file) props.onAvatarSelected(file);
+          event.currentTarget.value = "";
+        }}
+        type="file"
+      />
     </aside>
   );
 }

@@ -26,6 +26,7 @@ interface AdminStats {
 }
 
 interface Telemetry {
+  users?: number;
   daily_token_limit: number;
   daily_tokens_burned: number;
   provider_waterfall: string;
@@ -45,6 +46,14 @@ interface Telemetry {
     library_items: number;
     completed_skill_capsules: number;
     non_cash_time_credits_earned: number;
+  };
+  grant_readiness: {
+    registered_profiles: number;
+    verified_social_profiles: number;
+    active_dau_mau_capacity: string;
+    cache_hit_rate_pct: number;
+    average_cost_per_task_usd: number;
+    grant_programs: Array<{ name: string; status: string }>;
   };
 }
 
@@ -81,6 +90,18 @@ const BASELINE_TELEMETRY: Telemetry = {
     library_items: 0,
     completed_skill_capsules: 0,
     non_cash_time_credits_earned: 0,
+  },
+  grant_readiness: {
+    registered_profiles: 0,
+    verified_social_profiles: 0,
+    active_dau_mau_capacity: "200,000 DAU @ 90% Cache",
+    cache_hit_rate_pct: 0,
+    average_cost_per_task_usd: 0.0002,
+    grant_programs: [
+      { name: "Google for Startups", status: "Evidence pack available" },
+      { name: "Microsoft Founders Hub", status: "Evidence pack available" },
+      { name: "Cloudflare Startup Plan", status: "Evidence pack available" },
+    ],
   },
 };
 
@@ -137,6 +158,12 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         investor_impact: {
           ...BASELINE_TELEMETRY.investor_impact,
           ...nextTelemetry.investor_impact,
+        },
+        grant_readiness: {
+          ...BASELINE_TELEMETRY.grant_readiness,
+          ...nextTelemetry.grant_readiness,
+          grant_programs: nextTelemetry.grant_readiness?.grant_programs
+            || BASELINE_TELEMETRY.grant_readiness.grant_programs,
         },
       });
       setDailyLimit(String(telemetryResult.value.daily_token_limit));
@@ -254,6 +281,35 @@ export default function AdminDashboard(props: AdminDashboardProps) {
     }
   }
 
+  function exportGrantEvidencePack() {
+    const report = {
+      report_title: "Genie Startup Grant Readiness & Capacity",
+      generated_at: new Date().toISOString(),
+      source: "Genie Admin Telemetry",
+      metrics: {
+        registered_profiles: telemetry.grant_readiness.registered_profiles,
+        verified_social_profiles: telemetry.grant_readiness.verified_social_profiles,
+        active_dau_mau_capacity: telemetry.grant_readiness.active_dau_mau_capacity,
+        cache_hit_rate_pct: telemetry.cache_hit_rate_pct,
+        average_cost_per_task_usd: telemetry.grant_readiness.average_cost_per_task_usd,
+        grant_programs: telemetry.grant_readiness.grant_programs,
+        provider_waterfall: telemetry.provider_waterfall,
+        pool_metrics: telemetry.pool_metrics,
+        investor_impact: telemetry.investor_impact,
+      },
+      note: "Operational estimates are telemetry snapshots and should be independently validated before submission.",
+    };
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `genie-grant-evidence-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="admin-modal dashboard-modal" role="dialog" aria-modal="true" aria-labelledby="dashboard-title">
@@ -307,6 +363,25 @@ export default function AdminDashboard(props: AdminDashboardProps) {
             <div><BarChart3 size={16} /><strong>{telemetry.investor_impact.completed_skill_capsules}</strong><small>Completed skill capsules</small></div>
             <div><BarChart3 size={16} /><strong>{telemetry.investor_impact.non_cash_time_credits_earned}</strong><small>Non-cash time credits earned</small></div>
           </div>
+        </section>
+
+        <section className="admin-vip-section" aria-label="Startup Grant Readiness and Capacity">
+          <h3>Startup Grant Readiness &amp; Capacity</h3>
+          <div className="admin-stats-grid">
+            <div><Users size={16} /><strong>{telemetry.grant_readiness.registered_profiles.toLocaleString()}</strong><small>Registered profiles</small></div>
+            <div><Users size={16} /><strong>{telemetry.grant_readiness.verified_social_profiles.toLocaleString()}</strong><small>Verified social profiles</small></div>
+            <div><BarChart3 size={16} /><strong>{telemetry.grant_readiness.active_dau_mau_capacity}</strong><small>Capacity estimate</small></div>
+            <div><BarChart3 size={16} /><strong>${telemetry.grant_readiness.average_cost_per_task_usd.toFixed(4)}</strong><small>Average cost per task</small></div>
+          </div>
+          <p>Cache hit rate: {telemetry.cache_hit_rate_pct.toFixed(2)}%</p>
+          {telemetry.grant_readiness.grant_programs.map((program) => (
+            <div className="admin-vip-row" key={program.name}>
+              <span>{program.name}</span><span>{program.status}</span>
+            </div>
+          ))}
+          <button className="passkey-secondary" onClick={exportGrantEvidencePack} type="button">
+            📥 Export Grant Evidence Pack (JSON / Report)
+          </button>
         </section>
 
         {!props.localOnly && (

@@ -131,7 +131,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .user-row { align-items: flex-end; }
 .assistant-row { align-items: flex-start; }
 .message-bubble { border: 1px solid transparent; border-radius: 17px; font-size: 14px; line-height: 1.68; max-width: min(680px, 92%); overflow-wrap: anywhere; padding: 12px 16px; position: relative; white-space: pre-wrap; }
-.message-sender { color: #4f554c; font-size: 11px; font-weight: 750; line-height: 1.35; margin: 0 0 6px; }
+.message-sender { align-items: center; color: #4f554c; display: flex; font-size: 11px; font-weight: 750; gap: 6px; line-height: 1.35; margin: 0 0 6px; }
+.chat-profile-avatar { border-radius: 50%; height: 22px; object-fit: cover; width: 22px; }
 .message-row-selecting .message-bubble { cursor: pointer; }
 .user-bubble { background: #edf0e9; border-color: #e4e8df; color: #30372f; border-bottom-right-radius: 5px; }
 .assistant-bubble { background: transparent; color: #30332e; padding-left: 3px; }
@@ -336,6 +337,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .friends-grid .section-card h2, .notebook-card-head h2 { font: 600 15px Manrope, sans-serif; margin: 0 0 13px; }
 .friends-grid .section-card h3 { color: #72746c; font-size: 11px; margin: 20px 0 7px; }
 .request-row, .friend-row { align-items: center; border-top: 1px solid #f0eee8; display: flex; gap: 8px; padding: 9px 0; }
+.friend-avatar { border-radius: 50%; height: 32px; object-fit: cover; width: 32px; }
+.friend-avatar-fallback { align-items: center; background: #edf3f2; color: #526b72; display: inline-flex; font-size: 12px; justify-content: center; }
+.social-profile-form { display: grid; gap: 10px; margin: 12px 0 20px; }
+.social-profile-form > label { color: #62655d; display: grid; font-size: 11px; gap: 5px; }
+.social-profile-form input:not([type="checkbox"]), .social-profile-form textarea { border: 1px solid var(--line); border-radius: 8px; color: #35382f; padding: 8px 10px; width: 100%; }
+.social-profile-form .discoverability-toggle { align-items: center; display: flex; gap: 8px; }
+.social-profile-avatar { align-items: center; display: flex; gap: 10px; }
+.social-profile-avatar button { align-items: center; background: #eef4f4; border: 1px solid var(--line); border-radius: 50%; color: #526b72; display: flex; height: 64px; justify-content: center; overflow: hidden; width: 64px; }
+.social-profile-avatar img { height: 100%; object-fit: cover; width: 100%; }
+.social-profile-avatar > span, .profile-complete-label { color: #6f7469; font-size: 10px; }
+.friend-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
+.friend-tabs button { background: #f8f8f5; border: 1px solid var(--line); border-radius: 999px; color: #5d625a; font-size: 10px; padding: 7px 10px; }
+.friend-tabs button[aria-selected="true"] { background: #eaf5f6; border-color: #9dc5cc; color: #245c68; }
+.friends-actions { display: flex; gap: 5px; margin-left: auto; }
+.friends-state-badge { color: #3c795d; font-size: 10px; margin-left: auto; }
 .request-row span strong, .request-row span small { display: block; }
 .request-row span strong, .friend-row > span:nth-child(2) { color: #4b4f46; font-size: 11px; }
 .request-row span small, .friend-row small { color: #9a9b92; font-size: 9px; margin-top: 3px; }
@@ -412,6 +428,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .profile-footer-module { align-items: center; display: flex; flex: 1; gap: 8px; min-width: 0; }
 .profile-footer-module > img { border-radius: 50%; height: 28px; object-fit: cover; width: 28px; }
 .profile-footer-module > span { display: grid; min-width: 0; }
+.profile-avatar-upload { align-items: center; background: transparent; border: 0; border-radius: 50%; color: #69736e; display: flex; flex: 0 0 28px; height: 28px; justify-content: center; overflow: hidden; padding: 0; width: 28px; }
+.profile-avatar-upload img { height: 100%; object-fit: cover; width: 100%; }
+.profile-footer-details { background: transparent; border: 0; cursor: pointer; display: grid; min-width: 0; padding: 0; text-align: left; }
+.sidebar-notification-badge { background: #d54b4b; border-radius: 999px; color: white; font-size: 9px; line-height: 16px; margin-left: auto; min-width: 16px; padding: 0 5px; text-align: center; }
 .profile-footer-module strong { color: #61655d; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .profile-footer-module small { color: #999b93; font-size: 9px; }
 .brand-mark-svg { display: block; flex: 0 0 auto; }
