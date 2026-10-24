@@ -2,6 +2,7 @@
 
 import { AudioLines, PhoneCall, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import LiveAgentCallDock from "@/components/genie/modules/LiveAgentCallDock";
 
 export interface RoomPerson {
   user_sub: string;
@@ -39,6 +40,7 @@ export default function RightSideRail(props: RightSideRailProps) {
   const [genieSummoned, setGenieSummoned] = useState(false);
   const [callPickerOpen, setCallPickerOpen] = useState(false);
   const localStream = useRef<MediaStream | null>(null);
+  const screenShareStream = useRef<MediaStream | null>(null);
   const peers = useRef<Map<string, RTCPeerConnection>>(new Map());
 
   useEffect(() => {
@@ -165,6 +167,31 @@ export default function RightSideRail(props: RightSideRailProps) {
     setLocalMicEnabled(enabled);
   }
 
+  async function syncScreenShare(stream: MediaStream | null) {
+    const previousStream = screenShareStream.current;
+    if (previousStream && localStream.current) {
+      for (const track of previousStream.getTracks()) {
+        localStream.current.removeTrack(track);
+        for (const peer of peers.current.values()) {
+          const sender = peer.getSenders().find((candidate) => candidate.track?.id === track.id);
+          if (sender) await sender.replaceTrack(null);
+        }
+      }
+    }
+    screenShareStream.current = stream;
+    if (!stream || !localStream.current) return;
+
+    for (const track of stream.getTracks()) {
+      localStream.current.addTrack(track);
+      for (const [userSub, peer] of peers.current) {
+        peer.addTrack(track, stream);
+        const offer = await peer.createOffer();
+        await peer.setLocalDescription(offer);
+        props.onSendSignal(userSub, offer);
+      }
+    }
+  }
+
   async function toggleLocalVideo() {
     if (localVideoEnabled) {
       const tracks = localStream.current?.getVideoTracks() || [];
@@ -212,6 +239,7 @@ export default function RightSideRail(props: RightSideRailProps) {
     peers.current.clear();
     localStream.current?.getTracks().forEach((track) => track.stop());
     localStream.current = null;
+    screenShareStream.current = null;
     props.onLocalStreamChange?.(null);
     setRemoteStreams({});
     setLocalVideoEnabled(false);
@@ -288,9 +316,20 @@ export default function RightSideRail(props: RightSideRailProps) {
               <span className="call-dock-genie-status">Summoned</span>
             </div>
           )}
+          <LiveAgentCallDock
+            activeSpeakerName={props.members.find((member) => member.user_sub === props.mySub)?.user_name || "You"}
+            activeSpeakerStatus="Connected"
+            audioEnabled={localMicEnabled}
+            cameraStream={localStream.current}
+            liveAiLabel="Genie"
+            liveAiStatus={genieSummoned ? "In the room" : "Ready"}
+            onEndCall={endCall}
+            onScreenShareChange={(stream) => { void syncScreenShare(stream).catch(() => setCallError("Screen sharing could not be synchronized with every call participant.")); }}
+            onToggleAudio={toggleLocalMic}
+            onToggleVideo={() => void toggleLocalVideo()}
+            videoEnabled={localVideoEnabled}
+          />
           <div className="active-call-dock-controls">
-            <button type="button" onClick={toggleLocalMic}>🎤 Mic {localMicEnabled ? "On" : "Off"}</button>
-            <button type="button" onClick={() => void toggleLocalVideo()}>📹 Video {localVideoEnabled ? "On" : "Off"}</button>
             {Object.entries(remoteStreams).map(([userSub, media]) => {
               const name = props.members.find((member) => member.user_sub === userSub)?.user_name || "Member";
               const audioEnabled = media.getAudioTracks().some((track) => track.enabled);

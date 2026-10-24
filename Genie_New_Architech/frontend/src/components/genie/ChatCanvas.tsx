@@ -17,6 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import ArrowActionToolbar from "@/modules/messages_arrows/ArrowActionToolbar";
 import InlineMessageEditor from "@/modules/messages_arrows/InlineMessageEditor";
 import MessageInfoLedgerModal from "@/modules/messages_arrows/MessageInfoLedgerModal";
+import TeamsMessageReactions from "@/components/genie/modules/TeamsMessageReactions";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import { requestVipPass, type MasterQuota } from "@/lib/api";
 import type { ReactNode } from "react";
@@ -78,6 +79,7 @@ interface ChatCanvasProps {
   onLoadLedger?: (messageId: string) => Promise<Partial<ChatMessage>>;
   reactionCounts?: Record<string, Record<string, number>>;
   onReact?: (message: ChatMessage, target: "user_message" | "ai_response", emoji: string) => void;
+  onFeedback?: (message: ChatMessage, rating: "up" | "down") => void;
   onReadAloud?: (message: ChatMessage) => void;
   onCopyResponse?: (message: ChatMessage) => void;
   onRegenerateResponse?: (message: ChatMessage) => void;
@@ -627,35 +629,38 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                   )}
                   <button
                     type="button"
-                    disabled={!props.activeRoom}
-                    onClick={() => props.onReact?.(message, "ai_response", "👍")}
+                    disabled={!props.onFeedback && !props.activeRoom}
+                    onClick={() => props.onFeedback
+                      ? props.onFeedback(message, "up")
+                      : props.onReact?.(message, "ai_response", "👍")}
                     aria-label="Like AI response"
                   ><ThumbsUp size={15} /></button>
                   <button
                     type="button"
-                    disabled={!props.activeRoom}
-                    onClick={() => props.onReact?.(message, "ai_response", "👎")}
+                    disabled={!props.onFeedback && !props.activeRoom}
+                    onClick={() => props.onFeedback
+                      ? props.onFeedback(message, "down")
+                      : props.onReact?.(message, "ai_response", "👎")}
                     aria-label="Dislike AI response"
                   ><ThumbsDown size={15} /></button>
                 </div>
                 </>
               )}
-              {props.activeRoom && !message.is_secret && (message.role === "user" || message.is_group_shared_ai_response) && (
+              {props.onReact && !message.is_secret && (
                 <div className="message-reaction-bar" aria-label="Message reactions">
-                  {["👍", "❤️", "😂", "🎉"].map((emoji) => (
-                    <button
-                      type="button"
-                      key={emoji}
-                      onClick={() => props.onReact?.(
-                        message,
-                        message.role === "user" ? "user_message" : "ai_response",
-                        emoji,
-                      )}
-                      aria-label={`React with ${emoji}`}
-                    >
-                      {emoji}
-                    </button>
-                  ))}
+                  <TeamsMessageReactions
+                    ariaLabel="Message reactions"
+                    onToggle={(emoji) => props.onReact?.(
+                      message,
+                      message.role === "user" ? "user_message" : "ai_response",
+                      emoji,
+                    )}
+                    reactions={Object.entries(
+                      props.reactionCounts?.[
+                        `${message.role === "user" ? "user_message" : "ai_response"}:${message.id}`
+                      ] || {},
+                    ).map(([emoji, count]) => ({ emoji, count }))}
+                  />
                 </div>
               )}
               {props.activeRoom && message.role === "user" && (status === "read_no_ai" || status === "yellow_no_ai") && !hasReview && !message.is_secret && (
