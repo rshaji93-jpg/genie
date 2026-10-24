@@ -20,13 +20,7 @@ interface AdminStats {
 interface Telemetry {
   daily_token_limit: number;
   daily_tokens_burned: number;
-  free_keys_configured: number;
-  free_keys_active: number;
-  free_pool_capacity_estimate: number;
-  estimated_dau_capacity: number;
-  master_key_isolated: boolean;
-  master_key_configured: boolean;
-  gemini_free_pool_enabled: boolean;
+  provider_waterfall: string;
   vip_pass_limit: number;
   vip_passes_allocated: number;
   vip_passes_claimed: number;
@@ -56,13 +50,7 @@ interface PoolMetric {
 const BASELINE_TELEMETRY: Telemetry = {
   daily_token_limit: 25,
   daily_tokens_burned: 0,
-  free_keys_configured: 0,
-  free_keys_active: 0,
-  free_pool_capacity_estimate: 0,
-  estimated_dau_capacity: 0,
-  master_key_isolated: true,
-  master_key_configured: false,
-  gemini_free_pool_enabled: false,
+  provider_waterfall: "Gemini-Free Argon Brain Waterfall",
   vip_pass_limit: 20,
   vip_passes_allocated: 0,
   vip_passes_claimed: 0,
@@ -75,12 +63,11 @@ const BASELINE_TELEMETRY: Telemetry = {
   latency_p95_ms: 0,
   pool_metrics: [
     { id: "pool0", name: "Pool 0 · Local Cache", requests: 0, configured: true },
-    { id: "pool1", name: "Pool 1 · Gemini Free Rotator", requests: 0, configured: false },
-    { id: "pool2", name: "Pool 2 · Cloudflare 10,000 Neurons", requests: 0, configured: false },
-    { id: "pool3", name: "Pool 3 · Groq", requests: 0, configured: false },
-    { id: "pool4", name: "Pool 4 · Mistral", requests: 0, configured: false },
-    { id: "pool5", name: "Pool 5 · OpenRouter / Cerebras", requests: 0, configured: false },
-    { id: "pool6", name: "Pool 6 · Pollinations", requests: 0, configured: true },
+    { id: "pool1", name: "Pool 1 · Groq / Cerebras 70B", requests: 0, configured: false },
+    { id: "pool2", name: "Pool 2 · OpenRouter / GitHub Models 70B", requests: 0, configured: false },
+    { id: "pool3", name: "Pool 3 · Mistral", requests: 0, configured: false },
+    { id: "pool4", name: "Pool 4 · OpenAI Zero-Key Gateway", requests: 0, configured: true },
+    { id: "pool5", name: "Pool 5 · Cloudflare Utility", requests: 0, configured: false },
   ],
   investor_impact: {
     library_items: 0,
@@ -96,18 +83,6 @@ interface VipPass {
   claimed_at: string | null;
 }
 
-interface OverflowRequest {
-  id: string;
-  requester: string;
-  created_at: number;
-}
-
-interface PoolStatus {
-  master_pool_enabled: boolean;
-  master_key_configured: boolean;
-  requests: OverflowRequest[];
-}
-
 interface AdminDashboardProps {
   stats: AdminStats | null;
   credential: string;
@@ -120,7 +95,6 @@ interface AdminDashboardProps {
 export default function AdminDashboard(props: AdminDashboardProps) {
   const [telemetry, setTelemetry] = useState<Telemetry>(BASELINE_TELEMETRY);
   const [passes, setPasses] = useState<VipPass[]>([]);
-  const [poolStatus, setPoolStatus] = useState<PoolStatus | null>(null);
   const [dailyLimit, setDailyLimit] = useState("25");
   const [totpCode, setTotpCode] = useState("");
   const [oneTimeCode, setOneTimeCode] = useState("");
@@ -128,12 +102,10 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    const [telemetryResult, passesResult, poolResult] = await Promise.allSettled([
+    if (props.localOnly) return;
+    const [telemetryResult, passesResult] = await Promise.allSettled([
       apiFetchAdminTelemetry<Telemetry>(props.credential, props.adminToken),
       apiFetch<VipPass[]>("/api/admin/vip-passes", props.credential, {
-        headers: { "X-Genie-Admin-Session": props.adminToken },
-      }),
-      apiFetch<PoolStatus>("/api/admin/pool/overflow", props.credential, {
         headers: { "X-Genie-Admin-Session": props.adminToken },
       }),
     ]);
@@ -163,26 +135,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         : "Admin telemetry could not be loaded; showing baseline metrics.");
     }
     if (passesResult.status === "fulfilled") setPasses(passesResult.value);
-    if (poolResult.status === "fulfilled") setPoolStatus(poolResult.value);
   }, [props.adminToken, props.credential, props.localOnly, props.onLocalFallback]);
-
-  const refreshPool = useCallback(async () => {
-    const nextPoolStatus = await apiFetch<PoolStatus>("/api/admin/pool/overflow", props.credential, {
-      headers: { "X-Genie-Admin-Session": props.adminToken },
-    });
-    setPoolStatus(nextPoolStatus);
-  }, [props.adminToken, props.credential, props.localOnly]);
-
-  useEffect(() => {
-    if (!props.stats || props.localOnly) return;
-    const timer = window.setInterval(() => {
-      void refreshPool().catch((caught: unknown) => {
-        if (isBackendUnavailable(caught) && props.onLocalFallback()) return;
-        setError(caught instanceof Error ? caught.message : "Pool status could not be refreshed.");
-      });
-    }, 5000);
-    return () => window.clearInterval(timer);
-  }, [props.localOnly, props.onLocalFallback, props.stats, refreshPool]);
 
   useEffect(() => {
     if (!props.stats) return;
@@ -194,18 +147,13 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }, [props.localOnly, props.onLocalFallback, props.stats, refresh]);
 
   if (!props.stats) return null;
+  const hasConfiguredProvider = telemetry.pool_metrics.some((pool) => pool.configured);
   const systemStatus = error
     ? "Error"
-    : telemetry && (!telemetry.gemini_free_pool_enabled || telemetry.free_keys_active === 0)
-      ? "Fallback"
-      : telemetry
-        ? "Operational"
-        : null;
-  const fallbackReason = telemetry && !telemetry.gemini_free_pool_enabled
-    ? "Gemini free-pool routing is disabled; requests use the primary provider chain."
-    : telemetry?.free_keys_active === 0
-      ? "No free-pool keys are available; requests use the configured provider fallback chain."
-      : "";
+    : hasConfiguredProvider
+      ? "Operational"
+      : "Fallback";
+  const fallbackReason = "No AI providers are currently configured.";
 
   async function saveLimit() {
     if (props.localOnly) return;
@@ -245,60 +193,6 @@ export default function AdminDashboard(props: AdminDashboardProps) {
     }
   }
 
-  async function toggleMasterPooling(enabled: boolean) {
-    if (props.localOnly) return;
-    setBusy(true);
-    setError("");
-    try {
-      await apiFetch("/api/admin/pool/master-pooling", props.credential, {
-        method: "POST",
-        headers: { "X-Genie-Admin-Session": props.adminToken },
-        body: JSON.stringify({ enabled }),
-      });
-      await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Master-key pool setting could not be changed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function toggleTelemetryGeminiPool(enabled: boolean) {
-    if (props.localOnly) return;
-    setBusy(true);
-    setError("");
-    try {
-      await apiFetch("/api/admin/telemetry/gemini-pool", props.credential, {
-        method: "POST",
-        headers: { "X-Genie-Admin-Session": props.adminToken },
-        body: JSON.stringify({ enabled }),
-      });
-      await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Gemini telemetry routing could not be changed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function decideOverflow(requestId: string, accept: boolean) {
-    if (props.localOnly) return;
-    setBusy(true);
-    setError("");
-    try {
-      await apiFetch(`/api/admin/pool/overflow/${encodeURIComponent(requestId)}`, props.credential, {
-        method: "POST",
-        headers: { "X-Genie-Admin-Session": props.adminToken },
-        body: JSON.stringify({ accept }),
-      });
-      await refresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Overflow request could not be updated.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="admin-modal dashboard-modal" role="dialog" aria-modal="true" aria-labelledby="dashboard-title">
@@ -306,6 +200,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         <div className="admin-lock"><BarChart3 size={22} /></div>
         <span className="eyebrow">PASSKEY-VERIFIED · EXPIRES {new Date(props.stats.expires_at * 1000).toLocaleTimeString()}</span>
         <h2 id="dashboard-title">Admin Telemetry</h2>
+        <p>{telemetry.provider_waterfall}</p>
         <p>Operational aggregates only. Encrypted room content and provider credentials are never shown.</p>
         {systemStatus && (
           <div className="admin-system-status" role="status">
@@ -327,7 +222,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         </div>
 
         <section className="admin-vip-section" aria-label="Global AI pool telemetry">
-          <h3>Global AI Pools</h3>
+          <h3>Gemini-Free Argon Brain Waterfall</h3>
           {(props.localOnly || error) && (
             <p role="status">Showing baseline metrics; live values update when the authenticated backend responds.</p>
           )}
@@ -357,51 +252,8 @@ export default function AdminDashboard(props: AdminDashboardProps) {
           <>
             <div className="admin-stats-grid">
               <div><BarChart3 size={16} /><strong>{telemetry.daily_tokens_burned}</strong><small>AI tokens charged · rolling 24h</small></div>
-              <div><BarChart3 size={16} /><strong>{telemetry.free_keys_active}/{telemetry.free_keys_configured}</strong><small>Free keys currently available</small></div>
-              <div><LockKeyhole size={16} /><strong>{telemetry.master_key_isolated ? "Isolated" : "Check configuration"}</strong><small>Master key access boundary</small></div>
-              <div><Users size={16} /><strong>{telemetry.estimated_dau_capacity.toLocaleString()}</strong><small>Estimated DAU at current limit (pool estimate)</small></div>
+              <div><Users size={16} /><strong>{telemetry.vip_passes_active}</strong><small>Active VIP passes</small></div>
             </div>
-            <p className="admin-telemetry-note">
-              Free pool capacity estimate: {telemetry.free_pool_capacity_estimate.toLocaleString()} requests/day ·
-              Master key {telemetry.master_key_configured ? "configured" : "not configured"}.
-            </p>
-            <section className="admin-vip-section" aria-label="Admin telemetry model routing">
-              <h3>Telemetry-gated Gemini routing</h3>
-              <p>When enabled, complex reasoning requests may use the Gemini free pool. Standard requests stay on the primary provider chain.</p>
-              <label className="settings-checkbox">
-                <input
-                  checked={telemetry.gemini_free_pool_enabled}
-                  disabled={busy}
-                  onChange={(event) => void toggleTelemetryGeminiPool(event.target.checked)}
-                  type="checkbox"
-                />
-                Gemini free pool: {telemetry.gemini_free_pool_enabled ? "ON" : "OFF"}
-              </label>
-            </section>
-            {poolStatus && (
-              <section className="admin-vip-section" aria-label="Free pool overflow controls">
-                <h3>Pool Master Key with 9 Free Keys: {poolStatus.master_pool_enabled ? "ON" : "OFF"}</h3>
-                <p>The pay-as-you-go key remains isolated unless you enable it here and approve a staged request.</p>
-                <label className="settings-checkbox">
-                  <input
-                    checked={poolStatus.master_pool_enabled}
-                    disabled={busy || !poolStatus.master_key_configured}
-                    onChange={(event) => void toggleMasterPooling(event.target.checked)}
-                    type="checkbox"
-                  />
-                  Pool Master Key with 9 Free Keys: {poolStatus.master_pool_enabled ? "ON" : "OFF"}
-                </label>
-                {!poolStatus.master_key_configured && <p role="status">Master key is not configured.</p>}
-                {poolStatus.requests.map((request) => (
-                  <div className="admin-vip-row" key={request.id} role="alert">
-                    <span>Free pool exhausted · {request.requester} · {new Date(request.created_at * 1000).toLocaleTimeString()}</span>
-                    <button disabled={busy || !poolStatus.master_pool_enabled} onClick={() => void decideOverflow(request.id, true)}>Accept</button>
-                    <button disabled={busy} onClick={() => void decideOverflow(request.id, false)}>Reject</button>
-                  </div>
-                ))}
-                {!poolStatus.requests.length && <p>No overflow requests are waiting.</p>}
-              </section>
-            )}
             <div className="admin-config-row">
               <label htmlFor="daily-token-limit">Hidden daily allowance</label>
               <select id="daily-token-limit" value={dailyLimit} onChange={(event) => setDailyLimit(event.target.value)}>

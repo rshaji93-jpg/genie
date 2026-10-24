@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import tempfile
@@ -32,6 +33,14 @@ class BackendApiTests(unittest.TestCase):
         )
         self.provider_probe_patch.start()
         self.addCleanup(self.provider_probe_patch.stop)
+        self.grounding_patch = patch.object(
+            orchestrator,
+            "fetch_live_grounding",
+            new_callable=AsyncMock,
+            return_value="",
+        )
+        self.grounding_patch.start()
+        self.addCleanup(self.grounding_patch.stop)
         self.client = TestClient(main.app)
 
     def tearDown(self):
@@ -318,10 +327,7 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["reply"], "Context-aware answer")
-        self.assertEqual(
-            response.json()["sub_agents"],
-            ["Coordinator Agent", "Context & Memory Agent", "Execution Agent"],
-        )
+        self.assertEqual(response.json()["sub_agents"], ["Argon Cognitive Brain"])
         provider.assert_awaited_once()
         prompt = provider.await_args.args[0]
         self.assertEqual(prompt[0]["role"], "system")
@@ -351,7 +357,7 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["reply"], "Fallback provider answer")
-        self.assertEqual(response.json()["sub_agents"], ["Execution Agent"])
+        self.assertEqual(response.json()["sub_agents"], ["Argon Cognitive Brain"])
         fallback.assert_awaited_once()
         self.assertIn("Current date and time:", fallback.await_args.args[0][0]["content"])
 
@@ -426,17 +432,30 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("Live AI providers are temporarily unavailable", response.text)
         self.assertIn("event: done", response.text)
 
-    def test_agent_router_keeps_dynamic_instruction_as_system_context(self):
+    def test_argon_prompt_keeps_dynamic_instruction_and_verified_grounding(self):
         prompt = [
-            {"role": "system", "content": "Current date and time: Thursday, 22 October 2026, 04:55 PM IST."},
             {"role": "user", "content": "What day is it?"},
         ]
+        router = AsyncMock()
+        router.complete.return_value = ("The verified answer.", "pool-test")
+        brain = orchestrator.MasterBrain(router=router)
+        with patch.object(
+            orchestrator,
+            "fetch_live_grounding",
+            new_callable=AsyncMock,
+            return_value="- English Wikipedia: verified fact",
+        ):
+            result = asyncio.run(
+                brain.run(prompt, user_sub=self.actor["sub"])
+            )
 
-        routed = main.agent_router._build_chat_messages(prompt)
-
-        self.assertEqual(routed[0]["role"], "system")
-        self.assertIn("Current date and time:", routed[0]["content"])
-        self.assertEqual(routed[1], {"role": "user", "content": "What day is it?"})
+        system_prompt = router.complete.await_args.args[0][0]["content"]
+        self.assertIn("Argon Cognitive Brain", system_prompt)
+        self.assertIn("Current date and time:", system_prompt)
+        self.assertIn("[VERIFIED GROUNDING CONTEXT]", system_prompt)
+        self.assertIn("English Wikipedia: verified fact", system_prompt)
+        self.assertIn("read_only=True", system_prompt)
+        self.assertEqual(result["reply"], "The verified answer.")
 
     def test_stream_chat_uses_tier_orchestrator_and_reports_agents(self):
         with patch.object(
@@ -455,7 +474,7 @@ class BackendApiTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertIn('"sub_agents": ["Coordinator Agent", "Context & Memory Agent", "Execution Agent"]', response.text)
+        self.assertIn('"sub_agents": ["Argon Cognitive Brain"]', response.text)
         self.assertIn('"text": "Streamed orchestrated answer"', response.text)
         prompt = provider.await_args.args[0]
         self.assertIn("Current date and time:", prompt[0]["content"])
@@ -472,32 +491,30 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403, response.text)
 
-    def test_master_tier_runs_all_orchestration_stages(self):
-        self.actor["email"] = main.SUPER_ADMIN_EMAIL
-        request = main.ChatRequest(
-            message="Design a resilient workflow.",
-            model_tier="genie-master",
-        )
-        messages = main.clean_ai_messages(main.effective_chat_messages(request))
+    def test_master_tier_uses_single_argon_waterfall_completion(self):
+        router = AsyncMock()
+        router.complete.return_value = ("Verified response", "pool4-pollinations")
+        brain = orchestrator.MasterBrain(router=router)
         with patch.object(
-            main.gemini_pool,
-            "chat",
-            side_effect=["Plan", "Research", "Solution", "Verified response"],
-        ) as provider:
-            reply = main.agentic_gemini_reply(
-                request,
-                messages,
-                self.actor,
+            orchestrator,
+            "fetch_live_grounding",
+            new_callable=AsyncMock,
+            return_value="",
+        ):
+            result = asyncio.run(
+                brain.run(
+                    [{"role": "user", "content": "Design a resilient workflow."}],
+                    user_sub=self.actor["sub"],
+                    model_tier="genie-master",
+                )
             )
 
-        self.assertEqual(reply, "Verified response")
-        self.assertEqual(provider.call_count, 4)
+        self.assertEqual(result["reply"], "Verified response")
+        router.complete.assert_awaited_once()
         self.assertEqual(
-            main.agent_names_for_request(request),
-            ["Planner Agent", "Research Agent", "Execution Agent", "Critic Agent"],
+            result["sub_agents"],
+            ["Argon Cognitive Brain", "Research (read-only)", "Synthesis"],
         )
-        self.assertIn("Planner Agent", provider.call_args_list[0].args[0][0]["content"])
-        self.assertIn("Critic Agent", provider.call_args_list[-1].args[0][0]["content"])
 
     def test_secret_chat_is_local_and_does_not_call_provider(self):
         with patch.object(main.gemini_pool, "chat", side_effect=AssertionError("provider called")) as provider:
@@ -562,7 +579,8 @@ class BackendApiTests(unittest.TestCase):
             },
         ):
             ordinary = self.client.get("/api/ai/status").json()
-            self.assertEqual(ordinary["genie_master_retry_seconds"], 30)
+            self.assertEqual(ordinary["provider"], "argon-waterfall")
+            self.assertEqual(ordinary["genie_master_retry_seconds"], 0)
 
     def test_chat_returns_local_fallback_when_all_providers_fail(self):
         with (
@@ -795,8 +813,12 @@ class BackendApiTests(unittest.TestCase):
             connection.commit()
         with (
             patch.object(main, "_master_access", return_value=True),
-            patch.object(main.multi_provider_pool, "chat", return_value="summary") as summarize,
-            patch.object(main.agent_router, "chat", return_value="review reply") as master,
+            patch.object(
+                main.master_brain,
+                "run",
+                new_callable=AsyncMock,
+                return_value={"reply": "review reply"},
+            ) as master,
         ):
             response = self.client.post(
                 f"/api/rooms/{room_id}/messages/{message_id}/review",
@@ -810,13 +832,10 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["tokens_burned"], 1)
         self.assertEqual(response.json()["triggered_by_sub"], self.actor["sub"])
-        summarize.assert_called_once()
-        summary_context = summarize.call_args.args[0]
-        self.assertEqual(len(summary_context), 1)
-        self.assertNotIn(SECRET_MARKER, summary_context[0]["content"])
-        self.assertEqual(master.call_count, 4)
-        self.assertIn("Planner Agent", master.call_args_list[0].args[0][0]["content"])
-        self.assertIn("Critic Agent", master.call_args_list[-1].args[0][0]["content"])
+        master.assert_awaited_once()
+        review_context = master.await_args.args[0][0]["content"]
+        self.assertIn("Keep this context", review_context)
+        self.assertNotIn(SECRET_MARKER, review_context)
         with closing(main.database()) as connection:
             row = connection.execute(
                 """
