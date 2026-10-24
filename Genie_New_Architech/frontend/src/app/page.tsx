@@ -1891,6 +1891,7 @@ export default function Home() {
           sub_agents?: string[];
           proposed_memory?: ChatMessage["proposed_memory"];
           proposed_memory_id?: string;
+          master_quota?: ChatMessage["master_quota"];
         };
         const replyText = data.reply || data.response || data.content || data.message || data.text;
 
@@ -1905,6 +1906,7 @@ export default function Home() {
               sub_agents: data.sub_agents,
               proposed_memory: data.proposed_memory,
               proposed_memory_id: data.proposed_memory_id,
+              master_quota: data.master_quota,
             }
           : message));
         if (room && (requestChatMode === "ai_room" || regenerate?.visibility === "group")) {
@@ -1950,15 +1952,22 @@ export default function Home() {
                 sub_agents?: string[];
                 proposed_memory?: ChatMessage["proposed_memory"];
                 proposed_memory_id?: string;
+                master_quota?: ChatMessage["master_quota"];
               };
               const textVal = payload.text || payload.reply || payload.response || payload.content;
-              if (eventType === "metadata" && (payload.sub_agents || payload.proposed_memory || payload.proposed_memory_id)) {
+              if (eventType === "metadata" && (
+                payload.sub_agents
+                || payload.proposed_memory
+                || payload.proposed_memory_id
+                || payload.master_quota
+              )) {
                 setMessages((current) => current.map((message) => message.id === assistantId
                   ? {
                       ...message,
                       sub_agents: payload.sub_agents,
                       proposed_memory: payload.proposed_memory as ChatMessage["proposed_memory"],
                       proposed_memory_id: typeof payload.proposed_memory_id === "string" ? payload.proposed_memory_id : undefined,
+                      master_quota: payload.master_quota,
                     }
                   : message));
               } else if ((eventType === "token" || eventType === "message") && textVal) {
@@ -3307,6 +3316,8 @@ export default function Home() {
             loading={sending}
             activeRoom={Boolean(room)}
             mySub={identity.sub}
+            myName={identity.name}
+            credential={credential}
             onReview={(id) => void reviewMessage(id)}
             onVerify={(id) => void verifyMessage(id)}
             onRefine={() => setToast("Each room message can receive one AI review. The current review remains available above.")}

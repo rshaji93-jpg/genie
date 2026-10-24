@@ -24,6 +24,11 @@ class BackendApiTests(unittest.TestCase):
         self.actor = {"sub": "test-user-123", "name": "Test User", "email": "test@example.com"}
         with orchestrator._PUBLIC_CACHE_LOCK:
             orchestrator._PUBLIC_CACHE.clear()
+        with closing(main.database()) as connection:
+            connection.execute("DELETE FROM master_quota_windows")
+            connection.execute("DELETE FROM vip_pass_requests")
+            connection.execute("DELETE FROM vip_passes")
+            connection.commit()
         main.app.dependency_overrides[main.current_identity] = lambda: self.actor
         main.app.dependency_overrides[main.optional_read_identity] = lambda: self.actor
         self.provider_probe_patch = patch.object(
@@ -480,16 +485,122 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("Current date and time:", prompt[0]["content"])
         self.assertIn("This is a shared-room request.", prompt[0]["content"])
 
-    def test_chat_tier_master_requires_access(self):
-        response = self.client.post(
-            "/api/chat",
+    def test_chat_master_is_open_and_returns_four_by_four_quota(self):
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Master answer.", "pool-test"),
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "Design a useful workflow.",
+                    "model_tier": "genie-master",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["master_quota"]["used"], 1)
+        self.assertEqual(response.json()["master_quota"]["limit"], 4)
+        self.assertEqual(response.json()["master_quota"]["remaining"], 3)
+        self.assertFalse(response.json()["master_quota"]["vip_active"])
+
+    def test_fifth_master_request_downgrades_to_pro_and_returns_200(self):
+        with patch.object(
+            main.multi_pool_router,
+            "complete",
+            new_callable=AsyncMock,
+            return_value=("Answer.", "pool-test"),
+        ) as provider:
+            responses = [
+                self.client.post(
+                    "/api/chat",
+                    json={
+                        "message": f"Question number {index} about architecture",
+                        "model_tier": "genie-master",
+                    },
+                )
+                for index in range(1, 6)
+            ]
+
+        self.assertTrue(all(response.status_code == 200 for response in responses))
+        for index, response in enumerate(responses[:4], start=1):
+            self.assertEqual(response.json()["master_quota"]["used"], index)
+            self.assertEqual(response.json()["master_quota"]["remaining"], 4 - index)
+            self.assertEqual(len(response.json()["sub_agents"]), 3)
+        fifth = responses[4].json()
+        self.assertEqual(fifth["master_quota"]["used"], 4)
+        self.assertEqual(fifth["master_quota"]["remaining"], 0)
+        self.assertEqual(fifth["master_quota"]["downgraded_to"], "genie-pro")
+        self.assertTrue(fifth["master_quota"]["can_request_vip"])
+        self.assertEqual(fifth["sub_agents"], ["Argon Cognitive Brain"])
+        self.assertEqual(provider.await_count, 5)
+
+    def test_master_quota_resets_after_four_hours_and_vip_bypasses(self):
+        identity = {"sub": "rolling-window-user", "email": "user@example.com"}
+        with patch.object(main.time, "time", side_effect=[1000.0, 1001.0, 1002.0, 1003.0, 1004.0, 15400.0]):
+            first_four = [main.consume_master_quota(identity) for _ in range(4)]
+            exhausted = main.consume_master_quota(identity)
+            reset = main.consume_master_quota(identity)
+
+        self.assertTrue(all(allowed for _, allowed in first_four))
+        self.assertEqual(first_four[-1][0]["used"], 4)
+        self.assertFalse(exhausted[1])
+        self.assertTrue(reset[1])
+        self.assertEqual(reset[0]["used"], 1)
+
+        owner_quota, owner_allowed = main.consume_master_quota({
+            "sub": "owner-user",
+            "email": main.SUPER_ADMIN_EMAIL,
+        })
+        self.assertTrue(owner_allowed)
+        self.assertTrue(owner_quota["unlimited"])
+
+    def test_vip_request_and_owner_approval_grant_unlimited_access(self):
+        requester = {"sub": "vip-requester", "email": "vip@example.com", "name": "VIP User"}
+        main.app.dependency_overrides[main.current_identity] = lambda: requester
+        requested = self.client.post(
+            "/api/admin/vip/request",
             json={
-                "message": "Design a useful workflow.",
-                "model_tier": "genie-master",
+                "user_email": "vip@example.com",
+                "user_name": "VIP User",
+                "reason": "I need frequent research access.",
             },
         )
+        self.assertEqual(requested.status_code, 200, requested.text)
 
-        self.assertEqual(response.status_code, 403, response.text)
+        with closing(main.database()) as connection:
+            connection.execute(
+                """
+                INSERT INTO users(email, user_sub, user_name, last_seen_at, registration_complete)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                ("vip@example.com", "vip-requester", "VIP User", main.utc_now()),
+            )
+            connection.commit()
+
+        owner = {"sub": "verified-owner", "email": main.SUPER_ADMIN_EMAIL, "name": "Owner"}
+        main.app.dependency_overrides[main.current_identity] = lambda: owner
+        approved = self.client.post(
+            "/api/admin/vip/approve",
+            json={"request_id": requested.json()["request_id"]},
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        quota, allowed = main.consume_master_quota(requester)
+        self.assertTrue(allowed)
+        self.assertTrue(quota["vip_active"])
+        queue = self.client.get("/api/admin/vip")
+        self.assertEqual(queue.status_code, 200, queue.text)
+        self.assertEqual(queue.json()["active_count"], 1)
+        self.assertEqual(queue.json()["pending"], [])
+        revoked = self.client.post(
+            "/api/admin/vip/revoke",
+            json={"pass_id": approved.json()["pass_id"]},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertTrue(revoked.json()["revoked"])
+        self.assertEqual(self.client.get("/api/admin/vip").json()["active_count"], 0)
 
     def test_master_tier_uses_single_argon_waterfall_completion(self):
         router = AsyncMock()
@@ -730,7 +841,6 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(stored["ciphertext"], encrypted_payload)
         self.assertEqual(stored["is_secret"], 1)
         with (
-            patch.object(main, "_master_access", return_value=True),
             patch.object(main.gemini_pool, "silent_pro_summarize", side_effect=AssertionError("summary called")),
         ):
             review = self.client.post(
@@ -812,7 +922,6 @@ class BackendApiTests(unittest.TestCase):
             )
             connection.commit()
         with (
-            patch.object(main, "_master_access", return_value=True),
             patch.object(
                 main.master_brain,
                 "run",

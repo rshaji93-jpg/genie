@@ -85,6 +85,42 @@ def sanitize_untrusted_context(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", sanitized).strip()
 
 
+def clean_human_response(text: str) -> str:
+    parts = re.split(
+        r"(```[\w+-]*\r?\n[\s\S]*?(?:\r?\n```|$)|`[^`\n]*`)",
+        text,
+    )
+    cleaned_parts = []
+    for part in parts:
+        if part.startswith("`"):
+            cleaned_parts.append(part)
+            continue
+        cleaned = (
+            part.replace("\\r\\n", "\n")
+            .replace("\\n\\n", "\n\n")
+            .replace("\\n", "\n")
+            .replace('\\"', '"')
+            .replace("\\'", "'")
+            .replace("\\", "")
+        )
+        cleaned = re.sub(
+            r"(?m)^[ \t]*(?:-{3,}|_{3,}|\*{3,})[ \t]*(?:\r?\n|$)",
+            "",
+            cleaned,
+        )
+        lines = []
+        for line in cleaned.splitlines(keepends=True):
+            content = line.rstrip("\r\n")
+            ending = line[len(content):]
+            if content.count("**") % 2:
+                content = content.replace("**", "")
+            if content.count("__") % 2:
+                content = content.replace("__", "")
+            lines.append(content.rstrip() + ending)
+        cleaned_parts.append("".join(lines))
+    return re.sub(r"\n{3,}", "\n\n", "".join(cleaned_parts)).strip()
+
+
 def check_and_consume_quota(pool_state: dict[str, Any], cost: int = 1) -> bool:
     if cost < 0:
         raise ValueError("Quota cost cannot be negative.")
@@ -566,7 +602,7 @@ class MasterBrain:
         local = self.deterministic_reply(messages)
         if local is not None:
             return {
-                "reply": local,
+                "reply": clean_human_response(local),
                 "source": "pool0-deterministic",
                 "sub_agents": [],
                 "verified": True,
@@ -604,7 +640,7 @@ class MasterBrain:
                     source = "pool0-personal-cache"
                     record_public_cache_lookup(True)
                 return {
-                    "reply": cache_entry[1],
+                    "reply": clean_human_response(cache_entry[1]),
                     "source": source,
                     "sub_agents": [],
                     "verified": True,
@@ -664,7 +700,7 @@ class MasterBrain:
             *prior_context,
         ]
         reply, pool = await self.router.complete(prompt, max_tokens=max_tokens)
-        reply = _strip_internal_agent_prefixes(reply)
+        reply = clean_human_response(_strip_internal_agent_prefixes(reply))
         verification = self.verifier.verify(reply)
         if cache_key and verification["verified"]:
             with _PUBLIC_CACHE_LOCK:

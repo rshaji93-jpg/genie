@@ -18,6 +18,7 @@ import ArrowActionToolbar from "@/modules/messages_arrows/ArrowActionToolbar";
 import InlineMessageEditor from "@/modules/messages_arrows/InlineMessageEditor";
 import MessageInfoLedgerModal from "@/modules/messages_arrows/MessageInfoLedgerModal";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
+import { requestVipPass, type MasterQuota } from "@/lib/api";
 import type { ReactNode } from "react";
 
 export type TickStatus = "sent" | "delivered" | "read_no_ai" | "yellow_no_ai" | "ai_review_active" | "ai_verified";
@@ -56,6 +57,7 @@ export interface ChatMessage {
   proposed_memory_id?: string;
   memory_status?: "pending" | "approved" | "rejected";
   is_live_call_response?: boolean;
+  master_quota?: MasterQuota;
 }
 
 interface ChatCanvasProps {
@@ -63,6 +65,8 @@ interface ChatCanvasProps {
   loading: boolean;
   activeRoom: boolean;
   mySub: string;
+  myName: string;
+  credential: string;
   onReview: (messageId: string) => void;
   onVerify: (messageId: string) => void;
   onRefine: (messageId: string) => void;
@@ -115,7 +119,35 @@ function inlineMarkdown(text: string): ReactNode[] {
   });
 }
 
+function cleanHumanResponse(text: string): string {
+  const parts = text.split(/(```[\w+-]*\r?\n[\s\S]*?(?:\r?\n```|$)|`[^`\n]*`)/g);
+  const cleanedParts = parts.map((part) => {
+    if (part.startsWith("`")) return part;
+    const cleaned = part
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n\\n/g, "\n\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\"/g, '"')
+      .replace(/\\'/g, "'")
+      .replace(/\\/g, "")
+      .replace(/^[ \t]*(?:-{3,}|_{3,}|\*{3,})[ \t]*(?:\r?\n|$)/gm, "");
+    return cleaned
+      .split("\n")
+      .map((line) => {
+        const boldMarkers = line.match(/\*\*/g)?.length || 0;
+        const underlineMarkers = line.match(/__/g)?.length || 0;
+        return line
+          .replace(boldMarkers % 2 ? /\*\*/g : /$^/, "")
+          .replace(underlineMarkers % 2 ? /__/g : /$^/, "")
+          .trimEnd();
+      })
+      .join("\n");
+  });
+  return cleanedParts.join("").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function MarkdownContent({ content }: { content: string }) {
+  content = cleanHumanResponse(content);
   const [copiedBlock, setCopiedBlock] = useState<number | null>(null);
   const [copyFailed, setCopyFailed] = useState(false);
   const copyTimer = useRef<number | undefined>(undefined);
@@ -258,6 +290,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
   const [unreadCount, setUnreadCount] = useState(0);
   const [pendingResponseAction, setPendingResponseAction] = useState<string | null>(null);
   const [completedResponseActions, setCompletedResponseActions] = useState<Set<string>>(() => new Set());
+  const [vipRequestStatus, setVipRequestStatus] = useState("");
 
   async function runResponseAction(
     action: "memory" | "library" | "future-self",
@@ -310,6 +343,31 @@ export default function ChatCanvas(props: ChatCanvasProps) {
     if (!element) return;
     element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
     setUnreadCount(0);
+  }
+
+  const latestMasterQuota = [...props.messages]
+    .reverse()
+    .find((message) => message.master_quota)?.master_quota;
+  const showMasterQuota = Boolean(
+    latestMasterQuota
+      && !latestMasterQuota.vip_active
+      && (latestMasterQuota.downgraded_to === "genie-pro" || latestMasterQuota.remaining === 0),
+  );
+  const resetHours = Math.floor((latestMasterQuota?.reset_in_seconds || 0) / 3600);
+  const resetMinutes = Math.floor(((latestMasterQuota?.reset_in_seconds || 0) % 3600) / 60);
+
+  async function submitVipRequest() {
+    setVipRequestStatus("");
+    try {
+      await requestVipPass(
+        props.credential,
+        props.myName,
+        "I would like Genie Master access through the VIP pass program.",
+      );
+      setVipRequestStatus("VIP pass request submitted.");
+    } catch (error) {
+      setVipRequestStatus(error instanceof Error ? error.message : "VIP pass request could not be submitted.");
+    }
   }
 
   useEffect(() => {
@@ -646,7 +704,18 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         </div>
       )}
       {auditMessage && <MessageInfoLedgerModal message={auditMessage} onClose={() => setAuditMessage(null)} />}
-      <div className="composer-wrap pb-[env(safe-area-inset-bottom)]">{props.children}</div>
+      <div className="composer-wrap pb-[env(safe-area-inset-bottom)]">
+        {showMasterQuota && (
+          <div className="mx-auto mb-2 flex w-full max-w-[850px] flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-950" role="status">
+            <span>⏳ Genie Master 4/4 window used (Resets in {resetHours}h {resetMinutes}m · Answered via Genie Pro)</span>
+            <button className="passkey-secondary" onClick={() => void submitVipRequest()} type="button">
+              🎫 Request VIP Pass
+            </button>
+            {vipRequestStatus && <span aria-live="polite">{vipRequestStatus}</span>}
+          </div>
+        )}
+        {props.children}
+      </div>
     </main>
   );
 }

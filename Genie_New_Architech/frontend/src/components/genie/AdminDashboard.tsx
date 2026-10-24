@@ -2,7 +2,15 @@
 
 import { BarChart3, LockKeyhole, RefreshCw, Users, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, apiFetch, apiFetchAdminTelemetry } from "@/lib/api";
+import {
+  ApiError,
+  apiFetch,
+  apiFetchAdminTelemetry,
+  approveVipPass,
+  getVipQueue,
+  revokeVipPass,
+  type VipQueue,
+} from "@/lib/api";
 
 function isBackendUnavailable(error: unknown): boolean {
   return error instanceof TypeError
@@ -95,6 +103,13 @@ interface AdminDashboardProps {
 export default function AdminDashboard(props: AdminDashboardProps) {
   const [telemetry, setTelemetry] = useState<Telemetry>(BASELINE_TELEMETRY);
   const [passes, setPasses] = useState<VipPass[]>([]);
+  const [vipQueue, setVipQueue] = useState<VipQueue>({
+    active_count: 0,
+    limit: 20,
+    active: [],
+    pending: [],
+  });
+  const [vipIdentifier, setVipIdentifier] = useState("");
   const [dailyLimit, setDailyLimit] = useState("25");
   const [totpCode, setTotpCode] = useState("");
   const [oneTimeCode, setOneTimeCode] = useState("");
@@ -103,11 +118,12 @@ export default function AdminDashboard(props: AdminDashboardProps) {
 
   const refresh = useCallback(async () => {
     if (props.localOnly) return;
-    const [telemetryResult, passesResult] = await Promise.allSettled([
+    const [telemetryResult, passesResult, queueResult] = await Promise.allSettled([
       apiFetchAdminTelemetry<Telemetry>(props.credential, props.adminToken),
       apiFetch<VipPass[]>("/api/admin/vip-passes", props.credential, {
         headers: { "X-Genie-Admin-Session": props.adminToken },
       }),
+      getVipQueue(props.credential, props.adminToken),
     ]);
 
     if (telemetryResult.status === "fulfilled") {
@@ -135,6 +151,10 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         : "Admin telemetry could not be loaded; showing baseline metrics.");
     }
     if (passesResult.status === "fulfilled") setPasses(passesResult.value);
+    if (queueResult.status === "fulfilled") setVipQueue(queueResult.value);
+    else setError(queueResult.reason instanceof Error
+      ? queueResult.reason.message
+      : "VIP allocations could not be loaded.");
   }, [props.adminToken, props.credential, props.localOnly, props.onLocalFallback]);
 
   useEffect(() => {
@@ -188,6 +208,47 @@ export default function AdminDashboard(props: AdminDashboardProps) {
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "VIP pass could not be updated.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function grantVipPass(identifier: string) {
+    if (props.localOnly || !identifier.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await approveVipPass(props.credential, props.adminToken, { identifier: identifier.trim() });
+      setVipIdentifier("");
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "VIP pass could not be granted.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveRequest(requestId: string) {
+    setBusy(true);
+    setError("");
+    try {
+      await approveVipPass(props.credential, props.adminToken, { request_id: requestId });
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "VIP request could not be approved.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeAllocation(passId: string) {
+    setBusy(true);
+    setError("");
+    try {
+      await revokeVipPass(props.credential, props.adminToken, passId);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "VIP allocation could not be revoked.");
     } finally {
       setBusy(false);
     }
@@ -250,6 +311,52 @@ export default function AdminDashboard(props: AdminDashboardProps) {
 
         {!props.localOnly && (
           <>
+            <section className="admin-vip-section" aria-label="20 VIP Pass Allocations and Approvals">
+              <h3>20 VIP Pass Allocations &amp; Approvals</h3>
+              <p role="status">Active VIP Passes: {vipQueue.active_count} / {vipQueue.limit}</p>
+              <div className="admin-config-row">
+                <label htmlFor="vip-direct-grant">Direct Grant</label>
+                <input
+                  id="vip-direct-grant"
+                  autoComplete="off"
+                  value={vipIdentifier}
+                  onChange={(event) => setVipIdentifier(event.target.value)}
+                  placeholder="Enter registered email or username"
+                />
+                <button
+                  className="passkey-secondary"
+                  disabled={busy || vipQueue.active_count >= vipQueue.limit || !vipIdentifier.trim()}
+                  onClick={() => void grantVipPass(vipIdentifier)}
+                >
+                  Grant VIP Pass
+                </button>
+              </div>
+              <h4>Pending Requests</h4>
+              {vipQueue.pending.map((request) => (
+                <div className="admin-vip-row" key={request.id}>
+                  <span>{request.user_name} · {request.user_email}</span>
+                  <span>{request.reason}</span>
+                  <button
+                    disabled={busy || vipQueue.active_count >= vipQueue.limit}
+                    onClick={() => void approveRequest(request.id)}
+                  >
+                    ✓ Approve
+                  </button>
+                </div>
+              ))}
+              {!vipQueue.pending.length && <p>No pending VIP requests.</p>}
+              <h4>Active VIPs</h4>
+              {vipQueue.active.map((allocation) => (
+                <div className="admin-vip-row" key={allocation.id}>
+                  <span>{allocation.user_name || "Unclaimed pass"} · {allocation.user_email || allocation.id}</span>
+                  <span>{allocation.status}</span>
+                  <button disabled={busy} onClick={() => void revokeAllocation(allocation.id)}>
+                    ✕ Revoke
+                  </button>
+                </div>
+              ))}
+              {!vipQueue.active.length && <p>No active VIP allocations.</p>}
+            </section>
             <div className="admin-stats-grid">
               <div><BarChart3 size={16} /><strong>{telemetry.daily_tokens_burned}</strong><small>AI tokens charged · rolling 24h</small></div>
               <div><Users size={16} /><strong>{telemetry.vip_passes_active}</strong><small>Active VIP passes</small></div>

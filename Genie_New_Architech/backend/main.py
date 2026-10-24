@@ -62,6 +62,7 @@ if __package__:
         public_cache_telemetry,
         record_public_cache_lookup,
         flush_legacy_answer_cache,
+        clean_human_response,
         skill_registry,
     )
     from .security import (
@@ -94,6 +95,7 @@ else:
         public_cache_telemetry,
         record_public_cache_lookup,
         flush_legacy_answer_cache,
+        clean_human_response,
         skill_registry,
     )
     from security import (
@@ -251,15 +253,69 @@ def _refund_user_tokens(
         connection.commit()
 
 
-def _master_access(identity: dict[str, str]) -> bool:
-    if identity.get("email", "").casefold() == SUPER_ADMIN_EMAIL.casefold():
-        return True
+MASTER_QUOTA_LIMIT = 4
+MASTER_QUOTA_WINDOW_SECONDS = 4 * 60 * 60
+
+
+def consume_master_quota(identity: dict[str, str]) -> tuple[dict[str, Any], bool]:
+    user_key = identity["sub"]
+    owner = identity.get("request_email", identity.get("email", "")).casefold() == SUPER_ADMIN_EMAIL.casefold()
+    now = time.time()
     with closing(database()) as connection:
-        row = connection.execute(
+        connection.execute("BEGIN IMMEDIATE")
+        vip_row = connection.execute(
             "SELECT 1 FROM vip_passes WHERE claimed_by = ? AND status = 'claimed' LIMIT 1",
-            (identity["sub"],),
+            (user_key,),
         ).fetchone()
-    return row is not None
+        vip_active = bool(vip_row)
+        if owner or vip_active:
+            connection.commit()
+            return {
+                "used": 0,
+                "limit": MASTER_QUOTA_LIMIT,
+                "remaining": MASTER_QUOTA_LIMIT,
+                "reset_in_seconds": 0,
+                "vip_active": True,
+                "unlimited": True,
+            }, True
+
+        row = connection.execute(
+            "SELECT window_start, request_count FROM master_quota_windows WHERE user_key = ?",
+            (user_key,),
+        ).fetchone()
+        if not row or now >= float(row["window_start"]) + MASTER_QUOTA_WINDOW_SECONDS:
+            window_start = now
+            used = 0
+        else:
+            window_start = float(row["window_start"])
+            used = min(MASTER_QUOTA_LIMIT, int(row["request_count"]))
+        allowed = used < MASTER_QUOTA_LIMIT
+        if allowed:
+            used += 1
+        connection.execute(
+            """
+            INSERT INTO master_quota_windows(user_key, window_start, request_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_key) DO UPDATE SET
+                window_start = excluded.window_start,
+                request_count = excluded.request_count
+            """,
+            (user_key, window_start, used),
+        )
+        connection.commit()
+
+    reset_in_seconds = max(
+        0,
+        math.ceil(window_start + MASTER_QUOTA_WINDOW_SECONDS - now),
+    )
+    quota = {
+        "used": used,
+        "limit": MASTER_QUOTA_LIMIT,
+        "remaining": max(0, MASTER_QUOTA_LIMIT - used),
+        "reset_in_seconds": reset_in_seconds,
+        "vip_active": False,
+    }
+    return quota, allowed
 
 
 async def _broadcast_quota_cooldown(
@@ -509,6 +565,24 @@ def initialize_database() -> None:
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(user_sub, edition_date)
+            );
+            CREATE TABLE IF NOT EXISTS master_quota_windows (
+                user_key TEXT PRIMARY KEY,
+                window_start REAL NOT NULL,
+                request_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS vip_pass_requests (
+                id TEXT PRIMARY KEY,
+                requested_by_sub TEXT NOT NULL,
+                user_email TEXT NOT NULL COLLATE NOCASE,
+                user_name TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                vip_pass_id TEXT,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                reviewed_by TEXT
             );
             """
         )
@@ -854,6 +928,18 @@ class GenesisTotpVerify(StrictModel):
 class VipPassAction(StrictModel):
     action: str = Field(pattern="^(mint|pause|resume|revoke|recycle)$")
     totp_code: str = Field(pattern="^[0-9]{6}$")
+    pass_id: str | None = Field(default=None, max_length=80)
+
+
+class VipPassRequest(StrictModel):
+    user_email: str = Field(min_length=3, max_length=254)
+    user_name: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class VipPassApproval(StrictModel):
+    request_id: str | None = Field(default=None, max_length=80)
+    identifier: str | None = Field(default=None, max_length=254)
     pass_id: str | None = Field(default=None, max_length=80)
 
 
@@ -1596,7 +1682,7 @@ def _get_general_cache(key: str | None) -> str | None:
                 "DELETE FROM general_query_cache WHERE expires_at <= ?", (now,)
             )
             connection.commit()
-            return str(cached["reply"]) if cached else None
+            return clean_human_response(str(cached["reply"])) if cached else None
 
 
 def _set_general_cache(key: str | None, reply: str, query_text: str = "") -> None:
@@ -1618,7 +1704,7 @@ def _set_general_cache(key: str | None, reply: str, query_text: str = "") -> Non
                 """,
                 (
                     key,
-                    reply,
+                    clean_human_response(reply),
                     time.time() + 7 * 24 * 60 * 60,
                     utc_now(),
                     query_text[:1000],
@@ -1899,14 +1985,15 @@ async def chat(
             "sub_agents": [],
         }
     master = requires_master_model(request)
-    if master and not _master_access(identity):
-        raise HTTPException(status_code=403, detail="Genie Master is available to the admin and active VIP passes.")
-    if (
-        identity.get("email", "").casefold() == SUPER_ADMIN_EMAIL.casefold()
-        and (request.model == "genie-master" or request.model_tier == "genie-master")
-        and request.response_visibility == "group"
-    ):
-        raise HTTPException(status_code=422, detail="The personal master key can only be used for private responses.")
+    master_quota = None
+    downgraded_to_pro = False
+    if master:
+        master_quota, master_allowed = consume_master_quota(identity)
+        if not master_allowed:
+            master = False
+            downgraded_to_pro = True
+            master_quota["downgraded_to"] = "genie-pro"
+            master_quota["can_request_vip"] = True
     cost = (
         _estimate_ai_token_cost(
             sum(len(str(item.get("content", ""))) for item in messages)
@@ -1927,14 +2014,18 @@ async def chat(
             },
         ) from error
     try:
-        tier = request.model_tier or (
-            "genie-master" if request.model == "genie-master" else request.model
+        tier = (
+            "genie-pro"
+            if downgraded_to_pro
+            else "genie-master"
+            if master
+            else request.model_tier or request.model
         )
         brain_result = await master_brain.run(
             messages,
             user_sub=identity["sub"],
             model_tier=tier,
-            future_self=request.future_self_mode,
+            future_self=request.future_self_mode and not downgraded_to_pro,
             room_mode=request.room_mode,
             max_tokens=4096,
             public_cache_allowed=not (
@@ -1961,8 +2052,9 @@ async def chat(
             "sub_agents": [],
             "proposed_memory": None,
             "verified": False,
+            **({"master_quota": master_quota} if master_quota is not None else {}),
         }
-    reply = brain_result["reply"]
+    reply = clean_human_response(brain_result["reply"])
     if brain_result.get("verified") is True:
         _set_general_cache(cache_key, reply, latest_user_text)
     return {
@@ -1973,6 +2065,7 @@ async def chat(
         "source": brain_result["source"],
         "verified": brain_result.get("verified", True),
         "proposed_memory": brain_result.get("proposed_memory"),
+        **({"master_quota": master_quota} if master_quota is not None else {}),
     }
 
 
@@ -2054,8 +2147,15 @@ async def chat_stream(
 
         return StreamingResponse(cached_events(), media_type="text/event-stream")
     master = requires_master_model(request)
-    if master and not _master_access(identity):
-        raise HTTPException(status_code=403, detail="Genie Master is available to the admin and active VIP passes.")
+    master_quota = None
+    downgraded_to_pro = False
+    if master:
+        master_quota, master_allowed = consume_master_quota(identity)
+        if not master_allowed:
+            master = False
+            downgraded_to_pro = True
+            master_quota["downgraded_to"] = "genie-pro"
+            master_quota["can_request_vip"] = True
     cost = (
         _estimate_ai_token_cost(
             sum(len(str(item.get("content", ""))) for item in messages)
@@ -2078,14 +2178,18 @@ async def chat_stream(
 
     async def events():
         try:
-            tier = request.model_tier or (
-                "genie-master" if request.model == "genie-master" else request.model
+            tier = (
+                "genie-pro"
+                if downgraded_to_pro
+                else "genie-master"
+                if master
+                else request.model_tier or request.model
             )
             result = await master_brain.run(
                 messages,
                 user_sub=identity["sub"],
                 model_tier=tier,
-                future_self=request.future_self_mode,
+                future_self=request.future_self_mode and not downgraded_to_pro,
                 room_mode=request.room_mode,
                 max_tokens=4096,
                 public_cache_allowed=not (
@@ -2099,9 +2203,9 @@ async def chat_stream(
             )
             yield (
                 f"event: metadata\ndata: "
-                f"{json.dumps({'sub_agents': result['sub_agents'], 'source': result['source'], 'proposed_memory': result.get('proposed_memory')})}\n\n"
+                f"{json.dumps({'sub_agents': result['sub_agents'], 'source': result['source'], 'proposed_memory': result.get('proposed_memory'), 'master_quota': master_quota})}\n\n"
             )
-            reply = result["reply"]
+            reply = clean_human_response(result["reply"])
             yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
             if result.get("verified") is True:
                 _set_general_cache(cache_key, reply, latest_user_text)
@@ -2116,7 +2220,7 @@ async def chat_stream(
             )
             yield (
                 "event: metadata\ndata: "
-                f"{json.dumps({'sub_agents': [], 'source': 'local-fallback', 'provider_status': 'unavailable'})}\n\n"
+                f"{json.dumps({'sub_agents': [], 'source': 'local-fallback', 'provider_status': 'unavailable', 'master_quota': master_quota})}\n\n"
             )
             yield (
                 f"event: confirmation\ndata: "
@@ -2185,8 +2289,6 @@ async def text_to_speech(
     language = language_map.get(request.dialect)
     if not language:
         raise HTTPException(status_code=422, detail="Unsupported speech dialect.")
-    if request.model == "genie-master" and not _master_access(identity):
-        raise HTTPException(status_code=403, detail="Genie Master voice is available to the admin and active VIP passes.")
     try:
         audio = await asyncio.to_thread(native_gemini_speech, request, identity)
         if audio:
@@ -2226,8 +2328,6 @@ async def voice_text_to_speech(
     voice = voices.get(request.dialect)
     if not voice:
         raise HTTPException(status_code=422, detail="Unsupported speech dialect.")
-    if request.model == "genie-master" and not _master_access(identity):
-        raise HTTPException(status_code=403, detail="Genie Master voice is available to the admin and active VIP passes.")
     try:
         import edge_tts
 
@@ -3517,8 +3617,6 @@ async def review_room_message(
     identity: dict[str, str] = Depends(current_identity),
 ):
     room_member(room_id, identity)
-    if not _master_access(identity):
-        raise HTTPException(status_code=403, detail="Genie Master reviews are available to the admin and active VIP passes.")
     with closing(database()) as connection:
         target = connection.execute(
             "SELECT id, is_secret, tick_status, ai_review_count FROM room_messages WHERE id = ? AND room_id = ?",
@@ -3541,9 +3639,14 @@ async def review_room_message(
     if not safe_context:
         raise HTTPException(status_code=422, detail="No reviewable room context was supplied.")
     prompt = str(safe_context[-1].get("content", "Review this discussion."))[:20_000]
+    master_quota, master_allowed = consume_master_quota(identity)
     cost = _estimate_ai_token_cost(
         sum(len(str(item["content"])) for item in safe_context)
     )
+    if not master_allowed:
+        master_quota["downgraded_to"] = "genie-pro"
+        master_quota["can_request_vip"] = True
+        cost = {"tokens_burned": 1, "breakdown": json.dumps({"tier": "genie-pro", "tokens_burned": 1})}
     try:
         charged_at = _charge_user_tokens(
             identity["sub"],
@@ -3595,7 +3698,7 @@ async def review_room_message(
                 ),
             }],
             user_sub=identity["sub"],
-            model_tier="genie-master",
+            model_tier="genie-master" if master_allowed else "genie-pro",
             room_mode=True,
             max_tokens=1200,
             public_cache_allowed=False,
@@ -3664,6 +3767,7 @@ async def review_room_message(
         "breakdown": cost["breakdown"],
         "ai_reply": reply,
         "review_at": timestamp,
+        "master_quota": master_quota,
     }
     await room_hub.broadcast(room_id, event)
     return event
@@ -5481,6 +5585,224 @@ def require_genesis_owner(identity: dict[str, str]) -> None:
         raise HTTPException(status_code=404, detail="Not found.")
 
 
+def require_vip_queue_admin(
+    identity: dict[str, str],
+    authorization: str | None,
+    admin_session: str | None,
+    admin_passkey: str | None,
+) -> None:
+    if identity.get("request_email", identity.get("email", "")).casefold() == SUPER_ADMIN_EMAIL.casefold():
+        return
+    if admin_passkey != "verified":
+        raise HTTPException(status_code=404, detail="Not found.")
+    session_token = admin_session or (
+        authorization[7:].strip()
+        if authorization and authorization.startswith("Bearer ")
+        else ""
+    )
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Passkey admin session is required.")
+    session = verify_admin_session(session_token)
+    if session.get("sub") != identity["sub"]:
+        raise HTTPException(status_code=403, detail="Admin session belongs to another identity.")
+
+
+def _resolve_vip_account(connection: sqlite3.Connection, identifier: str) -> sqlite3.Row | None:
+    normalized = identifier.strip()
+    if not normalized:
+        return None
+    return connection.execute(
+        """
+        SELECT user_sub, email, user_name, username, registration_complete FROM users
+        WHERE email = ? COLLATE NOCASE OR username = ? COLLATE NOCASE
+        LIMIT 1
+        """,
+        (normalized, normalized),
+    ).fetchone()
+
+
+@app.post("/api/admin/vip/request")
+async def request_vip_pass(
+    request: VipPassRequest,
+    identity: dict[str, str] = Depends(current_identity),
+):
+    user_email = request.user_email.strip().casefold()
+    if user_email != identity["email"].casefold():
+        raise HTTPException(status_code=403, detail="VIP requests must use the signed-in account email.")
+    address = parseaddr(user_email)[1]
+    if address != user_email or "@" not in user_email:
+        raise HTTPException(status_code=422, detail="Enter a valid account email.")
+    with closing(database()) as connection:
+        pending = connection.execute(
+            "SELECT id, status FROM vip_pass_requests WHERE user_email = ? AND status = 'pending'",
+            (user_email,),
+        ).fetchone()
+        if pending:
+            return {"request_id": pending["id"], "status": pending["status"]}
+        request_id = str(uuid.uuid4())
+        connection.execute(
+            """
+            INSERT INTO vip_pass_requests(
+                id, requested_by_sub, user_email, user_name, reason, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                request_id,
+                identity["sub"],
+                user_email,
+                identity["name"].strip()[:120] or request.user_name.strip()[:120],
+                request.reason.strip()[:1000],
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    return {"request_id": request_id, "status": "pending"}
+
+
+@app.get("/api/admin/vip")
+async def list_vip_queue(
+    identity: dict[str, str] = Depends(current_identity),
+    authorization: str | None = Header(default=None),
+    admin_session: str | None = Header(default=None, alias="X-Genie-Admin-Session"),
+    admin_passkey: str | None = Header(default=None, alias="X-Admin-Passkey"),
+):
+    require_vip_queue_admin(identity, authorization, admin_session, admin_passkey)
+    with closing(database()) as connection:
+        active = connection.execute(
+            """
+            SELECT p.id, p.status, p.created_at, p.claimed_at,
+                   u.email AS user_email, u.user_name
+            FROM vip_passes p
+            LEFT JOIN users u ON u.user_sub = p.claimed_by
+            WHERE p.status IN ('active', 'claimed')
+            ORDER BY p.created_at
+            LIMIT 20
+            """
+        ).fetchall()
+        pending = connection.execute(
+            """
+            SELECT id, user_email, user_name, reason, created_at
+            FROM vip_pass_requests WHERE status = 'pending'
+            ORDER BY created_at LIMIT 100
+            """
+        ).fetchall()
+        active_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM vip_passes WHERE status IN ('active', 'claimed')"
+        ).fetchone()["total"]
+    return {
+        "active_count": int(active_count),
+        "limit": 20,
+        "active": [dict(row) for row in active],
+        "pending": [dict(row) for row in pending],
+    }
+
+
+@app.post("/api/admin/vip/approve")
+async def approve_vip_pass(
+    request: VipPassApproval,
+    identity: dict[str, str] = Depends(current_identity),
+    authorization: str | None = Header(default=None),
+    admin_session: str | None = Header(default=None, alias="X-Genie-Admin-Session"),
+    admin_passkey: str | None = Header(default=None, alias="X-Admin-Passkey"),
+):
+    require_vip_queue_admin(identity, authorization, admin_session, admin_passkey)
+    if not request.request_id and not request.identifier:
+        raise HTTPException(status_code=422, detail="A pending request ID or account email/username is required.")
+    timestamp = utc_now()
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        pending_request = None
+        if request.request_id:
+            pending_request = connection.execute(
+                "SELECT id, user_email FROM vip_pass_requests WHERE id = ? AND status = 'pending'",
+                (request.request_id,),
+            ).fetchone()
+            if not pending_request:
+                connection.rollback()
+                raise HTTPException(status_code=404, detail="Pending VIP request was not found.")
+            identifier = str(pending_request["user_email"])
+        else:
+            identifier = str(request.identifier)
+        account = _resolve_vip_account(connection, identifier)
+        if not account or account["registration_complete"] != 1:
+            connection.rollback()
+            raise HTTPException(status_code=404, detail="A registered user account was not found.")
+        already_active = connection.execute(
+            "SELECT id FROM vip_passes WHERE claimed_by = ? AND status = 'claimed' LIMIT 1",
+            (account["user_sub"],),
+        ).fetchone()
+        if already_active:
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="This account already has an active VIP pass.")
+        active_count = connection.execute(
+            "SELECT COUNT(*) AS total FROM vip_passes WHERE status IN ('active', 'claimed')"
+        ).fetchone()["total"]
+        if active_count >= 20:
+            connection.rollback()
+            raise HTTPException(status_code=409, detail="All 20 VIP pass allocations are currently in use.")
+        pass_id = f"VIP-{uuid.uuid4().hex[:12].upper()}"
+        connection.execute(
+            """
+            INSERT INTO vip_passes(id, code_hash, status, created_by, created_at,
+                                   claimed_by, claimed_at, updated_at)
+            VALUES (?, ?, 'claimed', ?, ?, ?, ?, ?)
+            """,
+            (
+                pass_id,
+                hashlib.sha256(secrets.token_bytes(32)).hexdigest(),
+                identity["sub"],
+                timestamp,
+                account["user_sub"],
+                timestamp,
+                timestamp,
+            ),
+        )
+        if pending_request:
+            connection.execute(
+                """
+                UPDATE vip_pass_requests SET status = 'approved', vip_pass_id = ?,
+                    reviewed_at = ?, reviewed_by = ? WHERE id = ? AND status = 'pending'
+                """,
+                (pass_id, timestamp, identity["sub"], pending_request["id"]),
+            )
+        connection.commit()
+    return {"pass_id": pass_id, "user_email": account["email"], "status": "claimed"}
+
+
+@app.post("/api/admin/vip/revoke")
+async def revoke_vip_pass(
+    request: VipPassApproval,
+    identity: dict[str, str] = Depends(current_identity),
+    authorization: str | None = Header(default=None),
+    admin_session: str | None = Header(default=None, alias="X-Genie-Admin-Session"),
+    admin_passkey: str | None = Header(default=None, alias="X-Admin-Passkey"),
+):
+    require_vip_queue_admin(identity, authorization, admin_session, admin_passkey)
+    if not request.pass_id and not request.identifier:
+        raise HTTPException(status_code=422, detail="A VIP pass ID or account email/username is required.")
+    with closing(database()) as connection:
+        if request.pass_id:
+            result = connection.execute(
+                "UPDATE vip_passes SET status = 'revoked', updated_at = ? WHERE id = ? AND status IN ('active', 'claimed')",
+                (utc_now(), request.pass_id),
+            )
+        else:
+            account = _resolve_vip_account(connection, str(request.identifier))
+            if not account:
+                raise HTTPException(status_code=404, detail="A registered user account was not found.")
+            result = connection.execute(
+                """
+                UPDATE vip_passes SET status = 'revoked', updated_at = ?
+                WHERE claimed_by = ? AND status = 'claimed'
+                """,
+                (utc_now(), account["user_sub"]),
+            )
+        connection.commit()
+    if not result.rowcount:
+        raise HTTPException(status_code=404, detail="Active VIP pass was not found.")
+    return {"revoked": True}
+
+
 @app.get("/api/admin/vip-passes")
 async def list_admin_vip_passes(
     identity: dict[str, str] = Depends(current_identity),
@@ -5622,16 +5944,13 @@ async def manage_vip_pass(
     with closing(database()) as connection:
         connection.execute("BEGIN IMMEDIATE")
         if request.action == "mint":
-            total = connection.execute("SELECT COUNT(*) AS total FROM vip_passes").fetchone()["total"]
+            total = connection.execute(
+                "SELECT COUNT(*) AS total FROM vip_passes WHERE status IN ('active', 'claimed')"
+            ).fetchone()["total"]
             if total >= 20:
                 connection.rollback()
                 raise HTTPException(status_code=409, detail="All 20 VIP passes are already allocated.")
-            used_ids = {
-                row["id"] for row in connection.execute("SELECT id FROM vip_passes").fetchall()
-            }
-            pass_id = next(
-                f"VIP-{index:02d}" for index in range(1, 21) if f"VIP-{index:02d}" not in used_ids
-            )
+            pass_id = f"VIP-{uuid.uuid4().hex[:12].upper()}"
             code = secrets.token_urlsafe(18)
             connection.execute(
                 """

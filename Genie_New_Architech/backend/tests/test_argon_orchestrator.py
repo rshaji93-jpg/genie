@@ -80,6 +80,16 @@ class ArgonOrchestratorTests(unittest.TestCase):
         self.assertNotIn("system prompt override", result.casefold())
         self.assertIn("keep this fact", result)
 
+    def test_clean_human_response_normalizes_escaped_text_and_markdown_noise(self):
+        result = orchestrator.clean_human_response(
+            'First line\\n\\n**Open heading\\n---\\nSay \\"hello\\".\\nA\\\\B\n\n```text\nC:\\folder\\file\n```'
+        )
+
+        self.assertEqual(
+            result,
+            'First line\n\nOpen heading\nSay "hello".\nAB\n\n```text\nC:\\folder\\file\n```',
+        )
+
 
 class ArgonCacheTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -129,6 +139,21 @@ class ArgonCacheTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertIsNone(orchestrator._public_query_key(messages, "genie-pro"))
+
+    async def test_cached_and_returned_responses_are_cleaned_before_storage(self):
+        self.router.complete.side_effect = None
+        self.router.complete.reset_mock()
+        self.router.complete.return_value = (
+            'Answer\\\\n\\\\n**unfinished \\"quote\\"',
+            "pool1-groq",
+        )
+        messages = [{"role": "user", "content": "Explain a queue?"}]
+
+        result = await self.brain.run(messages, user_sub="user-a")
+        repeated = await self.brain.run(messages, user_sub="user-b")
+
+        self.assertEqual(result["reply"], 'Answer\n\nunfinished "quote"')
+        self.assertEqual(repeated["reply"], result["reply"])
 
 
 if __name__ == "__main__":

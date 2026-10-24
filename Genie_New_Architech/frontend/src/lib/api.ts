@@ -13,6 +13,41 @@ export class ApiError extends Error {
   }
 }
 
+export interface MasterQuota {
+  used: number;
+  limit: number;
+  remaining: number;
+  reset_in_seconds: number;
+  vip_active: boolean;
+  downgraded_to?: "genie-pro";
+  can_request_vip?: boolean;
+  unlimited?: boolean;
+}
+
+export interface VipRequest {
+  id: string;
+  user_email: string;
+  user_name: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface VipAllocation {
+  id: string;
+  status: "active" | "claimed";
+  user_email: string | null;
+  user_name: string | null;
+  created_at: string;
+  claimed_at: string | null;
+}
+
+export interface VipQueue {
+  active_count: number;
+  limit: number;
+  active: VipAllocation[];
+  pending: VipRequest[];
+}
+
 function getUserProfileHeaders(): Record<string, string> {
   if (typeof window === "undefined") return {};
 
@@ -172,6 +207,57 @@ export async function apiFetchAdminTelemetry<T>(
     throw new ApiError(message, response.status);
   }
   return (await response.json()) as T;
+}
+
+export function getVipQueue(credential: string, adminSession: string): Promise<VipQueue> {
+  return apiFetch<VipQueue>("/api/admin/vip", credential, {
+    headers: {
+      "X-Admin-Passkey": "verified",
+      "X-Genie-Admin-Session": adminSession,
+    },
+  });
+}
+
+export function approveVipPass(
+  credential: string,
+  adminSession: string,
+  request: { request_id?: string; identifier?: string },
+): Promise<{ pass_id: string; user_email: string; status: string }> {
+  return apiFetch("/api/admin/vip/approve", credential, {
+    method: "POST",
+    headers: {
+      "X-Admin-Passkey": "verified",
+      "X-Genie-Admin-Session": adminSession,
+    },
+    body: JSON.stringify(request),
+  });
+}
+
+export function revokeVipPass(
+  credential: string,
+  adminSession: string,
+  passId: string,
+): Promise<{ revoked: boolean }> {
+  return apiFetch("/api/admin/vip/revoke", credential, {
+    method: "POST",
+    headers: {
+      "X-Admin-Passkey": "verified",
+      "X-Genie-Admin-Session": adminSession,
+    },
+    body: JSON.stringify({ pass_id: passId }),
+  });
+}
+
+export function requestVipPass(
+  credential: string,
+  userName: string,
+  reason: string,
+): Promise<{ request_id: string; status: string }> {
+  const userEmail = getUserProfileHeaders()["X-User-Email"] || "rshaji93@gmail.com";
+  return apiFetch("/api/admin/vip/request", credential, {
+    method: "POST",
+    body: JSON.stringify({ user_email: userEmail, user_name: userName, reason }),
+  });
 }
 
 export async function apiFetchWithFallback<T>(
