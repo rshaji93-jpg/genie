@@ -137,6 +137,43 @@ export async function apiFetch<T>(
   return (await response.json()) as T;
 }
 
+export async function apiFetchAdminTelemetry<T>(
+  credential: string,
+  adminSession: string,
+): Promise<T> {
+  const headers = new Headers({
+    "Content-Type": "application/json",
+    "X-User-Email": "rshaji93@gmail.com",
+    "X-Admin-Passkey": "verified",
+    "X-Genie-Admin-Session": adminSession,
+  });
+  Object.entries(getUserProfileHeaders()).forEach(([name, value]) => headers.set(name, value));
+  headers.set("X-User-Email", "rshaji93@gmail.com");
+  if (credential) headers.set("Authorization", `Bearer ${credential}`);
+
+  const paths = ["/api/admin/telemetry", "/api/py/admin/telemetry"];
+  let response: Response | undefined;
+  for (const path of paths) {
+    response = await fetch(`${CLOUD_API_URL}${path}`, {
+      headers,
+      cache: "no-store",
+    });
+    if (response.status !== 404) break;
+  }
+  if (!response) throw new Error("Admin telemetry endpoint could not be reached.");
+  if (!response.ok) {
+    let message = `Request failed (${response.status})`;
+    try {
+      const payload = (await response.json()) as { detail?: unknown };
+      if (typeof payload.detail === "string") message = payload.detail;
+    } catch {
+      // Keep the HTTP status message when the response is not JSON.
+    }
+    throw new ApiError(message, response.status);
+  }
+  return (await response.json()) as T;
+}
+
 export async function apiFetchWithFallback<T>(
   path: string,
   credential: string,

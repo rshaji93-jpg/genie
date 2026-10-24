@@ -57,7 +57,13 @@ if __package__:
         passcode_hash,
         verify_passcode,
     )
-    from .orchestrator import master_brain, multi_pool_router, skill_registry
+    from .orchestrator import (
+        master_brain,
+        multi_pool_router,
+        public_cache_telemetry,
+        record_public_cache_lookup,
+        skill_registry,
+    )
     from .security import (
         SUPER_ADMIN_EMAIL,
         is_zero_knowledge_secret,
@@ -83,7 +89,13 @@ else:
         passcode_hash,
         verify_passcode,
     )
-    from orchestrator import master_brain, multi_pool_router, skill_registry
+    from orchestrator import (
+        master_brain,
+        multi_pool_router,
+        public_cache_telemetry,
+        record_public_cache_lookup,
+        skill_registry,
+    )
     from security import (
         SUPER_ADMIN_EMAIL,
         is_zero_knowledge_secret,
@@ -482,6 +494,13 @@ def initialize_database() -> None:
                 completed_capsules INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_sub, skill_id)
+            );
+            CREATE TABLE IF NOT EXISTS genie_daily_editions (
+                user_sub TEXT NOT NULL,
+                edition_date TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_sub, edition_date)
             );
             """
         )
@@ -1717,6 +1736,9 @@ def _general_cache_key(request: ChatRequest, messages: list[dict[str, Any]]) -> 
     if (
         request.room_id
         or request.room_mode
+        or request.chat_mode == "private_ai"
+        or request.response_visibility == "group"
+        or request.future_self_mode
         or request.model == "genie-master"
         or request.model_tier == "genie-master"
         or request.thinking_level == "deep"
@@ -2039,6 +2061,8 @@ async def chat(
         }
     cache_key = _general_cache_key(request, messages)
     cached_reply = _get_general_cache(cache_key)
+    if cache_key:
+        record_public_cache_lookup(cached_reply is not None)
     if cached_reply is not None:
         return {
             "reply": cached_reply,
@@ -2089,6 +2113,8 @@ async def chat(
             future_self=request.future_self_mode,
             room_mode=request.room_mode,
             max_tokens=4096,
+            public_cache_allowed=cache_key is not None,
+            public_cache_checked=True,
         )
     except Exception as error:
         _refund_user_tokens(identity["sub"], cost, room_id=request.room_id, created_at=charged_at)
@@ -2107,7 +2133,8 @@ async def chat(
             "verified": False,
         }
     reply = brain_result["reply"]
-    _set_general_cache(cache_key, reply)
+    if brain_result.get("verified") is True:
+        _set_general_cache(cache_key, reply)
     return {
         "reply": reply,
         "tick_status": "read_no_ai",
@@ -2188,6 +2215,8 @@ async def chat_stream(
         return StreamingResponse(calculation_events(), media_type="text/event-stream")
     cache_key = _general_cache_key(request, messages)
     cached_reply = _get_general_cache(cache_key)
+    if cache_key:
+        record_public_cache_lookup(cached_reply is not None)
     if cached_reply is not None:
         def cached_events():
             yield f"event: confirmation\ndata: {json.dumps({'reply': cached_reply, 'tokens_burned': 0})}\n\n"
@@ -2232,6 +2261,8 @@ async def chat_stream(
                 future_self=request.future_self_mode,
                 room_mode=request.room_mode,
                 max_tokens=4096,
+                public_cache_allowed=cache_key is not None,
+                public_cache_checked=True,
             )
             yield (
                 f"event: metadata\ndata: "
@@ -2239,7 +2270,8 @@ async def chat_stream(
             )
             reply = result["reply"]
             yield f"event: token\ndata: {json.dumps({'text': reply})}\n\n"
-            _set_general_cache(cache_key, reply)
+            if result.get("verified") is True:
+                _set_general_cache(cache_key, reply)
             yield "event: done\ndata: {}\n\n"
         except Exception as error:
             _refund_user_tokens(
@@ -5210,6 +5242,18 @@ async def grounded_library_ask(
 async def current_genie_daily_edition(
     identity: dict[str, str] = Depends(optional_read_identity),
 ):
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+    with closing(database()) as connection:
+        cached = connection.execute(
+            """
+            SELECT payload FROM genie_daily_editions
+            WHERE user_sub = ? AND edition_date = ?
+            """,
+            (identity["sub"], today_str),
+        ).fetchone()
+    if cached:
+        return json.loads(cached["payload"])
+
     pillars = {
         "Knowledge": {"article", "code", "prompt"},
         "Work & Goals": {"project", "goal", "skill_capsule"},
@@ -5257,11 +5301,29 @@ async def current_genie_daily_edition(
                 "source_order": "own_unread_then_accepted_friends",
             }
         )
-    return {
-        "date": datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat(),
+    edition = {
+        "date": today_str,
         "title": "Genie Daily",
         "pillars": editions,
     }
+    with closing(database()) as connection:
+        connection.execute(
+            """
+            INSERT INTO genie_daily_editions(user_sub, edition_date, payload, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_sub, edition_date) DO UPDATE SET
+                payload = excluded.payload,
+                created_at = excluded.created_at
+            """,
+            (
+                identity["sub"],
+                edition["date"],
+                json.dumps(edition, separators=(",", ":")),
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    return edition
 
 
 @app.get("/api/skills/capsules")
@@ -5436,6 +5498,12 @@ async def admin_telemetry(
             FROM vip_passes
             """
         ).fetchone()
+        vip_rows = connection.execute(
+            """
+            SELECT id, status, created_at, claimed_at
+            FROM vip_passes ORDER BY id LIMIT 20
+            """
+        ).fetchall()
         burned = connection.execute(
             """
             SELECT COALESCE(SUM(-amount), 0) AS total
@@ -5456,6 +5524,59 @@ async def admin_telemetry(
     free_keys = len(gemini_pool.free_keys)
     available_keys = int(gemini_pool.availability()["free_keys_available"])
     free_capacity_estimate = 13_500_000
+    cache_metrics = public_cache_telemetry()
+    provider_requests = cache_metrics["provider_requests"]
+    pool_metrics = [
+        {
+            "id": "pool0",
+            "name": "Pool 0 · Local Cache",
+            "requests": cache_metrics["cache_hits"],
+            "configured": True,
+        },
+        {
+            "id": "pool1",
+            "name": "Pool 1 · Gemini Free Rotator",
+            "requests": provider_requests.get("pool1-gemini", 0),
+            "configured": free_keys > 0,
+        },
+        {
+            "id": "pool2",
+            "name": "Pool 2 · Cloudflare 10,000 Neurons",
+            "requests": provider_requests.get("pool2-cloudflare", 0),
+            "configured": bool(
+                os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+                and os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+            ),
+        },
+        {
+            "id": "pool3",
+            "name": "Pool 3 · Groq",
+            "requests": provider_requests.get("pool3-groq", 0),
+            "configured": bool(os.getenv("GROQ_API_KEY", "").strip()),
+        },
+        {
+            "id": "pool4",
+            "name": "Pool 4 · Mistral",
+            "requests": provider_requests.get("pool4-mistral", 0),
+            "configured": bool(os.getenv("MISTRAL_API_KEY", "").strip()),
+        },
+        {
+            "id": "pool5",
+            "name": "Pool 5 · OpenRouter / Cerebras",
+            "requests": provider_requests.get("pool5-openrouter", 0)
+            + provider_requests.get("pool5-cerebras", 0),
+            "configured": bool(
+                os.getenv("OPENROUTER_API_KEY", "").strip()
+                or os.getenv("CEREBRAS_API_KEY", "").strip()
+            ),
+        },
+        {
+            "id": "pool6",
+            "name": "Pool 6 · Pollinations",
+            "requests": provider_requests.get("pool6-pollinations", 0),
+            "configured": True,
+        },
+    ]
     return {
         "status": "unlocked",
         "expires_at": session["exp"],
@@ -5474,6 +5595,13 @@ async def admin_telemetry(
         "vip_passes_claimed": int(vip["claimed"] or 0),
         "vip_passes_active": int(vip["active"] or 0),
         "vip_passes_paused": int(vip["paused"] or 0),
+        "vip_pass_rows": [dict(row) for row in vip_rows],
+        "cache_hits": cache_metrics["cache_hits"],
+        "cache_lookups": cache_metrics["cache_lookups"],
+        "cache_hit_rate_pct": cache_metrics["cache_hit_rate_pct"],
+        "latency_p50_ms": cache_metrics["latency_p50_ms"],
+        "latency_p95_ms": cache_metrics["latency_p95_ms"],
+        "pool_metrics": pool_metrics,
         "investor_impact": {
             "library_items": int(library_items),
             "completed_skill_capsules": int(completed_capsules),

@@ -8,9 +8,11 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
+from collections import OrderedDict
 from functools import lru_cache
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -22,6 +24,111 @@ REGISTRY_PATH = Path(__file__).resolve().parent / "ai_muscle" / "registry.json"
 MAX_CALLS_NORMAL = 1
 MAX_CALLS_MASTER = 4
 MAX_WORKERS_AI_NEURONS = 9200
+PUBLIC_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+PUBLIC_CACHE_MAX_ENTRIES = 1000
+_PUBLIC_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_PUBLIC_CACHE_LOCK = threading.Lock()
+_TELEMETRY_LOCK = threading.Lock()
+_TELEMETRY: dict[str, Any] = {
+    "cache_hits": 0,
+    "cache_lookups": 0,
+    "provider_requests": {},
+    "latencies_ms": [],
+}
+
+_PROMPT_INJECTION_PATTERNS = (
+    re.compile(r"ignore\s+(?:all\s+)?previous instructions", re.IGNORECASE),
+    re.compile(r"system prompt override", re.IGNORECASE),
+)
+_PRIVATE_QUERY_PATTERN = re.compile(
+    r"\b(?:my|mine|me|i am|i'm|myself|password|medical|diagnosis|"
+    r"account|private|confidential|phone number|email address)\b",
+    re.IGNORECASE,
+)
+_DYNAMIC_QUERY_PATTERN = re.compile(
+    r"\b(?:today|tonight|currently|current|latest|recent|now|weather|news|price|score)\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_untrusted_context(text: str) -> str:
+    sanitized = text
+    for pattern in _PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub("[removed instruction]", sanitized)
+    return re.sub(r"[ \t]{2,}", " ", sanitized).strip()
+
+
+def check_and_consume_quota(pool_state: dict[str, Any], cost: int = 1) -> bool:
+    if cost < 0:
+        raise ValueError("Quota cost cannot be negative.")
+    today_str = date.today().isoformat()
+    if pool_state.get("last_reset_date") != today_str:
+        pool_state["used_today"] = 0
+        pool_state["last_reset_date"] = today_str
+    used_today = int(pool_state.get("used_today", 0))
+    daily_limit = pool_state.get("daily_limit")
+    if isinstance(daily_limit, int) and used_today + cost > daily_limit:
+        return False
+    pool_state["used_today"] = used_today + cost
+    return True
+
+
+def _public_query_key(messages: list[dict[str, str]], model: str) -> str | None:
+    user_messages = [message for message in messages if message.get("role") == "user"]
+    if len(user_messages) != 1 or len(messages) > 2:
+        return None
+    prompt = " ".join(user_messages[0].get("content", "").casefold().split())
+    if (
+        not prompt
+        or len(prompt) > 1000
+        or _PRIVATE_QUERY_PATTERN.search(prompt)
+        or _DYNAMIC_QUERY_PATTERN.search(prompt)
+        or any(pattern.search(prompt) for pattern in _PROMPT_INJECTION_PATTERNS)
+    ):
+        return None
+    normalized = json.dumps(
+        {"model": model, "prompt": prompt},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def record_public_cache_lookup(hit: bool) -> None:
+    with _TELEMETRY_LOCK:
+        _TELEMETRY["cache_lookups"] += 1
+        if hit:
+            _TELEMETRY["cache_hits"] += 1
+
+
+def record_provider_request(pool: str, elapsed_ms: float) -> None:
+    with _TELEMETRY_LOCK:
+        requests = _TELEMETRY["provider_requests"]
+        requests[pool] = requests.get(pool, 0) + 1
+        latencies = _TELEMETRY["latencies_ms"]
+        latencies.append(max(0.0, elapsed_ms))
+        if len(latencies) > 2048:
+            del latencies[:-2048]
+
+
+def public_cache_telemetry() -> dict[str, Any]:
+    with _TELEMETRY_LOCK:
+        latencies = sorted(_TELEMETRY["latencies_ms"])
+        hits = int(_TELEMETRY["cache_hits"])
+        lookups = int(_TELEMETRY["cache_lookups"])
+        provider_requests = dict(_TELEMETRY["provider_requests"])
+    def percentile(value: float) -> float:
+        if not latencies:
+            return 0.0
+        return round(latencies[min(len(latencies) - 1, int((len(latencies) - 1) * value))], 2)
+    return {
+        "cache_hits": hits,
+        "cache_lookups": lookups,
+        "cache_hit_rate_pct": round((hits / lookups) * 100, 2) if lookups else 0.0,
+        "latency_p50_ms": percentile(0.50),
+        "latency_p95_ms": percentile(0.95),
+        "provider_requests": provider_requests,
+    }
 
 INLINE_REGISTRY: dict[str, Any] = {
     "body_agents": {
@@ -76,6 +183,10 @@ class MultiPoolRouter:
 
     def __init__(self, timeout_seconds: float = 8.0) -> None:
         self.timeout_seconds = timeout_seconds
+        self.pool_state: dict[str, Any] = {
+            "used_today": 0,
+            "last_reset_date": "",
+        }
 
     @staticmethod
     def _extract_openai_text(body: dict[str, Any]) -> str:
@@ -150,7 +261,7 @@ class MultiPoolRouter:
         safe_messages = [
             {
                 "role": message.get("role", "user"),
-                "content": str(message.get("content", ""))[:20_000],
+                "content": sanitize_untrusted_context(str(message.get("content", "")))[:20_000],
             }
             for message in messages[-40:]
         ]
@@ -184,12 +295,20 @@ class MultiPoolRouter:
         *,
         max_tokens: int = 4096,
     ) -> tuple[str, str]:
+        if not check_and_consume_quota(
+            self.pool_state,
+            int(os.getenv("GENIE_GLOBAL_DAILY_QUOTA_COST", "1")),
+        ):
+            raise RuntimeError("The global provider-pool daily quota has been reached.")
         errors: list[str] = []
         for pool, endpoint, model, _, headers, pool_cap in self._provider_specs():
+            started_at = time.perf_counter()
             try:
                 answer = await self._post(endpoint, model, messages, headers, min(max_tokens, pool_cap))
+                record_provider_request(pool, (time.perf_counter() - started_at) * 1000)
                 return answer, pool
             except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+                record_provider_request(pool, (time.perf_counter() - started_at) * 1000)
                 errors.append(f"{pool}:{type(error).__name__}")
                 LOGGER.warning("AI provider route failed (%s: %s)", pool, type(error).__name__)
         raise RuntimeError("Provider waterfall exhausted: " + ", ".join(errors or ["no providers"]))
@@ -307,6 +426,8 @@ class MasterBrain:
         future_self: bool = False,
         room_mode: bool = False,
         max_tokens: int = 4096,
+        public_cache_allowed: bool = True,
+        public_cache_checked: bool = False,
     ) -> dict[str, Any]:
         local = self.deterministic_reply(messages)
         if local is not None:
@@ -319,6 +440,29 @@ class MasterBrain:
             }
 
         master = model_tier == "genie-master" or future_self
+        cache_key = (
+            _public_query_key(messages, model_tier)
+            if public_cache_allowed and not master and not room_mode
+            else None
+        )
+        if cache_key and not public_cache_checked:
+            with _PUBLIC_CACHE_LOCK:
+                cached = _PUBLIC_CACHE.get(cache_key)
+                if cached and time.monotonic() - cached[0] < PUBLIC_CACHE_TTL_SECONDS:
+                    _PUBLIC_CACHE.move_to_end(cache_key)
+                    record_public_cache_lookup(True)
+                    return {
+                        "reply": cached[1],
+                        "source": "pool0-global-public-cache",
+                        "sub_agents": [],
+                        "verified": True,
+                        "proposed_memory": None,
+                        "max_calls": MAX_CALLS_NORMAL,
+                    }
+                if cached:
+                    del _PUBLIC_CACHE[cache_key]
+            record_public_cache_lookup(False)
+
         agents = (
             ["Lead Orchestrator", "Planner Sub-Agent", "Research Sub-Agent",
              "Execution Sub-Agent", "Critic Sub-Agent", "Synthesis Sub-Agent"]
@@ -334,9 +478,9 @@ class MasterBrain:
             {
                 "role": message.get("role", "user"),
                 "content": (
-                    f"{message['sender']}: {message.get('content', '')}"
+                    f"{message['sender']}: {sanitize_untrusted_context(str(message.get('content', '')))}"
                     if message.get("sender") and message.get("role") == "user"
-                    else str(message.get("content", ""))
+                    else sanitize_untrusted_context(str(message.get("content", "")))
                 ),
             }
             for message in messages[-40:]
@@ -377,7 +521,15 @@ class MasterBrain:
                 if name == "Critic Sub-Agent":
                     instruction += " Do not introduce claims that are not supported by the conversation."
                 phase_prompt = [
-                    {"role": "system", "content": f"{system_context}\n{instruction}"},
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{system_context}\n{instruction} "
+                            "read_only=True; do not execute tools, modify files, or write to external systems."
+                            if "Research" in name or "Coding" in name
+                            else f"{system_context}\n{instruction}"
+                        ),
+                    },
                     *phase_context,
                 ]
                 reply, pool = await self.router.complete(phase_prompt, max_tokens=max_tokens)
@@ -386,6 +538,12 @@ class MasterBrain:
                     {"role": "assistant", "content": f"{name} output:\n{reply}"},
                 ]
         verification = self.verifier.verify(reply)
+        if cache_key and verification["verified"]:
+            with _PUBLIC_CACHE_LOCK:
+                _PUBLIC_CACHE[cache_key] = (time.monotonic(), reply)
+                _PUBLIC_CACHE.move_to_end(cache_key)
+                while len(_PUBLIC_CACHE) > PUBLIC_CACHE_MAX_ENTRIES:
+                    _PUBLIC_CACHE.popitem(last=False)
         if master and not verification["verified"]:
             LOGGER.info("Critic verifier flagged high-certainty phrasing in the answer.")
         return {

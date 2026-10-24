@@ -2,7 +2,7 @@
 
 import { BarChart3, LockKeyhole, RefreshCw, Users, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { ApiError, apiFetch } from "@/lib/api";
+import { ApiError, apiFetch, apiFetchAdminTelemetry } from "@/lib/api";
 
 function isBackendUnavailable(error: unknown): boolean {
   return error instanceof TypeError
@@ -32,7 +32,62 @@ interface Telemetry {
   vip_passes_claimed: number;
   vip_passes_active: number;
   vip_passes_paused: number;
+  cache_hits: number;
+  cache_lookups: number;
+  cache_hit_rate_pct: number;
+  latency_p50_ms: number;
+  latency_p95_ms: number;
+  pool_metrics: PoolMetric[];
+  vip_pass_rows?: VipPass[];
+  investor_impact: {
+    library_items: number;
+    completed_skill_capsules: number;
+    non_cash_time_credits_earned: number;
+  };
 }
+
+interface PoolMetric {
+  id: string;
+  name: string;
+  requests: number;
+  configured: boolean;
+}
+
+const BASELINE_TELEMETRY: Telemetry = {
+  daily_token_limit: 25,
+  daily_tokens_burned: 0,
+  free_keys_configured: 0,
+  free_keys_active: 0,
+  free_pool_capacity_estimate: 0,
+  estimated_dau_capacity: 0,
+  master_key_isolated: true,
+  master_key_configured: false,
+  gemini_free_pool_enabled: false,
+  vip_pass_limit: 20,
+  vip_passes_allocated: 0,
+  vip_passes_claimed: 0,
+  vip_passes_active: 0,
+  vip_passes_paused: 0,
+  cache_hits: 0,
+  cache_lookups: 0,
+  cache_hit_rate_pct: 0,
+  latency_p50_ms: 0,
+  latency_p95_ms: 0,
+  pool_metrics: [
+    { id: "pool0", name: "Pool 0 · Local Cache", requests: 0, configured: true },
+    { id: "pool1", name: "Pool 1 · Gemini Free Rotator", requests: 0, configured: false },
+    { id: "pool2", name: "Pool 2 · Cloudflare 10,000 Neurons", requests: 0, configured: false },
+    { id: "pool3", name: "Pool 3 · Groq", requests: 0, configured: false },
+    { id: "pool4", name: "Pool 4 · Mistral", requests: 0, configured: false },
+    { id: "pool5", name: "Pool 5 · OpenRouter / Cerebras", requests: 0, configured: false },
+    { id: "pool6", name: "Pool 6 · Pollinations", requests: 0, configured: true },
+  ],
+  investor_impact: {
+    library_items: 0,
+    completed_skill_capsules: 0,
+    non_cash_time_credits_earned: 0,
+  },
+};
 
 interface VipPass {
   id: string;
@@ -63,7 +118,7 @@ interface AdminDashboardProps {
 }
 
 export default function AdminDashboard(props: AdminDashboardProps) {
-  const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
+  const [telemetry, setTelemetry] = useState<Telemetry>(BASELINE_TELEMETRY);
   const [passes, setPasses] = useState<VipPass[]>([]);
   const [poolStatus, setPoolStatus] = useState<PoolStatus | null>(null);
   const [dailyLimit, setDailyLimit] = useState("25");
@@ -73,11 +128,8 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    if (!props.credential || !props.adminToken || props.localOnly) return;
-    const [nextTelemetry, nextPasses, nextPoolStatus] = await Promise.all([
-      apiFetch<Telemetry>("/api/admin/telemetry", props.credential, {
-        headers: { "X-Genie-Admin-Session": props.adminToken },
-      }),
+    const [telemetryResult, passesResult, poolResult] = await Promise.allSettled([
+      apiFetchAdminTelemetry<Telemetry>(props.credential, props.adminToken),
       apiFetch<VipPass[]>("/api/admin/vip-passes", props.credential, {
         headers: { "X-Genie-Admin-Session": props.adminToken },
       }),
@@ -85,14 +137,36 @@ export default function AdminDashboard(props: AdminDashboardProps) {
         headers: { "X-Genie-Admin-Session": props.adminToken },
       }),
     ]);
-    setTelemetry(nextTelemetry);
-    setDailyLimit(String(nextTelemetry.daily_token_limit));
-    setPasses(nextPasses);
-    setPoolStatus(nextPoolStatus);
-  }, [props.adminToken, props.credential, props.localOnly]);
+
+    if (telemetryResult.status === "fulfilled") {
+      const nextTelemetry = telemetryResult.value;
+      setTelemetry({
+        ...BASELINE_TELEMETRY,
+        ...nextTelemetry,
+        pool_metrics: nextTelemetry.pool_metrics?.length
+          ? nextTelemetry.pool_metrics
+          : BASELINE_TELEMETRY.pool_metrics,
+        investor_impact: {
+          ...BASELINE_TELEMETRY.investor_impact,
+          ...nextTelemetry.investor_impact,
+        },
+      });
+      setDailyLimit(String(telemetryResult.value.daily_token_limit));
+      setError("");
+      if (passesResult.status === "rejected" && nextTelemetry.vip_pass_rows) {
+        setPasses(nextTelemetry.vip_pass_rows);
+      }
+    } else {
+      if (isBackendUnavailable(telemetryResult.reason) && props.onLocalFallback()) return;
+      setError(telemetryResult.reason instanceof Error
+        ? telemetryResult.reason.message
+        : "Admin telemetry could not be loaded; showing baseline metrics.");
+    }
+    if (passesResult.status === "fulfilled") setPasses(passesResult.value);
+    if (poolResult.status === "fulfilled") setPoolStatus(poolResult.value);
+  }, [props.adminToken, props.credential, props.localOnly, props.onLocalFallback]);
 
   const refreshPool = useCallback(async () => {
-    if (!props.credential || !props.adminToken || props.localOnly) return;
     const nextPoolStatus = await apiFetch<PoolStatus>("/api/admin/pool/overflow", props.credential, {
       headers: { "X-Genie-Admin-Session": props.adminToken },
     });
@@ -111,7 +185,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }, [props.localOnly, props.onLocalFallback, props.stats, refreshPool]);
 
   useEffect(() => {
-    if (!props.stats || props.localOnly) return;
+    if (!props.stats) return;
     setError("");
     void refresh().catch((caught: unknown) => {
       if (isBackendUnavailable(caught) && props.onLocalFallback()) return;
@@ -120,19 +194,6 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }, [props.localOnly, props.onLocalFallback, props.stats, refresh]);
 
   if (!props.stats) return null;
-  if (props.localOnly) {
-    return (
-      <div className="modal-backdrop" role="presentation">
-        <section className="admin-modal dashboard-modal" role="dialog" aria-modal="true" aria-labelledby="dashboard-title">
-          <div className="admin-lock"><LockKeyhole size={22} /></div>
-          <span className="eyebrow">DEVICE CONFIRMED · READ ONLY</span>
-          <h2 id="dashboard-title">Super Admin Dashboard</h2>
-          <p>The device passkey was confirmed locally, but the backend is unavailable. Admin data and controls require a server connection.</p>
-          <button className="passkey-secondary" onClick={props.onClose}>Lock dashboard</button>
-        </section>
-      </div>
-    );
-  }
   const systemStatus = error
     ? "Error"
     : telemetry && (!telemetry.gemini_free_pool_enabled || telemetry.free_keys_active === 0)
@@ -147,6 +208,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
       : "";
 
   async function saveLimit() {
+    if (props.localOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -164,6 +226,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }
 
   async function updateVipPass(action: "mint" | "pause" | "resume" | "revoke" | "recycle", passId?: string) {
+    if (props.localOnly) return;
     setBusy(true);
     setError("");
     setOneTimeCode("");
@@ -183,6 +246,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }
 
   async function toggleMasterPooling(enabled: boolean) {
+    if (props.localOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -200,6 +264,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }
 
   async function toggleTelemetryGeminiPool(enabled: boolean) {
+    if (props.localOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -217,6 +282,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   }
 
   async function decideOverflow(requestId: string, accept: boolean) {
+    if (props.localOnly) return;
     setBusy(true);
     setError("");
     try {
@@ -260,7 +326,34 @@ export default function AdminDashboard(props: AdminDashboardProps) {
           <div><BarChart3 size={16} /><strong>{props.stats.review_tokens}</strong><small>Review tokens metered</small></div>
         </div>
 
-        {telemetry && (
+        <section className="admin-vip-section" aria-label="Global AI pool telemetry">
+          <h3>Global AI Pools</h3>
+          {(props.localOnly || error) && (
+            <p role="status">Showing baseline metrics; live values update when the authenticated backend responds.</p>
+          )}
+          <div className="admin-vip-row"><strong>Pool</strong><strong>Requests</strong><strong>State</strong></div>
+          {telemetry.pool_metrics.map((pool) => (
+            <div className="admin-vip-row" key={pool.id}>
+              <span>{pool.name}</span>
+              <span>{pool.requests.toLocaleString()}</span>
+              <span>{pool.configured ? "Configured" : "Not configured"}</span>
+            </div>
+          ))}
+          <div className="admin-stats-grid">
+            <div><BarChart3 size={16} /><strong>{telemetry.cache_hit_rate_pct.toFixed(2)}%</strong><small>Global cache hit rate · {telemetry.cache_hits}/{telemetry.cache_lookups} lookups</small></div>
+            <div><BarChart3 size={16} /><strong>{telemetry.latency_p50_ms.toFixed(2)} ms</strong><small>Provider p50 latency</small></div>
+            <div><BarChart3 size={16} /><strong>{telemetry.latency_p95_ms.toFixed(2)} ms</strong><small>Provider p95 latency</small></div>
+            <div><Users size={16} /><strong>{telemetry.vip_pass_limit}</strong><small>VIP pass allocation limit</small></div>
+          </div>
+          <h3>Investor Impact Metrics</h3>
+          <div className="admin-stats-grid">
+            <div><BarChart3 size={16} /><strong>{telemetry.investor_impact.library_items}</strong><small>Ready Library items</small></div>
+            <div><BarChart3 size={16} /><strong>{telemetry.investor_impact.completed_skill_capsules}</strong><small>Completed skill capsules</small></div>
+            <div><BarChart3 size={16} /><strong>{telemetry.investor_impact.non_cash_time_credits_earned}</strong><small>Non-cash time credits earned</small></div>
+          </div>
+        </section>
+
+        {!props.localOnly && (
           <>
             <div className="admin-stats-grid">
               <div><BarChart3 size={16} /><strong>{telemetry.daily_tokens_burned}</strong><small>AI tokens charged · rolling 24h</small></div>

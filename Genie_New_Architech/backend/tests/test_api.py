@@ -13,6 +13,7 @@ os.environ["GENIE_GOOGLE_CLIENT_ID"] = "test-client"
 from fastapi.testclient import TestClient
 
 import main
+import orchestrator
 from security import SECRET_MARKER
 from security import issue_inline_push_reply_token
 
@@ -20,6 +21,8 @@ from security import issue_inline_push_reply_token
 class BackendApiTests(unittest.TestCase):
     def setUp(self):
         self.actor = {"sub": "test-user-123", "name": "Test User", "email": "test@example.com"}
+        with orchestrator._PUBLIC_CACHE_LOCK:
+            orchestrator._PUBLIC_CACHE.clear()
         main.app.dependency_overrides[main.current_identity] = lambda: self.actor
         main.app.dependency_overrides[main.optional_read_identity] = lambda: self.actor
         self.provider_probe_patch = patch.object(
@@ -193,6 +196,33 @@ class BackendApiTests(unittest.TestCase):
         capsules = self.client.get("/api/skills/capsules")
         self.assertEqual(capsules.json()["time_credits"], 10)
         self.assertEqual(capsules.json()["skill_dna"][0]["completed_capsules"], 1)
+
+    def test_genie_daily_edition_is_cached_for_user_and_day(self):
+        self.actor["sub"] = "daily-cache-test-user"
+        with patch.object(
+            main,
+            "_seed_starter_library",
+            wraps=main._seed_starter_library,
+        ) as seed_library:
+            first = self.client.get("/api/v1/genie-daily/editions/current")
+            second = self.client.get("/api/v1/genie-daily/editions/current")
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(first.json(), second.json())
+        seed_library.assert_called_once()
+
+    def test_provider_pool_quota_resets_lazily_by_date(self):
+        pool_state = {
+            "used_today": 1,
+            "last_reset_date": "2000-01-01",
+            "daily_limit": 1,
+        }
+
+        self.assertTrue(orchestrator.check_and_consume_quota(pool_state))
+        self.assertEqual(pool_state["used_today"], 1)
+        self.assertEqual(pool_state["last_reset_date"], orchestrator.date.today().isoformat())
+        self.assertFalse(orchestrator.check_and_consume_quota(pool_state))
 
     def test_seeded_library_reads_are_available_without_sign_in(self):
         main.app.dependency_overrides.pop(main.optional_read_identity, None)

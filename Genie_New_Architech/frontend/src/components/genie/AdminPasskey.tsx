@@ -75,7 +75,7 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
   function unlockLocally(credentialId: string): boolean {
     if (localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY) !== credentialId) return false;
     setError("");
-    setStatus("Device passkey confirmed locally. Backend access is unavailable; dashboard is read-only.");
+    setStatus("Device passkey confirmed locally. Opening dashboard with baseline telemetry.");
     props.onUnlocked(LOCAL_ADMIN_UNLOCK_TOKEN, true, credentialId);
     props.onClose();
     return true;
