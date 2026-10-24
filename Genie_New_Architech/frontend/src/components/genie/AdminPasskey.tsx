@@ -1,16 +1,18 @@
 "use client";
 
 import { Fingerprint, ShieldCheck, X } from "lucide-react";
-import { useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { ApiError, apiFetch, randomToken } from "@/lib/api";
 
 const ADMIN_SESSION_STORAGE_KEY = "genie_admin_signed_session";
+export const LOCAL_CREDENTIAL_STORAGE_KEY = "genie_admin_local_credential_id";
+export const LOCAL_ADMIN_UNLOCK_TOKEN = "local-device-unlock";
 
 interface AdminPasskeyProps {
   open: boolean;
   credential: string;
   onClose: () => void;
-  onUnlocked: (token: string) => void;
+  onUnlocked: (token: string, localOnly?: boolean, credentialId?: string) => void;
 }
 
 function decodeBase64Url(value: string): ArrayBuffer {
@@ -54,10 +56,30 @@ function serializeCredential(credential: PublicKeyCredential): Record<string, un
   return result;
 }
 
+function canUseLocalPasskey(error: unknown): boolean {
+  return error instanceof TypeError
+    || (error instanceof ApiError && (error.status === 401 || error.status === 404));
+}
+
 export default function AdminPasskey(props: AdminPasskeyProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
+  const [deviceEnrolled, setDeviceEnrolled] = useState(false);
+
+  useEffect(() => {
+    if (!props.open) return;
+    setDeviceEnrolled(Boolean(localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY)));
+  }, [props.open]);
+
+  function unlockLocally(credentialId: string): boolean {
+    if (localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY) !== credentialId) return false;
+    setError("");
+    setStatus("Device passkey confirmed locally. Backend access is unavailable; dashboard is read-only.");
+    props.onUnlocked(LOCAL_ADMIN_UNLOCK_TOKEN, true, credentialId);
+    props.onClose();
+    return true;
+  }
 
   async function enroll() {
     setBusy(true);
@@ -87,9 +109,16 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
       };
       const passkey = await navigator.credentials.create({ publicKey });
       if (!(passkey instanceof PublicKeyCredential)) throw new Error("The device did not create a passkey.");
-      await apiFetch("/api/admin/passkeys/enroll/verify", props.credential, {
-        method: "POST", body: JSON.stringify({ credential: serializeCredential(passkey) }),
-      });
+      localStorage.setItem(LOCAL_CREDENTIAL_STORAGE_KEY, passkey.id);
+      setDeviceEnrolled(true);
+      try {
+        await apiFetch("/api/admin/passkeys/enroll/verify", props.credential, {
+          method: "POST", body: JSON.stringify({ credential: serializeCredential(passkey) }),
+        });
+      } catch (caught) {
+        if (!canUseLocalPasskey(caught) || !unlockLocally(passkey.id)) throw caught;
+        return;
+      }
       setStatus("Device passkey enrolled. Now use it to unlock the dashboard.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Passkey enrollment failed.");
@@ -101,10 +130,25 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
   async function unlock() {
     setBusy(true);
     setError("");
+    let authenticatedCredentialId = "";
     try {
-      const options = await apiFetch<Record<string, unknown>>(
-        "/api/admin/passkeys/auth/options", props.credential, { method: "POST", body: "{}" },
-      );
+      let options: Record<string, unknown>;
+      let localOnly = false;
+      try {
+        options = await apiFetch<Record<string, unknown>>(
+          "/api/admin/passkeys/auth/options", props.credential, { method: "POST", body: "{}" },
+        );
+      } catch (caught) {
+        const localCredentialId = localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY);
+        if (!localCredentialId || !canUseLocalPasskey(caught)) throw caught;
+        localOnly = true;
+        options = {
+          challenge: randomToken(),
+          rpId: window.location.hostname,
+          userVerification: "required",
+          allowCredentials: [{ id: localCredentialId, type: "public-key" }],
+        };
+      }
       const allowCredentials = (options.allowCredentials || []) as Array<{
         id: string; type: "public-key"; transports?: AuthenticatorTransport[];
       }>;
@@ -119,6 +163,11 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
       };
       const passkey = await navigator.credentials.get({ publicKey });
       if (!(passkey instanceof PublicKeyCredential)) throw new Error("Passkey authentication was cancelled.");
+      authenticatedCredentialId = passkey.id;
+      if (localOnly) {
+        if (unlockLocally(passkey.id)) return;
+        throw new Error("This device passkey is not registered locally.");
+      }
       const result = await apiFetch<{ admin_session: string }>(
         "/api/admin/passkeys/auth/verify", props.credential,
         { method: "POST", body: JSON.stringify({ credential: serializeCredential(passkey) }) },
@@ -126,9 +175,16 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
       if (!result.admin_session) throw new Error("The server did not issue an admin session.");
       // Persist only the server-signed token returned after WebAuthn verification.
       localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, result.admin_session);
-      props.onUnlocked(result.admin_session);
+      props.onUnlocked(result.admin_session, false, passkey.id);
       props.onClose();
     } catch (caught) {
+      const localCredentialId = localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY);
+      if (
+        canUseLocalPasskey(caught)
+        && authenticatedCredentialId
+        && localCredentialId === authenticatedCredentialId
+        && unlockLocally(authenticatedCredentialId)
+      ) return;
       setError(caught instanceof Error ? caught.message : "Passkey verification failed.");
     } finally {
       setBusy(false);
@@ -145,7 +201,7 @@ export default function AdminPasskey(props: AdminPasskeyProps) {
         <h2 id="admin-title">Super Admin Dashboard</h2>
         <p>Verify with a platform passkey. This device's biometric or screen-lock verification stays with your authenticator.</p>
         <button className="passkey-primary" disabled={busy} onClick={() => void unlock()}><ShieldCheck size={17} />{busy ? "Verifying…" : "Unlock with passkey"}</button>
-        <button className="passkey-secondary" disabled={busy} onClick={() => void enroll()}>{busy ? "Working…" : "Enroll this device passkey"}</button>
+        {!deviceEnrolled && <button className="passkey-secondary" disabled={busy} onClick={() => void enroll()}>{busy ? "Working…" : "Enroll this device passkey"}</button>}
         {status && <p className="passkey-status" role="status">{status}</p>}
         {error && <p className="passkey-error" role="alert">{error}</p>}
       </section>

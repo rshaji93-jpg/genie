@@ -1023,7 +1023,31 @@ def _recover_expired_or_local_identity(token: str) -> dict[str, str]:
         "picture": "",
     }
 
-async def current_identity(authorization: str | None = Header(default=None)) -> dict[str, str]:
+def bind_profile_headers(
+    identity: dict[str, str],
+    user_email: str | None,
+    user_id: str | None,
+) -> dict[str, str]:
+    verified = dict(identity)
+    verified["request_email"] = (
+        user_email.strip().casefold()
+        if isinstance(user_email, str)
+        and user_email.strip().casefold() == identity["email"].casefold()
+        else identity["email"].casefold()
+    )
+    verified["request_sub"] = (
+        user_id.strip()
+        if isinstance(user_id, str) and user_id.strip() == identity["sub"]
+        else identity["sub"]
+    )
+    return verified
+
+
+async def current_identity(
+    authorization: str | None = Header(default=None),
+    user_email: str | None = Header(default=None, alias="X-User-Email"),
+    user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> dict[str, str]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Google sign-in is required.")
     token = authorization[7:].strip()
@@ -1043,7 +1067,7 @@ async def current_identity(authorization: str | None = Header(default=None)) -> 
             ).fetchone()
         if not registered:
             raise HTTPException(status_code=401, detail="User account is no longer active.")
-        return identity
+        return bind_profile_headers(identity, user_email, user_id)
     try:
         identity = verify_google_identity(token, GOOGLE_CLIENT_ID)
     except HTTPException:
@@ -1063,7 +1087,25 @@ async def current_identity(authorization: str | None = Header(default=None)) -> 
         )
         ensure_public_username(connection, identity["sub"])
         connection.commit()
-    return identity
+    return bind_profile_headers(identity, user_email, user_id)
+
+
+ANONYMOUS_STARTER_IDENTITY = {
+    "sub": "genie-anonymous-starter",
+    "email": "guest@localhost",
+    "name": "Guest",
+    "picture": "",
+}
+
+
+async def optional_read_identity(
+    authorization: str | None = Header(default=None),
+    user_email: str | None = Header(default=None, alias="X-User-Email"),
+    user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> dict[str, str]:
+    if not authorization:
+        return dict(ANONYMOUS_STARTER_IDENTITY)
+    return await current_identity(authorization, user_email, user_id)
 
 
 async def local_chat_identity(
@@ -4244,7 +4286,7 @@ def _web_authn():
 
 
 def require_super_admin(identity: dict[str, str]) -> None:
-    if identity["email"] != SUPER_ADMIN_EMAIL:
+    if identity.get("request_email", identity["email"]).casefold() != SUPER_ADMIN_EMAIL.casefold():
         raise HTTPException(status_code=403, detail="Super administrator access required.")
 
 
@@ -4955,7 +4997,7 @@ async def list_library_items(
     item_type: str | None = None,
     status: Literal["pending_approval", "ready"] | None = None,
     room_id: str | None = None,
-    identity: dict[str, str] = Depends(current_identity),
+    identity: dict[str, str] = Depends(optional_read_identity),
 ):
     allowed_types = {
         "prompt", "article", "code", "game", "thread", "social_embed", "goal",
@@ -5166,7 +5208,7 @@ async def grounded_library_ask(
 
 @app.get("/api/v1/genie-daily/editions/current")
 async def current_genie_daily_edition(
-    identity: dict[str, str] = Depends(current_identity),
+    identity: dict[str, str] = Depends(optional_read_identity),
 ):
     pillars = {
         "Knowledge": {"article", "code", "prompt"},
@@ -5176,6 +5218,8 @@ async def current_genie_daily_edition(
         "Community & Creativity": {"thread", "game", "social_embed"},
     }
     with closing(database()) as connection:
+        _seed_starter_library(connection, identity["sub"])
+        connection.commit()
         friend_ids = _accepted_friend_ids(connection, identity["sub"])
         own_rows = connection.execute(
             """
@@ -5221,7 +5265,7 @@ async def current_genie_daily_edition(
 
 
 @app.get("/api/skills/capsules")
-async def list_skill_capsules(identity: dict[str, str] = Depends(current_identity)):
+async def list_skill_capsules(identity: dict[str, str] = Depends(optional_read_identity)):
     with closing(database()) as connection:
         capsules = connection.execute(
             "SELECT * FROM skill_capsules WHERE user_sub = ? ORDER BY created_at DESC LIMIT 100",
@@ -5491,7 +5535,7 @@ def require_admin_session(
 
 
 def require_genesis_owner(identity: dict[str, str]) -> None:
-    if identity.get("email", "").casefold() != SUPER_ADMIN_EMAIL.casefold():
+    if identity.get("request_email", identity.get("email", "")).casefold() != SUPER_ADMIN_EMAIL.casefold():
         raise HTTPException(status_code=404, detail="Not found.")
 
 

@@ -2,7 +2,12 @@
 
 import { BarChart3, LockKeyhole, RefreshCw, Users, X } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { apiFetch } from "@/lib/api";
+import { ApiError, apiFetch } from "@/lib/api";
+
+function isBackendUnavailable(error: unknown): boolean {
+  return error instanceof TypeError
+    || (error instanceof ApiError && (error.status === 401 || error.status === 404));
+}
 
 interface AdminStats {
   rooms: number;
@@ -52,6 +57,8 @@ interface AdminDashboardProps {
   stats: AdminStats | null;
   credential: string;
   adminToken: string;
+  localOnly?: boolean;
+  onLocalFallback: () => boolean;
   onClose: () => void;
 }
 
@@ -66,7 +73,7 @@ export default function AdminDashboard(props: AdminDashboardProps) {
   const [error, setError] = useState("");
 
   const refresh = useCallback(async () => {
-    if (!props.credential || !props.adminToken) return;
+    if (!props.credential || !props.adminToken || props.localOnly) return;
     const [nextTelemetry, nextPasses, nextPoolStatus] = await Promise.all([
       apiFetch<Telemetry>("/api/admin/telemetry", props.credential, {
         headers: { "X-Genie-Admin-Session": props.adminToken },
@@ -82,35 +89,50 @@ export default function AdminDashboard(props: AdminDashboardProps) {
     setDailyLimit(String(nextTelemetry.daily_token_limit));
     setPasses(nextPasses);
     setPoolStatus(nextPoolStatus);
-  }, [props.adminToken, props.credential]);
+  }, [props.adminToken, props.credential, props.localOnly]);
 
   const refreshPool = useCallback(async () => {
-    if (!props.credential || !props.adminToken) return;
+    if (!props.credential || !props.adminToken || props.localOnly) return;
     const nextPoolStatus = await apiFetch<PoolStatus>("/api/admin/pool/overflow", props.credential, {
       headers: { "X-Genie-Admin-Session": props.adminToken },
     });
     setPoolStatus(nextPoolStatus);
-  }, [props.adminToken, props.credential]);
+  }, [props.adminToken, props.credential, props.localOnly]);
 
   useEffect(() => {
-    if (!props.stats) return;
+    if (!props.stats || props.localOnly) return;
     const timer = window.setInterval(() => {
       void refreshPool().catch((caught: unknown) => {
+        if (isBackendUnavailable(caught) && props.onLocalFallback()) return;
         setError(caught instanceof Error ? caught.message : "Pool status could not be refreshed.");
       });
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [props.stats, refreshPool]);
+  }, [props.localOnly, props.onLocalFallback, props.stats, refreshPool]);
 
   useEffect(() => {
-    if (!props.stats) return;
+    if (!props.stats || props.localOnly) return;
     setError("");
     void refresh().catch((caught: unknown) => {
+      if (isBackendUnavailable(caught) && props.onLocalFallback()) return;
       setError(caught instanceof Error ? caught.message : "Admin telemetry could not be loaded.");
     });
-  }, [props.stats, refresh]);
+  }, [props.localOnly, props.onLocalFallback, props.stats, refresh]);
 
   if (!props.stats) return null;
+  if (props.localOnly) {
+    return (
+      <div className="modal-backdrop" role="presentation">
+        <section className="admin-modal dashboard-modal" role="dialog" aria-modal="true" aria-labelledby="dashboard-title">
+          <div className="admin-lock"><LockKeyhole size={22} /></div>
+          <span className="eyebrow">DEVICE CONFIRMED · READ ONLY</span>
+          <h2 id="dashboard-title">Super Admin Dashboard</h2>
+          <p>The device passkey was confirmed locally, but the backend is unavailable. Admin data and controls require a server connection.</p>
+          <button className="passkey-secondary" onClick={props.onClose}>Lock dashboard</button>
+        </section>
+      </div>
+    );
+  }
   const systemStatus = error
     ? "Error"
     : telemetry && (!telemetry.gemini_free_pool_enabled || telemetry.free_keys_active === 0)

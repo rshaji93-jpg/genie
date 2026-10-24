@@ -21,6 +21,7 @@ class BackendApiTests(unittest.TestCase):
     def setUp(self):
         self.actor = {"sub": "test-user-123", "name": "Test User", "email": "test@example.com"}
         main.app.dependency_overrides[main.current_identity] = lambda: self.actor
+        main.app.dependency_overrides[main.optional_read_identity] = lambda: self.actor
         self.provider_probe_patch = patch.object(
             main.multi_provider_pool,
             "validate_primary_providers",
@@ -192,6 +193,24 @@ class BackendApiTests(unittest.TestCase):
         capsules = self.client.get("/api/skills/capsules")
         self.assertEqual(capsules.json()["time_credits"], 10)
         self.assertEqual(capsules.json()["skill_dna"][0]["completed_capsules"], 1)
+
+    def test_seeded_library_reads_are_available_without_sign_in(self):
+        main.app.dependency_overrides.pop(main.optional_read_identity, None)
+
+        library = self.client.get("/api/library")
+        edition = self.client.get("/api/v1/genie-daily/editions/current")
+        capsules = self.client.get("/api/skills/capsules")
+
+        self.assertEqual(library.status_code, 200, library.text)
+        self.assertGreaterEqual(library.json()["count"], 5)
+        self.assertEqual(edition.status_code, 200, edition.text)
+        self.assertTrue(any(
+            item["title"] == "Welcome to your Living Library"
+            for pillar in edition.json()["pillars"]
+            for item in pillar["items"]
+        ))
+        self.assertEqual(capsules.status_code, 200, capsules.text)
+        self.assertTrue(capsules.json()["available_skills"])
 
     def test_private_ai_chat_omits_prior_history_from_inference(self):
         with patch.object(

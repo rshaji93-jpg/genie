@@ -3,7 +3,10 @@
 import { ArrowUpRight, AudioLines, Check, ChevronDown, LockKeyhole, Menu, MoreHorizontal, Search, ShieldCheck, Trash2, UsersRound } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import AdminDashboard from "@/components/genie/AdminDashboard";
-import AdminPasskey from "@/components/genie/AdminPasskey";
+import AdminPasskey, {
+  LOCAL_ADMIN_UNLOCK_TOKEN,
+  LOCAL_CREDENTIAL_STORAGE_KEY,
+} from "@/components/genie/AdminPasskey";
 import ChatCanvas, { type ChatMessage } from "@/components/genie/ChatCanvas";
 import CommandSearchModal from "@/components/genie/CommandSearchModal";
 import OmniComposer, { type Attachment, type ChatMode, type SubmitTarget } from "@/modules/composer/OptionAComposer";
@@ -13,6 +16,7 @@ import RoomInviteModal from "@/components/genie/RoomInviteModal";
 import Sidebar, { type DeletedThreadItem, type ThreadItem, type WorkspaceView } from "@/components/genie/Sidebar";
 import WorkspacePanel from "@/components/genie/WorkspacePanel";
 import {
+  ApiError,
   apiFetch,
   apiFetchWithFallback,
   apiRequest,
@@ -243,6 +247,7 @@ const LOCAL_REQUESTS_STORAGE = "genie_local_friend_requests";
 const LOCAL_FRIENDS_STORAGE = "genie_local_friends";
 const LOCAL_PROFILE_STORAGE = "genie_local_profile";
 const LOCAL_VOICE_STORAGE = "genie_selected_voice";
+const ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY = "genie_admin_verified_local_credential_id";
 const GENIE_VOICES: GenieVoice[] = [
   { id: "genie-assistant", label: "Genie Assistant", lang: "en-IN", pitch: 1.08, rate: 1, sample: "Hello, I am your Genie Assistant. I can help with everyday questions, explain ideas clearly, and make your next step easier with a calm, thoughtful voice." },
   { id: "genie-master", label: "Genie Master", lang: "en-IN", pitch: 1.12, rate: 0.96, sample: "Hello, I am Genie Master. I bring careful reasoning to complex questions, code, and documents, then share a clear and considerate explanation you can act on." },
@@ -447,6 +452,24 @@ export default function Home() {
     rooms: number; users: number; reviews: number; review_tokens: number; expires_at: number;
   } | null>(null);
   const [toast, setToast] = useState("");
+  const switchToLocalAdminView = useCallback(() => {
+    const verifiedCredentialId = sessionStorage.getItem(ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY);
+    if (
+      !verifiedCredentialId
+      || localStorage.getItem(LOCAL_CREDENTIAL_STORAGE_KEY) !== verifiedCredentialId
+    ) return false;
+
+    setAdminToken(LOCAL_ADMIN_UNLOCK_TOKEN);
+    setAdminStats({
+      rooms: 0,
+      users: 0,
+      reviews: 0,
+      review_tokens: 0,
+      expires_at: Math.floor(Date.now() / 1000) + 300,
+    });
+    setToast("Device passkey confirmed locally. Admin dashboard is read-only while the backend is unavailable.");
+    return true;
+  }, []);
   const avatarTaps = useRef<number[]>([]);
   const [profilePreferences, setProfilePreferences] = useState<ProfilePreferences>({
     geo_region_hash: null,
@@ -551,6 +574,7 @@ export default function Home() {
       } else if (saved) {
         sessionStorage.removeItem("genie_google_credential");
         sessionStorage.removeItem("genie_user_session");
+        sessionStorage.removeItem(ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY);
       }
       const hint = localStorage.getItem("genie_returning_email") || "";
       setLoginEmail(hint);
@@ -3471,24 +3495,41 @@ export default function Home() {
         open={adminOpen}
         credential={credential}
         onClose={() => setAdminOpen(false)}
-        onUnlocked={(token) => {
+        onUnlocked={(token, localOnly = false, credentialId = "") => {
+          if (credentialId) {
+            sessionStorage.setItem(ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY, credentialId);
+          }
+          if (localOnly) {
+            if (!switchToLocalAdminView()) {
+              setToast("This device passkey could not be matched to its local enrollment.");
+            }
+            return;
+          }
           setAdminToken(token);
-        void apiFetch<{
-          status: string; rooms: number; users: number; reviews: number; review_tokens: number; expires_at: number;
-        }>("/api/admin/status", token)
-          .then((result) => {
-            setAdminStats(result);
-            setToast(`Secure Admin Dashboard ${result.status}.`);
-          })
-          .catch((error: unknown) => setToast(error instanceof Error ? error.message : "Admin session rejected."));
+          void apiFetch<{
+            status: string; rooms: number; users: number; reviews: number; review_tokens: number; expires_at: number;
+          }>("/api/admin/status", token)
+            .then((result) => {
+              setAdminStats(result);
+              setToast(`Secure Admin Dashboard ${result.status}.`);
+            })
+            .catch((error: unknown) => {
+              if (
+                (error instanceof TypeError || (error instanceof ApiError && [401, 404].includes(error.status)))
+                && switchToLocalAdminView()
+              ) return;
+              setToast(error instanceof Error ? error.message : "Admin session rejected.");
+            });
         }}
       />
-      {adminToken && adminStats && <div className="admin-session-badge"><ShieldCheck size={13} /> Secure Admin session active <button onClick={() => setAdminStats(adminStats)}>Open dashboard</button><button onClick={() => { localStorage.removeItem("genie_admin_signed_session"); setAdminToken(""); setAdminStats(null); }}>Lock</button></div>}
+      {adminToken && adminStats && <div className="admin-session-badge"><ShieldCheck size={13} /> {adminToken === LOCAL_ADMIN_UNLOCK_TOKEN ? "Device-verified local view" : "Secure Admin session active"} <button onClick={() => setAdminStats(adminStats)}>Open dashboard</button><button onClick={() => { localStorage.removeItem("genie_admin_signed_session"); sessionStorage.removeItem(ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY); setAdminToken(""); setAdminStats(null); }}>Lock</button></div>}
       <AdminDashboard
         stats={adminStats}
         credential={credential}
         adminToken={adminToken}
-        onClose={() => { localStorage.removeItem("genie_admin_signed_session"); setAdminStats(null); setAdminToken(""); }}
+        localOnly={adminToken === LOCAL_ADMIN_UNLOCK_TOKEN}
+        onLocalFallback={switchToLocalAdminView}
+        onClose={() => { localStorage.removeItem("genie_admin_signed_session"); sessionStorage.removeItem(ADMIN_LOCAL_VERIFIED_CREDENTIAL_STORAGE_KEY); setAdminStats(null); setAdminToken(""); }}
       />
       <ForwardToRoomModal
         open={Boolean(forwardingMessage)}

@@ -6,6 +6,50 @@ const API_URL_OVERRIDE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, 
 const LEGACY_API_URL = (process.env.NEXT_PUBLIC_GENIE_API_URL || "").replace(/\/$/, "");
 let localBackendUnavailable = false;
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+function getUserProfileHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+
+  let userId = "";
+  let userEmail = "";
+  try {
+    const credential = sessionStorage.getItem("genie_user_session")
+      || sessionStorage.getItem("genie_google_credential")
+      || "";
+    const payload = credential.split(".")[1];
+    if (payload) {
+      const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+      const claims = JSON.parse(
+        atob(normalized + "=".repeat((4 - (normalized.length % 4)) % 4)),
+      ) as { sub?: unknown; email?: unknown };
+      if (typeof claims.sub === "string") userId = claims.sub;
+      if (typeof claims.email === "string") userEmail = claims.email;
+    }
+
+    if (userId) {
+      const profile = localStorage.getItem(`genie_local_profile_${encodeURIComponent(userId)}`);
+      if (profile) {
+        const parsed = JSON.parse(profile) as { email?: unknown };
+        if (typeof parsed.email === "string") userEmail = parsed.email;
+      }
+    }
+    userEmail = userEmail || localStorage.getItem("genie_returning_email") || "";
+  } catch {
+    userId = "";
+  }
+
+  return {
+    "X-User-Email": userEmail || "rshaji93@gmail.com",
+    ...(userId ? { "X-User-Id": userId } : {}),
+  };
+}
+
 function isLocalApiUrl(value: string): boolean {
   try {
     const hostname = new URL(value).hostname;
@@ -36,8 +80,11 @@ export function apiUrl(path: string): string {
 }
 
 export async function apiRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  Object.entries(getUserProfileHeaders()).forEach(([name, value]) => headers.set(name, value));
+  const requestInit = { ...init, headers };
   try {
-    return await fetch(apiUrl(path), init);
+    return await fetch(apiUrl(path), requestInit);
   } catch (error) {
     if (
       !(error instanceof TypeError)
@@ -50,7 +97,7 @@ export async function apiRequest(path: string, init: RequestInit = {}): Promise<
       throw error;
     }
     localBackendUnavailable = true;
-    return fetch(`${CLOUD_API_URL}${proxyPath(path)}`, init);
+    return fetch(`${CLOUD_API_URL}${proxyPath(path)}`, requestInit);
   }
 }
 
@@ -85,7 +132,7 @@ export async function apiFetch<T>(
     } catch {
       // Keep the HTTP status message when the response is not JSON.
     }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return (await response.json()) as T;
 }
