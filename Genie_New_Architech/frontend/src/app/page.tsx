@@ -1915,6 +1915,9 @@ export default function Home() {
       model: modelTier,
       model_tier: modelTier,
       room_mode: Boolean(room),
+      room_members: room
+        ? members.map((member) => member.user_sub)
+        : [identity.sub],
       chat_mode: requestChatMode,
       thinking_level: thinkingLevel,
       response_visibility: regenerate?.visibility || (room && requestChatMode === "ai_room" ? "group" : "private"),

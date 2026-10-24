@@ -257,6 +257,73 @@ MASTER_QUOTA_LIMIT = 4
 MASTER_QUOTA_WINDOW_SECONDS = 4 * 60 * 60
 
 
+def check_cooperative_master_quota(
+    user_id: str,
+    room_members: list[str] | None,
+    room_mode: bool | str,
+    is_vip_or_admin: bool,
+) -> tuple[dict[str, Any], bool]:
+    active_room = room_mode is True or room_mode == "ai_active"
+    members = sorted({member.strip() for member in room_members or [] if member.strip()})
+    if not active_room or len(members) < 2 or user_id not in members:
+        members = [user_id]
+        quota_key = user_id
+    else:
+        quota_key = "room:" + hashlib.sha256(
+            "\0".join(members).encode("utf-8")
+        ).hexdigest()
+    limit = MASTER_QUOTA_LIMIT * len(members)
+    now = time.time()
+
+    with closing(database()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if is_vip_or_admin:
+            connection.commit()
+            return {
+                "used": 0,
+                "limit": limit,
+                "remaining": limit,
+                "reset_in_seconds": 0,
+                "vip_active": True,
+                "unlimited": True,
+            }, True
+
+        row = connection.execute(
+            "SELECT window_start, request_count FROM master_quota_windows WHERE user_key = ?",
+            (quota_key,),
+        ).fetchone()
+        if not row or now >= float(row["window_start"]) + MASTER_QUOTA_WINDOW_SECONDS:
+            window_start = now
+            used = 0
+        else:
+            window_start = float(row["window_start"])
+            used = min(limit, int(row["request_count"]))
+        allowed = used < limit
+        if allowed:
+            used += 1
+        connection.execute(
+            """
+            INSERT INTO master_quota_windows(user_key, window_start, request_count)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_key) DO UPDATE SET
+                window_start = excluded.window_start,
+                request_count = excluded.request_count
+            """,
+            (quota_key, window_start, used),
+        )
+        connection.commit()
+
+    return {
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "reset_in_seconds": max(
+            0, math.ceil(window_start + MASTER_QUOTA_WINDOW_SECONDS - now)
+        ),
+        "vip_active": False,
+    }, allowed
+
+
 def consume_master_quota(identity: dict[str, str]) -> tuple[dict[str, Any], bool]:
     user_key = identity["sub"]
     owner = identity.get("request_email", identity.get("email", "")).casefold() == SUPER_ADMIN_EMAIL.casefold()
@@ -754,6 +821,7 @@ class ChatRequest(StrictModel):
     response_visibility: str = Field(default="private", pattern="^(private|group)$")
     room_id: str | None = Field(default=None, max_length=100)
     room_mode: bool = False
+    room_members: list[str] = Field(default_factory=list, max_length=MAX_MEMBERS)
     chat_mode: Literal["ai_room", "friends_only", "private_ai"] = "ai_room"
     future_self_mode: bool = False
 
@@ -2010,6 +2078,17 @@ async def chat(
     request.messages = effective_chat_messages(request)
     if request.room_id:
         room_member(request.room_id, identity)
+        with closing(database()) as connection:
+            verified_room_members = [
+                row["user_sub"]
+                for row in connection.execute(
+                    "SELECT user_sub FROM room_members WHERE room_id = ? ORDER BY user_sub",
+                    (request.room_id,),
+                ).fetchall()
+            ]
+        request.room_members = verified_room_members
+    else:
+        request.room_members = [identity["sub"]]
     if request.chat_mode == "friends_only":
         return {
             "reply": "Friends-only mode is active. The message is ready for encrypted peer relay; AI inference was skipped.",
@@ -2077,7 +2156,26 @@ async def chat(
     master_quota = None
     downgraded_to_pro = False
     if master:
-        master_quota, master_allowed = consume_master_quota(identity)
+        payload = request.model_dump(exclude_unset=True)
+        is_vip_or_admin = (
+            identity.get("request_email", identity.get("email", "")).casefold()
+            == SUPER_ADMIN_EMAIL.casefold()
+        )
+        if not is_vip_or_admin:
+            with closing(database()) as connection:
+                is_vip_or_admin = connection.execute(
+                    """
+                    SELECT 1 FROM vip_passes
+                    WHERE claimed_by = ? AND status = 'claimed' LIMIT 1
+                    """,
+                    (identity["sub"],),
+                ).fetchone() is not None
+        master_quota, master_allowed = check_cooperative_master_quota(
+            identity["sub"],
+            payload.get("room_members"),
+            payload.get("room_mode", "ai_active"),
+            is_vip_or_admin,
+        )
         if not master_allowed:
             master = False
             downgraded_to_pro = True

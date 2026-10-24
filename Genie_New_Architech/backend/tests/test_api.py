@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import re
 import tempfile
@@ -556,6 +557,111 @@ class BackendApiTests(unittest.TestCase):
         })
         self.assertTrue(owner_allowed)
         self.assertTrue(owner_quota["unlimited"])
+
+    def test_cooperative_master_quota_scales_with_room_members(self):
+        two_members = ["shared-user-a", "shared-user-b"]
+        for index in range(8):
+            quota, allowed = main.check_cooperative_master_quota(
+                two_members[index % 2], two_members, "ai_active", False
+            )
+            self.assertTrue(allowed)
+            self.assertEqual(quota["limit"], 8)
+        exhausted_two, allowed_two = main.check_cooperative_master_quota(
+            two_members[0], two_members, "ai_active", False
+        )
+        self.assertFalse(allowed_two)
+        self.assertEqual(exhausted_two["used"], 8)
+        self.assertEqual(exhausted_two["remaining"], 0)
+
+        five_members = [f"shared-user-{index}" for index in range(5)]
+        for index in range(20):
+            quota, allowed = main.check_cooperative_master_quota(
+                five_members[index % 5], five_members, "ai_active", False
+            )
+            self.assertTrue(allowed)
+            self.assertEqual(quota["limit"], 20)
+        exhausted_five, allowed_five = main.check_cooperative_master_quota(
+            five_members[0], five_members, "ai_active", False
+        )
+        self.assertFalse(allowed_five)
+        self.assertEqual(exhausted_five["used"], 20)
+        self.assertEqual(exhausted_five["remaining"], 0)
+
+    def test_cooperative_quota_requires_active_shared_room_and_includes_vip_bypass(self):
+        quota, allowed = main.check_cooperative_master_quota(
+            "quota-user-a", ["quota-user-a", "quota-user-b"], "inactive", False
+        )
+        self.assertTrue(allowed)
+        self.assertEqual(quota["limit"], 4)
+
+        vip_quota, vip_allowed = main.check_cooperative_master_quota(
+            "quota-vip",
+            ["quota-vip", "quota-user-b"],
+            "ai_active",
+            True,
+        )
+        self.assertTrue(vip_allowed)
+        self.assertTrue(vip_quota["unlimited"])
+        self.assertEqual(vip_quota["limit"], 8)
+
+    def test_chat_downgrades_room_master_only_after_shared_pool_is_exhausted(self):
+        room_id = "cooperative-master-room"
+        chat_user_id = "local-development"
+        member_ids = sorted((chat_user_id, "cooperative-partner"))
+        room_key = "room:" + hashlib.sha256(
+            "\0".join(member_ids).encode("utf-8")
+        ).hexdigest()
+        with closing(main.database()) as connection:
+            connection.execute(
+                """
+                INSERT INTO rooms(id, name, owner_sub, invite_hash, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (room_id, "Quota Room", chat_user_id, "cooperative-invite-hash", main.utc_now()),
+            )
+            connection.executemany(
+                """
+                INSERT INTO room_members(room_id, user_sub, user_name, joined_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (room_id, member_ids[0], "Member A", main.utc_now()),
+                    (room_id, member_ids[1], "Member B", main.utc_now()),
+                ],
+            )
+            connection.execute(
+                """
+                INSERT INTO master_quota_windows(user_key, window_start, request_count)
+                VALUES (?, ?, 8)
+                """,
+                (room_key, main.time.time()),
+            )
+            connection.commit()
+
+        brain_result = {
+            "reply": "Pro fallback response.",
+            "sub_agents": ["Argon Cognitive Brain"],
+            "source": "pool-test",
+            "verified": True,
+            "proposed_memory": None,
+        }
+        with patch.object(main.master_brain, "run", new_callable=AsyncMock, return_value=brain_result) as brain:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "Explain the room workflow.",
+                    "model_tier": "genie-master",
+                    "room_mode": True,
+                    "room_members": ["spoofed-member"],
+                    "room_id": room_id,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["master_quota"]["limit"], 8)
+        self.assertEqual(response.json()["master_quota"]["downgraded_to"], "genie-pro")
+        self.assertEqual(brain.await_args.kwargs["model_tier"], "genie-pro")
+        self.assertEqual(brain.await_args.kwargs["room_mode"], True)
 
     def test_vip_request_and_owner_approval_grant_unlimited_access(self):
         requester = {"sub": "vip-requester", "email": "vip@example.com", "name": "VIP User"}
