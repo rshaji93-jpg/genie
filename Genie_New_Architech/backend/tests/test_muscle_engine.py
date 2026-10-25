@@ -1,16 +1,33 @@
+import asyncio
 import gzip
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from modules.bone_router import sanitize_general_answer
-from modules.muscle_engine import MAX_DATABASE_BYTES, MuscleEngine, database_path
+from modules.muscle_engine import (
+    MAX_DATABASE_BYTES,
+    MuscleEngine,
+    database_path,
+    fetch_real_world_context,
+    match_conversational_reflex,
+)
 
 
 class MuscleEngineSeedTests(unittest.TestCase):
+    def test_fuzzy_greetings_handle_repetition_typos_and_common_abbreviations(self):
+        for query in ("Heelo", "hiii", "gud mrng"):
+            with self.subTest(query=query):
+                result = match_conversational_reflex(query)
+                self.assertIsNotNone(result)
+                expected = "Good morning" if query == "gud mrng" else "Hello"
+                self.assertIn(expected, result["answer"])
+
+        self.assertIsNone(match_conversational_reflex("deployment architecture"))
+
     def test_writeback_scrubs_personal_and_room_secrets(self):
         answer = sanitize_general_answer(
             "Contact Ada Lovelace at ada@example.com; room key: 8xAbC123 and api_key=secret."
@@ -52,6 +69,38 @@ class MuscleEngineSeedTests(unittest.TestCase):
 
             self.assertTrue(engine.purge("What is a local cache?"))
             self.assertIsNone(engine.lookup("What is a local cache?"))
+
+    def test_real_world_grounding_uses_wikipedia_search_and_summary(self):
+        search_response = MagicMock()
+        search_response.json.return_value = {"pages": [{"key": "Grace_Hopper"}]}
+        summary_response = MagicMock()
+        summary_response.json.return_value = {
+            "extract": "Grace Hopper was an American computer scientist.",
+            "content_urls": {"desktop": {"page": "https://en.wikipedia.org/wiki/Grace_Hopper"}},
+        }
+        client = MagicMock()
+        client.get = AsyncMock(side_effect=[search_response, summary_response])
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=client)
+        context.__aexit__ = AsyncMock(return_value=None)
+
+        with patch(
+            "modules.muscle_engine.httpx.AsyncClient",
+            return_value=context,
+        ) as async_client:
+            result = asyncio.run(fetch_real_world_context("Who is Grace Hopper?"))
+
+        self.assertIn("Grace Hopper was an American computer scientist.", result)
+        self.assertIn("https://en.wikipedia.org/wiki/Grace_Hopper", result)
+        self.assertEqual(
+            client.get.await_args_list[0].args[0],
+            "https://en.wikipedia.org/w/rest.php/v1/search/page",
+        )
+        self.assertIn(
+            "/api/rest_v1/page/summary/Grace_Hopper",
+            client.get.await_args_list[1].args[0],
+        )
+        self.assertEqual(async_client.call_args.kwargs["timeout"].read, 2.5)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gzip
+import json
 import logging
+import os
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -14,14 +18,75 @@ _THREAD: threading.Thread | None = None
 def _warm_muscle_index() -> None:
     try:
         try:
-            from .muscle_engine import get_muscle_engine
+            from .muscle_engine import get_initialized_muscle_engine
         except ImportError:
-            from modules.muscle_engine import get_muscle_engine
-        engine = get_muscle_engine()
+            from modules.muscle_engine import get_initialized_muscle_engine
+        engine = get_initialized_muscle_engine()
+        if engine is None:
+            return
         with engine.connect() as connection:
             connection.execute("SELECT count(*) FROM muscle_core").fetchone()
     except (OSError, sqlite3.Error, ImportError):
         LOGGER.exception("Could not warm the local Muscle index.")
+
+
+def _sync_learned_snapshot() -> None:
+    """Restore and persist learned synapses without delaying server startup."""
+    try:
+        try:
+            from .muscle_engine import (
+                LEARNED_SNAPSHOT_BACKUP,
+                LEARNED_SNAPSHOT_LOCAL,
+                get_initialized_muscle_engine,
+            )
+        except ImportError:
+            from modules.muscle_engine import (
+                LEARNED_SNAPSHOT_BACKUP,
+                LEARNED_SNAPSHOT_LOCAL,
+                get_initialized_muscle_engine,
+            )
+
+        engine = get_initialized_muscle_engine()
+        if engine is None:
+            return
+        entries = engine.export_learned_synapses()
+        if not entries:
+            snapshot = next(
+                (
+                    path for path in (LEARNED_SNAPSHOT_BACKUP, LEARNED_SNAPSHOT_LOCAL)
+                    if path.is_file()
+                ),
+                None,
+            )
+            if snapshot is not None:
+                with gzip.open(snapshot, "rt", encoding="utf-8") as snapshot_file:
+                    payload = json.load(snapshot_file)
+                if isinstance(payload, list):
+                    engine.import_learned_synapses(
+                        [entry for entry in payload if isinstance(entry, dict)]
+                    )
+                    entries = engine.export_learned_synapses()
+
+        if not entries:
+            return
+        for destination in (LEARNED_SNAPSHOT_LOCAL, LEARNED_SNAPSHOT_BACKUP):
+            temp_path: Path | None = None
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    dir=destination.parent,
+                    suffix=".tmp",
+                    delete=False,
+                ) as temp_file:
+                    temp_path = Path(temp_file.name)
+                with gzip.open(temp_path, "wt", encoding="utf-8") as snapshot_file:
+                    json.dump(entries, snapshot_file, ensure_ascii=False, separators=(",", ":"))
+                os.replace(temp_path, destination)
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()
+    except (OSError, sqlite3.Error, ValueError, TypeError, ImportError):
+        LOGGER.exception("Could not restore or persist the learned Muscle snapshot.")
 
 
 def _sync_archive(source_path: Path, target_path: Path) -> None:
@@ -46,6 +111,7 @@ def _sync_archive(source_path: Path, target_path: Path) -> None:
 def _run(source_path: Path, target_path: Path | None, interval_seconds: int) -> None:
     while True:
         _warm_muscle_index()
+        _sync_learned_snapshot()
         if target_path is not None:
             _sync_archive(source_path, target_path)
         time.sleep(interval_seconds)

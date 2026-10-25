@@ -1,10 +1,14 @@
 import asyncio
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator
+from modules import bone_router
 from modules.bone_router import is_rca_query
+from modules.muscle_engine import MuscleEngine, signature
 
 
 class ArgonOrchestratorTests(unittest.TestCase):
@@ -179,6 +183,74 @@ class ArgonCacheTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["reply"], 'Answer\n\nunfinished "quote"')
         self.assertEqual(repeated["reply"], result["reply"])
+
+    async def test_typo_greeting_returns_a_warm_zero_token_reflex(self):
+        result = await self.brain.run(
+            [{"role": "user", "content": "Heelo"}],
+            user_sub="user-a",
+        )
+
+        self.assertEqual(result["reply"], "Hello! What would you like to work on?")
+        self.assertEqual(result["source"], "pool0-deterministic")
+        self.assertEqual(result["tokens_burned"], 0)
+        self.router.complete.assert_not_awaited()
+
+    async def test_brain_answer_is_learned_and_reused_from_muscle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = MuscleEngine(Path(temp_dir) / "learned.sqlite3")
+            question = "Explain the quartz scheduler invariant in detail."
+            with patch.object(
+                bone_router,
+                "get_initialized_muscle_engine",
+                return_value=engine,
+            ):
+                first = await self.brain.run(
+                    [{"role": "user", "content": question}],
+                    user_sub="user-a",
+                )
+                second = await self.brain.run(
+                    [{"role": "user", "content": question}],
+                    user_sub="user-a",
+                )
+
+            self.assertEqual(first["reply"], "Public answer.")
+            self.assertEqual(second["reply"], "Public answer.")
+            self.assertEqual(second["source"], "pool0-muscle")
+            self.assertEqual(second["tokens_burned"], 0)
+            self.router.complete.assert_awaited_once()
+            with engine.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT category, hit_count, updated_at
+                    FROM learned_synapses WHERE signature = ?
+                    """,
+                    (signature(question),),
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["category"], "general")
+            self.assertEqual(row["hit_count"], 1)
+            self.assertTrue(row["updated_at"])
+
+    async def test_grounding_is_returned_when_all_brain_providers_are_unavailable(self):
+        self.router.complete.side_effect = RuntimeError("Provider waterfall exhausted.")
+        grounding = patch.object(
+            orchestrator,
+            "fetch_live_grounding",
+            new_callable=AsyncMock,
+            return_value="Wikipedia summary: Asteria is a newly discovered test entity.",
+        )
+        grounding.start()
+        self.addAsyncCleanup(grounding.stop)
+
+        result = await self.brain.run(
+            [{"role": "user", "content": "What is Asteria?"}],
+            user_sub="user-a",
+        )
+
+        self.assertIn("Asteria is a newly discovered test entity.", result["reply"])
+        self.assertEqual(result["source"], "pool0-real-world-grounding")
+        self.assertEqual(result["tokens_burned"], 0)
+        self.assertEqual(result["max_calls"], 0)
 
 
 if __name__ == "__main__":

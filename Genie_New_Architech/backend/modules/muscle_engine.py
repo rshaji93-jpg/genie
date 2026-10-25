@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import difflib
 import gzip
 import json
 import logging
@@ -12,12 +14,34 @@ import threading
 import zlib
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+import httpx
 
 MODULE_DIR = Path(__file__).parent
 BACKEND_DIR = MODULE_DIR.parent
 LOGGER = logging.getLogger("genie.muscle")
 MAX_DATABASE_BYTES = 50 * 1024 * 1024
+LEARNED_SNAPSHOT_LOCAL = Path("/tmp/learned_muscle.json.gz")
+LEARNED_SNAPSHOT_BACKUP = Path("/app/data/learned_muscle.json.gz")
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_REPEATED_LETTERS_RE = re.compile(r"([a-z])\1{1,}", re.IGNORECASE)
+_GREETING_REFLEXES = {
+    "hi": "Hello! What would you like to work on?",
+    "hello": "Hello! What would you like to work on?",
+    "hey": "Hello! What would you like to work on?",
+    "good morning": "Good morning! What would you like to work on?",
+    "good afternoon": "Good afternoon! What would you like to work on?",
+    "good evening": "Good evening! What would you like to work on?",
+}
+_GREETING_ALIASES = {"gud mrng": "good morning", "gud morning": "good morning"}
+_FACTUAL_QUERY_RE = re.compile(
+    r"\b(?:who|what|when|where|which|how many|how much|tell me about|describe|"
+    r"define|current|latest|today|"
+    r"recent|news|president|prime minister|population|capital|founded|"
+    r"born|died|weather|price|version|release)\b",
+    re.IGNORECASE,
+)
 _STOP_WORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for",
     "from", "how", "i", "in", "is", "it", "of", "on", "or", "please", "the",
@@ -44,9 +68,91 @@ def normalize_query(query: str) -> str:
     )
 
 
+def match_conversational_reflex(query: str) -> dict[str, Any] | None:
+    candidate = " ".join(query.casefold().strip().strip("!?.,;:").split())
+    if not candidate:
+        return None
+    candidate = _GREETING_ALIASES.get(candidate, candidate)
+    candidate = _REPEATED_LETTERS_RE.sub(r"\1", candidate)
+    best_match: tuple[float, str] | None = None
+    for intent in _GREETING_REFLEXES:
+        score = difflib.SequenceMatcher(None, candidate, intent).ratio()
+        if best_match is None or score > best_match[0]:
+            best_match = score, intent
+    if best_match is None or best_match[0] < 0.78:
+        return None
+    confidence, intent = best_match
+    return {
+        "answer": _GREETING_REFLEXES[intent],
+        "confidence": confidence,
+        "source": "greeting-reflex",
+        "signature": signature(intent),
+    }
+
+
 def signature(query: str) -> str:
     normalized = normalize_query(query)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def is_factual_query(query: str) -> bool:
+    return bool(_FACTUAL_QUERY_RE.search(query))
+
+
+async def fetch_real_world_context(query: str) -> str:
+    """Fetch a short, public Wikipedia summary without requiring provider credentials."""
+    cleaned_query = " ".join(query.strip().split())
+    if (
+        not cleaned_query
+        or len(cleaned_query) > 240
+        or not is_factual_query(cleaned_query)
+        or re.search(r"\b(?:my|mine|our|we|i am|i'm|password|private|medical)\b", cleaned_query, re.I)
+        or re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", cleaned_query)
+    ):
+        return ""
+
+    timeout = httpx.Timeout(2.5)
+    headers = {"User-Agent": "GeniePersonalAssistant/1.0 (public knowledge lookup)"}
+    try:
+        async with asyncio.timeout(2.5):
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+                headers=headers,
+            ) as client:
+                search_response = await client.get(
+                    "https://en.wikipedia.org/w/rest.php/v1/search/page",
+                    params={"q": cleaned_query, "limit": "1"},
+                )
+                search_response.raise_for_status()
+                search_payload = search_response.json()
+                pages = search_payload.get("pages", []) if isinstance(search_payload, dict) else []
+                if not pages or not isinstance(pages[0], dict):
+                    return ""
+                title = pages[0].get("key") or pages[0].get("title")
+                if not isinstance(title, str) or not title.strip():
+                    return ""
+                summary_response = await client.get(
+                    "https://en.wikipedia.org/api/rest_v1/page/summary/"
+                    + quote(title.replace(" ", "_"), safe="()"),
+                )
+                summary_response.raise_for_status()
+                summary_payload = summary_response.json()
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, TimeoutError) as error:
+        LOGGER.info("Wikipedia grounding lookup unavailable (%s).", type(error).__name__)
+        return ""
+
+    extract = summary_payload.get("extract") if isinstance(summary_payload, dict) else None
+    if not isinstance(extract, str) or not extract.strip():
+        return ""
+    page_url = ""
+    content_urls = summary_payload.get("content_urls")
+    if isinstance(content_urls, dict):
+        desktop = content_urls.get("desktop")
+        if isinstance(desktop, dict) and isinstance(desktop.get("page"), str):
+            page_url = desktop["page"]
+    citation = f" Source: {page_url}" if page_url else ""
+    return f"Wikipedia summary: {extract.strip()[:1600]}{citation}"
 
 
 def database_path() -> Path:
@@ -159,6 +265,9 @@ class MuscleEngine:
                     compressed_answer BLOB NOT NULL,
                     concepts TEXT NOT NULL,
                     source TEXT NOT NULL DEFAULT 'learned',
+                    category TEXT NOT NULL DEFAULT 'general',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -176,6 +285,22 @@ class MuscleEngine:
                     concepts TEXT NOT NULL
                 );
                 """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(learned_synapses)")
+            }
+            for column, definition in (
+                ("category", "TEXT NOT NULL DEFAULT 'general'"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+                ("hit_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE learned_synapses ADD COLUMN {column} {definition}"
+                    )
+            connection.execute(
+                "UPDATE learned_synapses SET updated_at = CURRENT_TIMESTAMP WHERE updated_at = ''"
             )
             self._sync_search_index(connection)
             self._compile_builtin_reflexes(connection)
@@ -348,9 +473,14 @@ class MuscleEngine:
             confidence, row = best
             if row["source"] == "learned":
                 connection.execute(
-                    "UPDATE learned_synapses SET last_used_at = CURRENT_TIMESTAMP WHERE signature = ?",
+                    """
+                    UPDATE learned_synapses
+                    SET last_used_at = CURRENT_TIMESTAMP, hit_count = hit_count + 1
+                    WHERE signature = ?
+                    """,
                     (row["signature"],),
                 )
+                connection.commit()
             return {
                 "answer": zlib.decompress(row["compressed_answer"]).decode("utf-8"),
                 "confidence": confidence,
@@ -358,31 +488,46 @@ class MuscleEngine:
                 "signature": row["signature"],
             }
 
-    def learn(self, question: str, answer: str) -> bool:
+    def learn(
+        self,
+        question: str,
+        answer: str,
+        *,
+        category: str = "general",
+    ) -> bool:
         normalized = normalize_query(question)
         clean_answer = answer.strip()
         if not normalized or not clean_answer:
             return False
-        database_bytes = self.path.stat().st_size if self.path.exists() else 0
-        if database_bytes >= MAX_DATABASE_BYTES:
-            return False
         compressed = zlib.compress(clean_answer.encode("utf-8"), level=9)
+        if len(compressed) > MAX_DATABASE_BYTES:
+            return False
         concepts = " ".join(sorted(set(normalized.split())))
         synapse_signature = signature(question)
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO learned_synapses(
-                    signature, question, normalized_question, compressed_answer, concepts
-                ) VALUES (?, ?, ?, ?, ?)
+                    signature, question, normalized_question, compressed_answer, concepts,
+                    category, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(signature) DO UPDATE SET
                     question = excluded.question,
                     normalized_question = excluded.normalized_question,
                     compressed_answer = excluded.compressed_answer,
                     concepts = excluded.concepts,
+                    category = excluded.category,
+                    updated_at = CURRENT_TIMESTAMP,
                     last_used_at = CURRENT_TIMESTAMP
                 """,
-                (synapse_signature, question[:1000], normalized, compressed, concepts),
+                (
+                    synapse_signature,
+                    question[:1000],
+                    normalized,
+                    compressed,
+                    concepts,
+                    category[:80],
+                ),
             )
             connection.execute("DELETE FROM synapse_search WHERE signature = ?", (synapse_signature,))
             connection.execute(
@@ -394,8 +539,96 @@ class MuscleEngine:
                 "INSERT INTO muscle_core(signature, concepts, question, source) VALUES (?, ?, ?, 'learned')",
                 (synapse_signature, concepts, question[:1000]),
             )
+            learned_bytes = int(
+                connection.execute(
+                    "SELECT COALESCE(SUM(length(compressed_answer)), 0) FROM learned_synapses"
+                ).fetchone()[0]
+            )
+            while learned_bytes > MAX_DATABASE_BYTES:
+                victim = connection.execute(
+                    """
+                    SELECT signature, length(compressed_answer) AS answer_bytes
+                    FROM learned_synapses
+                    WHERE signature != ?
+                    ORDER BY hit_count ASC, last_used_at ASC, updated_at ASC
+                    LIMIT 1
+                    """,
+                    (synapse_signature,),
+                ).fetchone()
+                if victim is None:
+                    connection.rollback()
+                    return False
+                connection.execute(
+                    "DELETE FROM learned_synapses WHERE signature = ?",
+                    (victim["signature"],),
+                )
+                connection.execute(
+                    "DELETE FROM synapse_search WHERE signature = ?",
+                    (victim["signature"],),
+                )
+                connection.execute(
+                    "DELETE FROM muscle_core WHERE signature = ?",
+                    (victim["signature"],),
+                )
+                learned_bytes -= int(victim["answer_bytes"])
             connection.commit()
         return True
+
+    def export_learned_synapses(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT signature, question, normalized_question, compressed_answer,
+                       concepts, category, updated_at, hit_count
+                FROM learned_synapses
+                ORDER BY hit_count DESC, updated_at DESC
+                """
+            ).fetchall()
+        return [
+            {
+                "signature": row["signature"],
+                "question": row["question"],
+                "normalized_question": row["normalized_question"],
+                "answer": zlib.decompress(row["compressed_answer"]).decode("utf-8"),
+                "concepts": row["concepts"],
+                "category": row["category"],
+                "updated_at": row["updated_at"],
+                "hit_count": row["hit_count"],
+            }
+            for row in rows
+        ]
+
+    def import_learned_synapses(self, entries: list[dict[str, Any]]) -> int:
+        imported = 0
+        for entry in entries:
+            question = entry.get("question")
+            answer = entry.get("answer")
+            category = entry.get("category", "general")
+            if not isinstance(question, str) or not isinstance(answer, str):
+                continue
+            if self.learn(question, answer, category=str(category)):
+                imported += 1
+                normalized_signature = signature(question)
+                with self.connect() as connection:
+                    connection.execute(
+                        """
+                        UPDATE learned_synapses
+                        SET hit_count = MAX(hit_count, ?),
+                            updated_at = CASE
+                                WHEN ? > updated_at THEN ?
+                                ELSE updated_at
+                            END
+                        WHERE signature = ?
+                        """,
+                        (
+                            max(0, int(entry.get("hit_count", 0))),
+                            str(entry.get("updated_at", "")),
+                            str(entry.get("updated_at", "")),
+                            normalized_signature,
+                        ),
+                    )
+                    connection.commit()
+        return imported
 
     def purge(self, question: str) -> bool:
         synapse_signature = signature(question)

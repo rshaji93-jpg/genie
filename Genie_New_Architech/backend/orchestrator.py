@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -27,7 +26,8 @@ try:
         learn_general_answer,
         lookup_muscle,
     )
-    from .modules.muscle_engine import get_muscle_engine
+    from .modules.muscle_engine import get_muscle_engine as get_muscle_engine
+    from .modules.muscle_engine import fetch_real_world_context, is_factual_query, match_conversational_reflex
 except ImportError:
     from modules.bone_router import (
         is_general_query,
@@ -35,7 +35,8 @@ except ImportError:
         learn_general_answer,
         lookup_muscle,
     )
-    from modules.muscle_engine import get_muscle_engine
+    from modules.muscle_engine import get_muscle_engine as get_muscle_engine
+    from modules.muscle_engine import fetch_real_world_context, is_factual_query, match_conversational_reflex
 
 LOGGER = logging.getLogger("genie.master_brain")
 REGISTRY_PATH = Path(__file__).parent / "ai_muscle" / "registry.json"
@@ -46,6 +47,7 @@ PUBLIC_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 PUBLIC_CACHE_MAX_ENTRIES = 1000
 ARGON_CACHE_VERSION = "argon-v1"
 _PUBLIC_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
+_PUBLIC_CACHE_OWNERS: dict[str, str] = {}
 _PERSONAL_CACHE: OrderedDict[tuple[str, str], tuple[float, str]] = OrderedDict()
 _PUBLIC_CACHE_LOCK = threading.Lock()
 _TELEMETRY_LOCK = threading.Lock()
@@ -218,6 +220,7 @@ def public_cache_telemetry() -> dict[str, Any]:
 def flush_legacy_answer_cache() -> None:
     with _PUBLIC_CACHE_LOCK:
         _PUBLIC_CACHE.clear()
+        _PUBLIC_CACHE_OWNERS.clear()
         _PERSONAL_CACHE.clear()
 
 
@@ -510,7 +513,7 @@ def _personal_query_key(
 
 
 async def fetch_live_grounding(query: str) -> str:
-    """Fetch brief public facts from Wikipedia and DuckDuckGo without blocking chat."""
+    """Fetch a brief, zero-key real-world fact summary when a query needs grounding."""
     safe_query = sanitize_untrusted_context(query).strip()
     if (
         not safe_query
@@ -521,61 +524,9 @@ async def fetch_live_grounding(query: str) -> str:
         or re.search(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b|\+?\d[\d\s().-]{7,}\d", safe_query)
     ):
         return ""
-
-    async def lookup(
-        client: httpx.AsyncClient, source: str, url: str, params: dict[str, str]
-    ) -> tuple[str, str]:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        payload = response.json()
-        if source == "DuckDuckGo":
-            results = [payload.get("AbstractText", "")]
-            related = payload.get("RelatedTopics", [])
-            for item in related if isinstance(related, list) else []:
-                if isinstance(item, dict):
-                    results.append(item.get("Text", ""))
-                    nested = item.get("Topics", [])
-                    if isinstance(nested, list):
-                        results.extend(
-                            child.get("Text", "")
-                            for child in nested
-                            if isinstance(child, dict)
-                        )
-            text = " ".join(str(item).strip() for item in results if item)
-        else:
-            query_data = payload.get("query", {})
-            results = query_data.get("search", []) if isinstance(query_data, dict) else []
-            text = " ".join(
-                str(item.get("snippet", "")).strip()
-                for item in results[:3]
-                if isinstance(item, dict) and item.get("snippet")
-            )
-        return source, re.sub(r"<[^>]+>", " ", text)[:1200]
-
-    timeout = httpx.Timeout(3.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-        lookups = (
-            lookup(client, "English Wikipedia", "https://en.wikipedia.org/w/api.php", {
-                "action": "query", "list": "search", "srsearch": safe_query, "format": "json",
-            }),
-            lookup(client, "Tamil Wikipedia", "https://ta.wikipedia.org/w/api.php", {
-                "action": "query", "list": "search", "srsearch": safe_query, "format": "json",
-            }),
-            lookup(client, "DuckDuckGo", "https://api.duckduckgo.com/", {
-                "q": safe_query, "format": "json", "no_html": "1",
-            }),
-        )
-        results = await asyncio.gather(*lookups, return_exceptions=True)
-
-    grounding = []
-    for result in results:
-        if isinstance(result, BaseException):
-            LOGGER.info("Public grounding lookup unavailable (%s)", type(result).__name__)
-            continue
-        source, text = result
-        if text:
-            grounding.append(f"- {source}: {text}")
-    return "\n".join(grounding)
+    if not is_factual_query(safe_query):
+        return ""
+    return await fetch_real_world_context(safe_query)
 
 
 def _strip_internal_agent_prefixes(text: str) -> str:
@@ -607,8 +558,9 @@ class MasterBrain:
             (message.get("content", "").strip() for message in reversed(messages) if message.get("role") == "user"),
             "",
         )
-        if re.fullmatch(r"(?:hi|hello|hey|good morning|good afternoon|good evening)[!. ]*", prompt, re.I):
-            return "Hello! What would you like to work on?"
+        greeting = match_conversational_reflex(prompt)
+        if greeting is not None:
+            return greeting["answer"]
         if re.fullmatch(r"(?:help|commands|what can you do)[?.! ]*", prompt, re.I):
             return "I can answer questions, help plan tasks, explain ideas, and support your projects."
         return None
@@ -633,6 +585,7 @@ class MasterBrain:
                 "sub_agents": [],
                 "verified": True,
                 "proposed_memory": None,
+                "tokens_burned": 0,
             }
 
         latest = next(
@@ -650,6 +603,25 @@ class MasterBrain:
             if not master and not room_mode and not bypass_local_cache
             else None
         )
+        if not future_self and not bypass_local_cache:
+            with _PUBLIC_CACHE_LOCK:
+                prefer_learned_synapse = bool(
+                    cache_key
+                    and cache_key in _PUBLIC_CACHE
+                    and _PUBLIC_CACHE_OWNERS.get(cache_key) == user_sub
+                )
+            if prefer_learned_synapse:
+                match = lookup_muscle(latest, room_mode=room_mode, model_tier=model_tier)
+                if match is not None and match["source"] == "learned":
+                    return {
+                        "reply": clean_human_response(match["answer"]),
+                        "source": "pool0-muscle",
+                        "sub_agents": [],
+                        "verified": True,
+                        "proposed_memory": None,
+                        "tokens_burned": 0,
+                        "muscle_confidence": match["confidence"],
+                    }
         with _PUBLIC_CACHE_LOCK:
             cache_entry = (
                 _PUBLIC_CACHE.get(cache_key) if cache_key
@@ -676,25 +648,13 @@ class MasterBrain:
             if cache_entry:
                 if cache_key:
                     del _PUBLIC_CACHE[cache_key]
+                    _PUBLIC_CACHE_OWNERS.pop(cache_key, None)
                 elif personal_cache_key:
                     del _PERSONAL_CACHE[personal_cache_key]
         if cache_key:
             record_public_cache_lookup(False)
         elif personal_cache_key:
             record_public_cache_lookup(False)
-
-        if not future_self and not bypass_local_cache:
-            match = lookup_muscle(latest, room_mode=room_mode, model_tier=model_tier)
-            if match is not None:
-                return {
-                    "reply": clean_human_response(match["answer"]),
-                    "source": "pool0-muscle",
-                    "sub_agents": [],
-                    "verified": True,
-                    "proposed_memory": None,
-                    "tokens_burned": 0,
-                    "muscle_confidence": match["confidence"],
-                }
 
         prior_context = [
             {
@@ -744,17 +704,32 @@ class MasterBrain:
             },
             *prior_context,
         ]
-        reply, pool = await self.router.complete(prompt, max_tokens=max_tokens)
+        grounded_fallback = False
+        try:
+            reply, pool = await self.router.complete(prompt, max_tokens=max_tokens)
+        except RuntimeError:
+            if not grounding:
+                raise
+            reply = grounding.removeprefix("Wikipedia summary: ").strip()
+            pool = "pool0-real-world-grounding"
+            grounded_fallback = True
         reply = clean_human_response(_strip_internal_agent_prefixes(reply))
         verification = self.verifier.verify(reply)
         if cache_key and verification["verified"]:
             with _PUBLIC_CACHE_LOCK:
                 _PUBLIC_CACHE[cache_key] = (time.monotonic(), reply)
+                _PUBLIC_CACHE_OWNERS[cache_key] = user_sub
                 _PUBLIC_CACHE.move_to_end(cache_key)
                 while len(_PUBLIC_CACHE) > PUBLIC_CACHE_MAX_ENTRIES:
-                    _PUBLIC_CACHE.popitem(last=False)
+                    expired_key, _ = _PUBLIC_CACHE.popitem(last=False)
+                    _PUBLIC_CACHE_OWNERS.pop(expired_key, None)
         if verification["verified"] and is_general_query(latest, room_mode):
-            learn_general_answer(latest, reply, room_mode=room_mode)
+            learn_general_answer(
+                latest,
+                reply,
+                room_mode=room_mode,
+                category="real-world" if grounding else "general",
+            )
         elif personal_cache_key and verification["verified"]:
             with _PUBLIC_CACHE_LOCK:
                 _PERSONAL_CACHE[personal_cache_key] = (time.monotonic(), reply)
@@ -774,7 +749,8 @@ class MasterBrain:
             "verified": verification["verified"],
             "verification_notes": verification["notes"],
             "proposed_memory": self.memory_sieve.propose(latest, user_sub),
-            "max_calls": 1,
+            "max_calls": 0 if grounded_fallback else 1,
+            **({"tokens_burned": 0} if grounded_fallback else {}),
         }
 
 

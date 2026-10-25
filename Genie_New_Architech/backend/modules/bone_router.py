@@ -8,6 +8,7 @@ from typing import Any, Callable
 try:
     from .muscle_engine import (
         MuscleEngine,
+        match_conversational_reflex,
         get_initialized_muscle_engine,
         normalize_query,
     )
@@ -15,6 +16,7 @@ try:
 except ImportError:
     from modules.muscle_engine import (
         MuscleEngine,
+        match_conversational_reflex,
         get_initialized_muscle_engine,
         normalize_query,
     )
@@ -89,6 +91,7 @@ def learn_general_answer(
     *,
     room_mode: bool = False,
     engine: MuscleEngine | None = None,
+    category: str = "general",
 ) -> bool:
     if not answer.strip() or not is_general_query(question, room_mode):
         return False
@@ -96,7 +99,11 @@ def learn_general_answer(
     if not sanitized:
         return False
     active_engine = engine or get_initialized_muscle_engine()
-    return active_engine.learn(question, sanitized) if active_engine is not None else False
+    return (
+        active_engine.learn(question, sanitized, category=category)
+        if active_engine is not None
+        else False
+    )
 
 
 def lookup_muscle(
@@ -127,6 +134,16 @@ async def route_query(
     """Try a local 0-token synapse before invoking the supplied Brain coroutine."""
     started = time.perf_counter()
     cleaned, normalized, intent = prepare_query(query)
+    greeting = match_conversational_reflex(cleaned)
+    if greeting is not None:
+        return {
+            "reply": greeting["answer"],
+            "source": "pool0-greeting-reflex",
+            "tokens_burned": 0,
+            "muscle_confidence": greeting["confidence"],
+            "intent": intent,
+            "elapsed_ms": (time.perf_counter() - started) * 1000,
+        }
     muscle = engine or get_initialized_muscle_engine()
     match = muscle.lookup(cleaned, minimum_confidence=0.85) if muscle else None
     if match is not None:
