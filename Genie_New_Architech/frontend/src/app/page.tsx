@@ -3717,6 +3717,7 @@ export default function Home() {
             loading={sending}
             activeRoom={Boolean(room)}
             isGroupRoom={Boolean(room && room.group_slot !== null && room.group_slot !== undefined)}
+            isMultiUserRoom={Boolean(room)}
             mySub={identity.sub}
             chatMode={chatMode}
             onChatModeChange={(mode) => {

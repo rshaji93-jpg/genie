@@ -1,6 +1,6 @@
 "use client";
 
-import { Search, Smile, X } from "lucide-react";
+import { Plus, Search, Smile, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type EmojiCategory =
@@ -58,12 +58,14 @@ export interface WhatsAppEmojiPickerProps {
   onSelect: (emoji: string) => void;
   className?: string;
   ariaLabel?: string;
+  triggerIcon?: "smile" | "plus";
 }
 
 export default function WhatsAppEmojiPicker({
   onSelect,
   className = "",
   ariaLabel = "Choose emoji",
+  triggerIcon = "smile",
 }: WhatsAppEmojiPickerProps) {
   const [open, setOpen] = useState(false);
   const [activeCategory, setActiveCategory] = useState("Recent");
@@ -128,7 +130,9 @@ export default function WhatsAppEmojiPicker({
         onClick={() => setOpen((value) => !value)}
         type="button"
       >
-        <Smile aria-hidden="true" size={18} />
+        {triggerIcon === "plus"
+          ? <Plus aria-hidden="true" size={18} />
+          : <Smile aria-hidden="true" size={18} />}
       </button>
       {open && (
         <section

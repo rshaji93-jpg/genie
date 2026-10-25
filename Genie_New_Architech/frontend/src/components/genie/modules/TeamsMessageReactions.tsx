@@ -1,8 +1,5 @@
 "use client";
 
-import WhatsAppEmojiPicker from "./WhatsAppEmojiPicker";
-import { useState } from "react";
-
 export interface ReactionUser {
   id: string;
   name: string;
@@ -20,20 +17,19 @@ export interface TeamsMessageReactionsProps {
   reactions: ReactionAggregate[];
   currentUserId?: string;
   onToggle: (emoji: string) => void;
+  canToggle?: boolean;
   className?: string;
   ariaLabel?: string;
 }
-
-const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"] as const;
 
 export default function TeamsMessageReactions({
   reactions,
   currentUserId,
   onToggle,
+  canToggle = true,
   className = "",
   ariaLabel = "Message reactions",
 }: TeamsMessageReactionsProps) {
-  const [quickOpen, setQuickOpen] = useState(false);
   const byEmoji = new Map(reactions.map((reaction) => [reaction.emoji, reaction]));
 
   function renderReaction(emoji: string) {
@@ -48,7 +44,7 @@ export default function TeamsMessageReactions({
         ? `${count} ${count === 1 ? "person" : "people"} reacted`
         : `React with ${emoji}`;
 
-    return (
+    return canToggle ? (
       <button
         aria-label={`React with ${emoji}${count ? `, ${count} reactions` : ""}`}
         aria-pressed={reactedByCurrentUser}
@@ -65,23 +61,22 @@ export default function TeamsMessageReactions({
         <span aria-hidden="true" className="text-base leading-none">{emoji}</span>
         {count > 0 && <span className="text-xs font-medium leading-none">{count}</span>}
       </button>
+    ) : (
+      <span
+        aria-label={`${tooltip}: ${count} reactions`}
+        className="inline-flex min-h-8 items-center justify-center gap-1.5 rounded-full border border-gray-200 bg-white px-2 text-sm text-gray-700"
+        key={emoji}
+        title={tooltip}
+      >
+        <span aria-hidden="true" className="text-base leading-none">{emoji}</span>
+        <span className="text-xs font-medium leading-none">{count}</span>
+      </span>
     );
   }
 
   return (
     <div aria-label={ariaLabel} className={`message-reactions ${className}`.trim()} role="group">
       <div className="message-reaction-pills">{reactions.filter((reaction) => reaction.count > 0).map((reaction) => renderReaction(reaction.emoji))}</div>
-      <button
-        aria-expanded={quickOpen}
-        aria-label="Show quick reactions"
-        className="message-reaction-toggle"
-        onClick={() => setQuickOpen((open) => !open)}
-        type="button"
-      >＋</button>
-      <div className={`message-reaction-quick-actions ${quickOpen ? "open" : ""}`}>
-        {QUICK_REACTIONS.map(renderReaction)}
-        <WhatsAppEmojiPicker ariaLabel="Add custom reaction" onSelect={onToggle} />
-      </div>
     </div>
   );
 }

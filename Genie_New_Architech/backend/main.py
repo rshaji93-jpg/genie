@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 import sys
 import threading
 import types
@@ -9,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 LOGGER = logging.getLogger("genie.bootstrap")
+_CORS_ORIGIN_PATTERN = re.compile(
+    r"https://.*\.pages\.dev|https://.*|http://localhost:\d+"
+)
 _IMPLEMENTATION_NAME = (
     f"{__package__}.application" if __package__ else "application"
 )
@@ -17,6 +21,7 @@ _IMPLEMENTATION: types.ModuleType | None = None
 _IMPLEMENTATION_ERROR: BaseException | None = None
 _BOOTSTRAP_NAMES = {
     "LOGGER",
+    "_CORS_ORIGIN_PATTERN",
     "_IMPLEMENTATION_NAME",
     "_IMPLEMENTATION_LOCK",
     "_IMPLEMENTATION",
@@ -72,6 +77,40 @@ class _LazyASGIApplication:
                 elif message["type"] == "lifespan.shutdown":
                     await send({"type": "lifespan.shutdown.complete"})
                     return
+            return
+
+        if scope["type"] == "http" and scope.get("method") == "OPTIONS":
+            request_headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1")
+                for key, value in scope.get("headers", [])
+            }
+            origin = request_headers.get("origin", "")
+            headers = [
+                (b"access-control-allow-credentials", b"true"),
+                (
+                    b"access-control-allow-headers",
+                    request_headers.get(
+                        "access-control-request-headers", "*"
+                    ).encode("latin-1"),
+                ),
+                (
+                    b"access-control-allow-methods",
+                    request_headers.get(
+                        "access-control-request-method", "*"
+                    ).encode("latin-1"),
+                ),
+                (
+                    b"vary",
+                    b"Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+                ),
+                (b"content-length", b"0"),
+            ]
+            if _CORS_ORIGIN_PATTERN.fullmatch(origin):
+                headers.append(
+                    (b"access-control-allow-origin", origin.encode("latin-1"))
+                )
+            await send({"type": "http.response.start", "status": 200, "headers": headers})
+            await send({"type": "http.response.body", "body": b""})
             return
 
         if scope["type"] == "http" and scope.get("path") in {

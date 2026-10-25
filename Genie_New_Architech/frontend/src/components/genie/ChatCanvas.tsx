@@ -19,6 +19,7 @@ import InlineMessageEditor from "@/modules/messages_arrows/InlineMessageEditor";
 import MessageInfoLedgerModal from "@/modules/messages_arrows/MessageInfoLedgerModal";
 import TeamsMessageReactions from "@/components/genie/modules/TeamsMessageReactions";
 import PinnableChatHeader from "@/components/genie/modules/PinnableChatHeader";
+import MessageContextActions from "@/components/genie/modules/MessageContextActions";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import type { ReactNode } from "react";
 import type { ChatMode } from "@/modules/composer/OptionAComposer";
@@ -75,6 +76,7 @@ interface ChatCanvasProps {
   loading: boolean;
   activeRoom: boolean;
   isGroupRoom: boolean;
+  isMultiUserRoom?: boolean;
   mySub: string;
   chatMode?: ChatMode;
   onChatModeChange?: (mode: ChatMode) => void;
@@ -372,7 +374,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
 
   useEffect(() => {
     const closeOnOutside = (event: Event) => {
-      if (event.target instanceof Element && event.target.closest(".message-actions-popover")) return;
+      if (event.target instanceof Element && event.target.closest(".message-actions-popover, .message-context-actions")) return;
       setActiveActionsId(null);
     };
     const closeOnKeyDown = (event: KeyboardEvent) => {
@@ -443,6 +445,22 @@ export default function ChatCanvas(props: ChatCanvasProps) {
           const hasReview = Boolean(message.ai_reply);
           const canVerify = message.review_triggered_by === props.mySub && status === "ai_review_active";
           const retryOnly = message.role === "assistant" && /failed to fetch|\b405\b/i.test(message.content);
+          const isOwnMessage = message.sender_sub === props.mySub || message.owner_sub === props.mySub;
+          const canReactToMessage = Boolean(
+            props.activeRoom
+            && (props.isGroupRoom || props.isMultiUserRoom)
+            && message.role === "user"
+            && !isOwnMessage
+            && !message.is_secret
+            && props.onReact,
+          );
+          const appliedReactions = Object.entries(
+            props.reactionCounts?.[
+              `${message.role === "user" ? "user_message" : "ai_response"}:${message.id}`
+            ] || {},
+          )
+            .filter(([, count]) => count > 0)
+            .map(([emoji, count]) => ({ emoji, count }));
           return (
             <article
               className={`message-row ${message.role === "user" ? "user-row" : "assistant-row"} ${props.selectionMode ? "message-row-selecting" : ""}`}
@@ -464,7 +482,8 @@ export default function ChatCanvas(props: ChatCanvasProps) {
               )}
               <div
                 className={`message-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"} ${message.is_secret ? "secret-bubble" : ""}`}
-                onPointerDown={() => {
+                onPointerDown={(event) => {
+                  if (event.pointerType === "touch" || event.button !== 0) return;
                   longPressTriggered.current = false;
                   if (props.selectionMode) return;
                   longPressTimer.current = window.setTimeout(() => {
@@ -477,9 +496,45 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                     );
                   }, 500);
                 }}
-                onPointerUp={() => window.clearTimeout(longPressTimer.current)}
-                onPointerCancel={() => window.clearTimeout(longPressTimer.current)}
-                onPointerLeave={() => window.clearTimeout(longPressTimer.current)}
+                onPointerUp={() => {
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                }}
+                onPointerCancel={() => {
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                }}
+                onPointerLeave={() => {
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                }}
+                onTouchStart={(event) => {
+                  if (props.selectionMode) return;
+                  const touch = event.touches[0];
+                  if (!touch) return;
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                  longPressTriggered.current = false;
+                  if (canReactToMessage) {
+                    const x = touch.clientX;
+                    const y = touch.clientY;
+                    longPressTimer.current = window.setTimeout(() => {
+                      longPressTriggered.current = true;
+                      setActiveActionsId(message.id);
+                      setActionsPosition({ x, y });
+                    }, 450);
+                  } else {
+                    longPressTimer.current = window.setTimeout(() => {
+                      longPressTriggered.current = true;
+                      setActiveActionsId(null);
+                      props.onEnterMessageSelection(
+                        !props.activeRoom || isOwnMessage ? message.id : undefined,
+                      );
+                    }, 500);
+                  }
+                }}
+                onTouchMove={() => {
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                }}
+                onTouchEnd={() => {
+                  if (longPressTimer.current !== undefined) window.clearTimeout(longPressTimer.current);
+                }}
                 onClick={(event) => {
                   if (longPressTriggered.current) {
                     longPressTriggered.current = false;
@@ -567,13 +622,13 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                   {message.role === "assistant" && message.tick_status === "yellow_no_ai" && <span>Local only</span>}
                 </div>
                 <div
-                  className={`message-actions-popover ${activeActionsId === message.id ? "message-actions-visible" : ""}`}
+                  className={`message-actions-popover ${activeActionsId === message.id && !canReactToMessage ? "message-actions-visible" : ""}`}
                   onPointerDown={(event) => event.stopPropagation()}
-                  style={activeActionsId === message.id && actionsPosition ? {
+                  style={activeActionsId === message.id && actionsPosition && !canReactToMessage ? {
                     left: Math.max(8, Math.min(actionsPosition.x, window.innerWidth - 300)),
                     top: Math.max(8, Math.min(actionsPosition.y, window.innerHeight - 56)),
                   } : undefined}
-                >
+                >{!canReactToMessage && (
                   <ArrowActionToolbar
                     messageRole={message.role}
                     onQuote={() => { setActiveActionsId(null); props.onQuote?.(message); }}
@@ -587,7 +642,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                       setActiveActionsId(null);
                     }}
                   />
-                </div>
+                )}</div>
               </div>
               {retryOnly && (
                 <button className="message-retry-button" onClick={() => (props.onRetryResponse || props.onRegenerateResponse)?.(message)} type="button">
@@ -653,22 +708,34 @@ export default function ChatCanvas(props: ChatCanvasProps) {
                 </div>
                 </>
               )}
-              {props.onReact && !message.is_secret && (
+              {props.onReact
+                && message.role === "user"
+                && !isOwnMessage
+                && !message.is_secret
+                && (props.isGroupRoom || props.isMultiUserRoom)
+                && appliedReactions.length > 0 && (
                 <div className="message-reaction-bar" aria-label="Message reactions">
                   <TeamsMessageReactions
                     ariaLabel="Message reactions"
+                    canToggle={canReactToMessage}
                     onToggle={(emoji) => props.onReact?.(
                       message,
                       message.role === "user" ? "user_message" : "ai_response",
                       emoji,
                     )}
-                    reactions={Object.entries(
-                      props.reactionCounts?.[
-                        `${message.role === "user" ? "user_message" : "ai_response"}:${message.id}`
-                      ] || {},
-                    ).map(([emoji, count]) => ({ emoji, count }))}
+                    currentUserId={props.mySub}
+                    reactions={appliedReactions}
                   />
                 </div>
+              )}
+              {activeActionsId === message.id && canReactToMessage && actionsPosition && (
+                <MessageContextActions
+                  onAIReview={() => props.onReview(message.id)}
+                  onClose={() => setActiveActionsId(null)}
+                  onForward={() => props.onForward?.(message)}
+                  onReact={(emoji) => props.onReact?.(message, "user_message", emoji)}
+                  position={actionsPosition}
+                />
               )}
               {props.activeRoom && message.role === "user" && (status === "read_no_ai" || status === "yellow_no_ai") && !hasReview && !message.is_secret && (
                 <button className="message-action review-action" onClick={() => props.onReview(message.id)}>

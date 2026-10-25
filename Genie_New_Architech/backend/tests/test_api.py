@@ -83,6 +83,25 @@ class BackendApiTests(unittest.TestCase):
             }.issubset(registered_routes)
         )
 
+    def test_cors_preflight_allows_pages_dev_with_credentials(self):
+        response = self.client.options(
+            "/api/chat",
+            headers={
+                "Origin": "https://preview.personalaigenie.pages.dev",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type,x-user-email",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://preview.personalaigenie.pages.dev",
+        )
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+        self.assertIn("POST", response.headers.get("access-control-allow-methods", ""))
+        self.assertIn("x-user-email", response.headers.get("access-control-allow-headers", ""))
+
     def test_python_social_requests_fall_back_to_empty_lists_on_sqlite_errors(self):
         with (
             patch.object(main, "database", side_effect=main.sqlite3.OperationalError("no such table")),
@@ -342,7 +361,11 @@ class BackendApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.headers.get("access-control-allow-origin"), "*")
+        self.assertEqual(
+            response.headers.get("access-control-allow-origin"),
+            "https://example.pages.dev",
+        )
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
 
     def test_chat_accepts_optional_session_id_on_frontend_proxy_alias(self):
         response = self.client.post(

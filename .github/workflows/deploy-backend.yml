@@ -1,0 +1,47 @@
+name: Deploy Genie backend to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-genie-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and deploy backend
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GENIE_DATA_BUCKET: ${{ secrets.GENIE_DATA_BUCKET }}
+        run: |
+          if [ -z "$GCP_PROJECT_ID" ] || [ -z "$GENIE_DATA_BUCKET" ]; then
+            echo "GCP_PROJECT_ID and GENIE_DATA_BUCKET repository secrets are required." >&2
+            exit 1
+          fi
+          gcloud builds submit \
+            --project "$GCP_PROJECT_ID" \
+            --config Genie_New_Architech/backend/cloudbuild.yaml \
+            --substitutions="_REGION=asia-south1,_SERVICE=genie-backend,_DATA_BUCKET=$GENIE_DATA_BUCKET,_REPOSITORY=genie" \
+            .

@@ -838,11 +838,29 @@ app = FastAPI(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origin_regex=r"https://.*\.pages\.dev|https://.*|http://localhost:\d+",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.options("/{rest_of_path:path}")
+async def cors_preflight(rest_of_path: str, request: Request) -> JSONResponse:
+    origin = request.headers.get("origin", "")
+    headers = {
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Headers": request.headers.get(
+            "access-control-request-headers", "*"
+        ),
+        "Access-Control-Allow-Methods": request.headers.get(
+            "access-control-request-method", "*"
+        ),
+        "Vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+    }
+    if re.fullmatch(r"https://.*\.pages\.dev|https://.*|http://localhost:\d+", origin):
+        headers["Access-Control-Allow-Origin"] = origin
+    return JSONResponse({"ok": True}, status_code=200, headers=headers)
 
 
 @app.middleware("http")
