@@ -24,6 +24,10 @@ from security import issue_inline_push_reply_token
 class BackendApiTests(unittest.TestCase):
     def setUp(self):
         self.actor = {"sub": "test-user-123", "name": "Test User", "email": "test@example.com"}
+        main.initialize_database()
+        orchestrator.get_muscle_engine()
+        with closing(main.database()) as connection:
+            main.initialize_mom_schema(connection)
         with orchestrator._PUBLIC_CACHE_LOCK:
             orchestrator._PUBLIC_CACHE.clear()
         with orchestrator.get_muscle_engine().connect() as connection:
@@ -35,6 +39,7 @@ class BackendApiTests(unittest.TestCase):
             connection.execute("DELETE FROM vip_pass_requests")
             connection.execute("DELETE FROM vip_passes")
             connection.commit()
+        main.app.dependency_overrides.clear()
         main.app.dependency_overrides[main.current_identity] = lambda: self.actor
         main.app.dependency_overrides[main.optional_read_identity] = lambda: self.actor
         self.provider_probe_patch = patch.object(
@@ -910,7 +915,7 @@ class BackendApiTests(unittest.TestCase):
             "/api/admin/telemetry/gemini-pool",
             json={"enabled": True},
         )
-        self.assertEqual(denied.status_code, 404)
+        self.assertEqual(denied.status_code, 404, denied.text)
         self.assertFalse(main.gemini_pool.telemetry_gemini_pool_enabled)
 
         admin = {

@@ -46,10 +46,6 @@ def create_groups_router(database_factory, identity_dependency):
             """
         )
 
-    with closing(database_factory()) as connection:
-        ensure_schema(connection)
-        connection.commit()
-
     def owned_group(connection: sqlite3.Connection, room_id: str, owner_sub: str):
         room = connection.execute(
             "SELECT id, owner_sub, group_slot FROM rooms WHERE id = ?",

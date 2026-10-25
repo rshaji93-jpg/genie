@@ -21,14 +21,24 @@ from zoneinfo import ZoneInfo
 import httpx
 
 try:
-    from .modules.bone_router import is_general_query, lookup_muscle
+    from .modules.bone_router import (
+        is_general_query,
+        is_rca_query,
+        learn_general_answer,
+        lookup_muscle,
+    )
     from .modules.muscle_engine import get_muscle_engine
 except ImportError:
-    from modules.bone_router import is_general_query, lookup_muscle
+    from modules.bone_router import (
+        is_general_query,
+        is_rca_query,
+        learn_general_answer,
+        lookup_muscle,
+    )
     from modules.muscle_engine import get_muscle_engine
 
 LOGGER = logging.getLogger("genie.master_brain")
-REGISTRY_PATH = Path(__file__).resolve().parent / "ai_muscle" / "registry.json"
+REGISTRY_PATH = Path(__file__).parent / "ai_muscle" / "registry.json"
 MAX_CALLS_NORMAL = 1
 MAX_CALLS_MASTER = 4
 MAX_WORKERS_AI_NEURONS = 9200
@@ -243,7 +253,7 @@ def _load_registry(path: str) -> dict[str, Any]:
 
 class SkillRegistry:
     def __init__(self, path: Path = REGISTRY_PATH) -> None:
-        self.path = str(path.resolve())
+        self.path = str(path.absolute())
 
     def skill(self, skill_id: str) -> dict[str, Any] | None:
         skills = _load_registry(self.path).get("skills", {})
@@ -291,6 +301,21 @@ class MultiPoolRouter:
     @staticmethod
     def _provider_specs() -> list[tuple[str, str, str, str, dict[str, str], int]]:
         specs: list[tuple[str, str, str, str, dict[str, str], int]] = []
+        account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+        cf_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+        if account and cf_token:
+            for model in (
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+            ):
+                specs.append((
+                    "pool5-cloudflare",
+                    f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/{model}",
+                    model,
+                    "CLOUDFLARE",
+                    {"Authorization": "Bearer " + cf_token},
+                    MAX_WORKERS_AI_NEURONS,
+                ))
         providers = (
             ("pool1-groq", "GROQ_API_KEY", "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile"),
             ("pool1-cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1/chat/completions", "llama-3.3-70b"),
@@ -313,17 +338,6 @@ class MultiPoolRouter:
             {},
             4096,
         ))
-        account = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
-        cf_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
-        if account and cf_token:
-            specs.append((
-                "pool5-cloudflare",
-                f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/run/@cf/meta/llama-3.1-8b-instruct",
-                "@cf/meta/llama-3.1-8b-instruct",
-                "CLOUDFLARE",
-                {"Authorization": "Bearer " + cf_token},
-                MAX_WORKERS_AI_NEURONS,
-            ))
         return specs
 
     async def _post(
@@ -703,6 +717,12 @@ class MasterBrain:
                 if room_mode else "This is a personal chat request."
             )
         )
+        if is_rca_query(latest):
+            system_context += (
+                " Apply root-cause analysis: distinguish the exact root cause from symptoms, "
+                "trace the affected layer (Bone, Muscle, Brain, Backend, or UI), and give a "
+                "direct, concrete fix. Use clean prose without markdown clutter."
+            )
         grounding = await fetch_live_grounding(latest)
         grounding_context = (
             grounding if grounding else "No external grounding sources returned usable facts."
@@ -734,7 +754,7 @@ class MasterBrain:
                 while len(_PUBLIC_CACHE) > PUBLIC_CACHE_MAX_ENTRIES:
                     _PUBLIC_CACHE.popitem(last=False)
         if verification["verified"] and is_general_query(latest, room_mode):
-            get_muscle_engine().learn(latest, reply)
+            learn_general_answer(latest, reply, room_mode=room_mode)
         elif personal_cache_key and verification["verified"]:
             with _PUBLIC_CACHE_LOCK:
                 _PERSONAL_CACHE[personal_cache_key] = (time.monotonic(), reply)

@@ -74,6 +74,7 @@ interface ChatCanvasProps {
   messages: ChatMessage[];
   loading: boolean;
   activeRoom: boolean;
+  isGroupRoom: boolean;
   mySub: string;
   chatMode?: ChatMode;
   onChatModeChange?: (mode: ChatMode) => void;
@@ -409,7 +410,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
 
   return (
     <main className="chat-canvas">
-      <PinnableChatHeader
+      {props.isGroupRoom && <PinnableChatHeader
         group={props.activeRoom}
         chatMode={props.chatMode}
         initial={(props.conversationName || "Genie").trim().slice(0, 1).toLocaleUpperCase()}
@@ -427,7 +428,7 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         onShare={props.onShareConversation ?? (() => undefined)}
         onTemporaryChange={props.onTemporaryChatChange ?? (() => undefined)}
         temporary={props.temporaryChat ?? false}
-      />
+      />}
       <section className="message-scroll" aria-live="polite" onScroll={updateScrollPosition} ref={messageScrollRef}>
         {!props.messages.length && (
           <div className="welcome-card">

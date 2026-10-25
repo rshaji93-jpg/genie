@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator
+from modules.bone_router import is_rca_query
 
 
 class ArgonOrchestratorTests(unittest.TestCase):
@@ -30,6 +31,8 @@ class ArgonOrchestratorTests(unittest.TestCase):
         self.assertEqual(
             [provider[0] for provider in providers],
             [
+                "pool5-cloudflare",
+                "pool5-cloudflare",
                 "pool1-groq",
                 "pool1-cerebras",
                 "pool2-openrouter-llama",
@@ -38,10 +41,21 @@ class ArgonOrchestratorTests(unittest.TestCase):
                 "pool3-mistral-nemo",
                 "pool3-mistral-large",
                 "pool4-pollinations",
-                "pool5-cloudflare",
+            ],
+        )
+        self.assertEqual(
+            [provider[2] for provider in providers[:2]],
+            [
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
             ],
         )
         self.assertTrue(all("gemini" not in provider[1].casefold() for provider in providers))
+
+    def test_root_cause_detector_selects_debug_and_analysis_requests(self):
+        self.assertTrue(is_rca_query("Why does this request fail in production?"))
+        self.assertTrue(is_rca_query("Analyze the backend architecture."))
+        self.assertFalse(is_rca_query("What is an algorithm?"))
 
     def test_pollinations_uses_argon_temperature_and_openai_compatible_payload(self):
         response = MagicMock()
@@ -111,7 +125,7 @@ class ArgonCacheTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.grounding.stop)
 
     async def test_global_cache_reuses_public_answer_across_users(self):
-        messages = [{"role": "user", "content": "What is an algorithm?"}]
+        messages = [{"role": "user", "content": "What is a consistency lattice?"}]
         first = await self.brain.run(messages, user_sub="user-a")
         second = await self.brain.run(messages, user_sub="user-b")
 
@@ -139,6 +153,17 @@ class ArgonCacheTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertIsNone(orchestrator._public_query_key(messages, "genie-pro"))
+
+    async def test_rca_requests_receive_root_cause_instructions(self):
+        await self.brain.run(
+            [{"role": "user", "content": "Why does a cache miss happen?"}],
+            user_sub="user-a",
+        )
+
+        system_prompt = self.router.complete.await_args.args[0][0]["content"]
+        self.assertIn("exact root cause", system_prompt)
+        self.assertIn("affected layer", system_prompt)
+        self.assertIn("without markdown clutter", system_prompt)
 
     async def test_cached_and_returned_responses_are_cleaned_before_storage(self):
         self.router.complete.side_effect = None

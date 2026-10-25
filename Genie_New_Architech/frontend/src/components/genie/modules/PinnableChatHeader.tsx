@@ -57,8 +57,9 @@ export default function PinnableChatHeader(props: PinnableChatHeaderProps) {
     top: 0,
     zIndex: 20,
     boxSizing: "border-box",
-    flexWrap: "wrap",
+    flexWrap: "nowrap",
     gap: 8,
+    overflowX: "auto",
   };
 
   return (
