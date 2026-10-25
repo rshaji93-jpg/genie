@@ -49,15 +49,28 @@ class MasterCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             engine = MuscleEngine(Path(temp_dir) / "muscle.sqlite3")
             brain = orchestrator.MasterBrain(router=AsyncMock())
 
-            with patch(
-                "orchestrator.learn_general_answer",
-                side_effect=lambda question, answer, **kwargs: engine.learn(
-                    question, answer, category=kwargs.get("category", "general")
+            with (
+                patch(
+                    "orchestrator.learn_general_answer",
+                    side_effect=lambda question, answer, **kwargs: engine.learn(
+                        question, answer, category=kwargs.get("category", "general")
+                    ),
+                ),
+                patch(
+                    "orchestrator.lookup_muscle",
+                    side_effect=lambda question, **kwargs: engine.lookup(
+                        question, minimum_confidence=0.85
+                    ),
                 ),
             ):
                 result = await brain.run(
                     [{"role": "user", "content": "who is the chief minister of Tamilnadu"}],
                     user_sub="user-1",
+                )
+                repeated = await brain.run(
+                    [{"role": "user", "content": "who is the chief minister of Tamilnadu"}],
+                    user_sub="user-2",
+                    model_tier="genie-master",
                 )
 
             self.assertIn("C. Joseph Vijay", result["reply"])
@@ -71,6 +84,9 @@ class MasterCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(learned)
             self.assertIn("C. Joseph Vijay", learned["answer"])
             self.assertIn("M. K. Stalin", learned["answer"])
+            self.assertEqual(repeated["source"], "pool0-muscle")
+            self.assertEqual(repeated["tokens_burned"], 0)
+            self.assertIn("C. Joseph Vijay", repeated["reply"])
 
     def test_unrelated_and_foreign_library_items_are_not_retrieved(self):
         retrieved = rank_and_filter_library_context(
@@ -162,3 +178,33 @@ class CoordinatorPureFunctionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertIn("C. Joseph Vijay", result.summary)
         self.assertIn("M. K. Stalin", result.summary)
+
+    async def test_multi_source_live_grounding_is_learned_for_zero_token_reuse(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = MuscleEngine(Path(temp_dir) / "live-facts.sqlite3")
+            result = world_knowledge_agent.WorldKnowledgeResult(
+                query="current Eiffel Tower",
+                summary="The Eiffel Tower is a landmark in Paris.",
+                sources=("Google News RSS", "Wikipedia"),
+                confidence=0.9,
+            )
+            with (
+                patch.object(
+                    world_knowledge_agent,
+                    "search_world_knowledge",
+                    new=AsyncMock(return_value=result),
+                ),
+                patch.object(
+                    world_knowledge_agent,
+                    "get_initialized_muscle_engine",
+                    return_value=engine,
+                ),
+            ):
+                answer = await world_knowledge_agent.fetch_live_world_context(
+                    "what is the current Eiffel Tower"
+                )
+
+            self.assertIn("Eiffel Tower", answer)
+            learned = engine.lookup("current Eiffel Tower", minimum_confidence=0.85)
+            self.assertIsNotNone(learned)
+            self.assertIn("Paris", learned["answer"])

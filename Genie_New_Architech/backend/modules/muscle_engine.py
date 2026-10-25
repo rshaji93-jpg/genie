@@ -445,17 +445,50 @@ class MuscleEngine:
         if not normalized:
             return None
         with self.connect() as connection:
+            exact = connection.execute(
+                """
+                SELECT signature, normalized_question, compressed_answer,
+                       category, 'learned' AS source
+                FROM learned_synapses
+                WHERE signature = ?
+                UNION ALL
+                SELECT signature, normalized_question, compressed_answer,
+                       'built-in' AS category, 'built-in' AS source
+                FROM built_in_reflexes
+                WHERE signature = ?
+                LIMIT 1
+                """,
+                (signature(query), signature(query)),
+            ).fetchone()
+            if exact is not None:
+                if exact["source"] == "learned":
+                    connection.execute(
+                        """
+                        UPDATE learned_synapses
+                        SET last_used_at = CURRENT_TIMESTAMP, hit_count = hit_count + 1
+                        WHERE signature = ?
+                        """,
+                        (exact["signature"],),
+                    )
+                    connection.commit()
+                return {
+                    "answer": zlib.decompress(exact["compressed_answer"]).decode("utf-8"),
+                    "confidence": 1.0,
+                    "source": exact["source"],
+                    "category": exact["category"],
+                    "signature": exact["signature"],
+                }
             terms = [f'"{term}"' for term in normalized.split()]
             match_query = " OR ".join(terms)
             candidates = connection.execute(
                 """
                 SELECT l.signature, l.normalized_question, l.compressed_answer,
-                       l.concepts, 'learned' AS source
+                       l.concepts, l.category, 'learned' AS source
                 FROM learned_synapses AS l
                 WHERE l.signature IN (SELECT signature FROM muscle_core WHERE muscle_core MATCH ?)
                 UNION ALL
                 SELECT b.signature, b.normalized_question, b.compressed_answer,
-                       b.concepts, 'built-in' AS source
+                       b.concepts, 'built-in' AS category, 'built-in' AS source
                 FROM built_in_reflexes AS b
                 WHERE b.signature IN (SELECT signature FROM muscle_core WHERE muscle_core MATCH ?)
                 """,
@@ -485,6 +518,7 @@ class MuscleEngine:
                 "answer": zlib.decompress(row["compressed_answer"]).decode("utf-8"),
                 "confidence": confidence,
                 "source": row["source"],
+                "category": row["category"],
                 "signature": row["signature"],
             }
 

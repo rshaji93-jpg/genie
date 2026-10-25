@@ -23,10 +23,12 @@ export default function CarromBlitzGame({
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationRef = useRef<number | undefined>(undefined);
+  const genieTimerRef = useRef<number | undefined>(undefined);
   const coinsRef = useRef<Coin[]>(state.coins || INITIAL_COINS);
   const strikerRef = useRef({ x: 200, y: 340, vx: 0, vy: 0 });
   const dragStart = useRef<{ x: number; y: number } | null>(null);
   const [score, setScore] = useState(state.score || 0);
+  const [practiceWithGenie, setPracticeWithGenie] = useState(false);
   const scoreRef = useRef(state.score || 0);
 
   useEffect(() => {
@@ -38,7 +40,15 @@ export default function CarromBlitzGame({
 
   useEffect(() => () => {
     if (animationRef.current !== undefined) cancelAnimationFrame(animationRef.current);
+    if (genieTimerRef.current !== undefined) window.clearTimeout(genieTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (!practiceWithGenie && genieTimerRef.current !== undefined) {
+      window.clearTimeout(genieTimerRef.current);
+      genieTimerRef.current = undefined;
+    }
+  }, [practiceWithGenie]);
 
   function draw() {
     const canvas = canvasRef.current;
@@ -88,7 +98,7 @@ export default function CarromBlitzGame({
     };
   }
 
-  function startFlick() {
+  function startFlick(isGenieMove = false) {
     let frames = 0;
     const step = () => {
       const striker = strikerRef.current;
@@ -124,6 +134,19 @@ export default function CarromBlitzGame({
         striker.vy = 0;
         animationRef.current = undefined;
         onStateChange({ coins: coinsRef.current, score: scoreRef.current });
+        if (practiceWithGenie && !isGenieMove) {
+          genieTimerRef.current = window.setTimeout(() => {
+            const target = coinsRef.current.find((coin) => !coin.pocketed);
+            if (!target) return;
+            const currentStriker = strikerRef.current;
+            const directionX = target.x - currentStriker.x;
+            const directionY = target.y - currentStriker.y;
+            const length = Math.max(1, Math.hypot(directionX, directionY));
+            currentStriker.vx = (directionX / length) * 8;
+            currentStriker.vy = (directionY / length) * 8;
+            startFlick(true);
+          }, 350);
+        }
       }
     };
     animationRef.current = requestAnimationFrame(step);
@@ -131,7 +154,18 @@ export default function CarromBlitzGame({
 
   return (
     <section className="rounded-xl border border-amber-200 bg-amber-50 p-3">
-      <div className="mb-2 flex items-center justify-between"><strong>Carrom Blitz</strong><span>Score: {score}</span></div>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <strong>Carrom Blitz</strong>
+        <div className="flex items-center gap-2">
+          <button
+            aria-pressed={practiceWithGenie}
+            className="rounded border bg-white px-2 py-1 text-xs"
+            onClick={() => setPracticeWithGenie((enabled) => !enabled)}
+            type="button"
+          >{practiceWithGenie ? "Practice vs Genie" : "1v1 peer game"}</button>
+          <span>Score: {score}</span>
+        </div>
+      </div>
       <canvas
         aria-label="Carrom board. Drag the striker backward and release to flick."
         className="mx-auto w-full max-w-[360px] touch-none rounded-lg"

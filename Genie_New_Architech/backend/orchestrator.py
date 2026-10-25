@@ -34,6 +34,7 @@ try:
         run_bounded_specialists,
     )
     from .modules.agents.world_knowledge_agent import fetch_live_world_context
+    from .modules.model_adapter import LocalModelUnavailable, complete_with_local_model
 except ImportError:
     from modules.bone_router import (
         is_general_query,
@@ -49,6 +50,7 @@ except ImportError:
         run_bounded_specialists,
     )
     from modules.agents.world_knowledge_agent import fetch_live_world_context
+    from modules.model_adapter import LocalModelUnavailable, complete_with_local_model
 
 LOGGER = logging.getLogger("genie.master_brain")
 REGISTRY_PATH = Path(__file__).parent / "ai_muscle" / "registry.json"
@@ -401,12 +403,32 @@ class MultiPoolRouter:
         *,
         max_tokens: int = 4096,
     ) -> tuple[str, str]:
+        local_model_error = ""
+        try:
+            local_messages = [
+                {
+                    "role": message.get("role", "user"),
+                    "content": sanitize_untrusted_context(
+                        str(message.get("content", ""))
+                    )[:20_000],
+                }
+                for message in messages[-40:]
+            ]
+            local_completion = await complete_with_local_model(
+                local_messages,
+                max_tokens=max_tokens,
+            )
+            if local_completion is not None:
+                return local_completion
+        except (LocalModelUnavailable, ImportError, OSError, RuntimeError, ValueError) as error:
+            local_model_error = f"local-safetensors:{type(error).__name__}"
+            LOGGER.warning("Local model route unavailable (%s).", type(error).__name__)
         if not check_and_consume_quota(
             self.pool_state,
             int(os.getenv("GENIE_GLOBAL_DAILY_QUOTA_COST", "1")),
         ):
             raise RuntimeError("The global provider-pool daily quota has been reached.")
-        errors: list[str] = []
+        errors: list[str] = [local_model_error] if local_model_error else []
         for pool, endpoint, model, _, headers, pool_cap in self._provider_specs():
             started_at = time.perf_counter()
             try:
@@ -599,6 +621,30 @@ class MasterBrain:
             "",
         )
         instant = answer_immediately(latest, user_name)
+        if (
+            (instant is None or instant.category == "real-world")
+            and is_factual_query(latest)
+        ):
+            if not room_mode and not future_self and not bypass_local_cache:
+                learned_match = lookup_muscle(
+                    latest,
+                    room_mode=False,
+                    model_tier="genie-pro",
+                )
+                if (
+                    learned_match is not None
+                    and learned_match.get("source") == "learned"
+                    and learned_match.get("category") == "real-world"
+                ):
+                    return {
+                        "reply": clean_human_response(learned_match["answer"]),
+                        "source": "pool0-muscle",
+                        "sub_agents": [],
+                        "verified": True,
+                        "proposed_memory": None,
+                        "tokens_burned": 0,
+                        "muscle_confidence": learned_match["confidence"],
+                    }
         if instant is not None:
             if instant.category == "real-world":
                 learn_general_answer(latest, instant.text, category=instant.category)
@@ -627,11 +673,6 @@ class MasterBrain:
             if public_cache_allowed and not master and not room_mode and not bypass_local_cache
             else None
         )
-        personal_cache_key = (
-            _personal_query_key(messages, model_tier, user_sub)
-            if not master and not room_mode and not bypass_local_cache
-            else None
-        )
         if not future_self and not bypass_local_cache:
             with _PUBLIC_CACHE_LOCK:
                 prefer_learned_synapse = bool(
@@ -651,6 +692,11 @@ class MasterBrain:
                         "tokens_burned": 0,
                         "muscle_confidence": match["confidence"],
                     }
+        personal_cache_key = (
+            _personal_query_key(messages, model_tier, user_sub)
+            if not master and not room_mode and not bypass_local_cache
+            else None
+        )
         with _PUBLIC_CACHE_LOCK:
             cache_entry = (
                 _PUBLIC_CACHE.get(cache_key) if cache_key

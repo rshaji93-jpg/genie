@@ -69,7 +69,7 @@ if __package__:
     from .modules.agents.master_coordinator import answer_immediately, initialize_sub_agent_registry
     from .modules.circle_feeds import create_circle_feeds_router, initialize_feed_schema
     from .modules.games_engine import initialize_games_schema, serialize_game_state
-    from .modules.library_guard import rank_and_filter_library_context
+    from .modules.agents.library_rag_agent import library_rag_agent
     from .modules.live_voice_agent import create_voice_router
     from .modules.mom_engine import create_mom_router, initialize_mom_schema, record_utterance
     from .modules.privacy_center import create_privacy_router
@@ -112,7 +112,7 @@ else:
     from modules.agents.master_coordinator import answer_immediately, initialize_sub_agent_registry
     from modules.circle_feeds import create_circle_feeds_router, initialize_feed_schema
     from modules.games_engine import initialize_games_schema, serialize_game_state
-    from modules.library_guard import rank_and_filter_library_context
+    from modules.agents.library_rag_agent import library_rag_agent
     from modules.live_voice_agent import create_voice_router
     from modules.mom_engine import create_mom_router, initialize_mom_schema, record_utterance
     from modules.privacy_center import create_privacy_router
@@ -2376,12 +2376,11 @@ def _owner_scoped_library_context(
                 "content": row["content"],
             }
         )
-    return rank_and_filter_library_context(
+    return library_rag_agent.retrieve(
         query,
         user_sub,
         conversation_id,
         items,
-        min_score=0.82,
     )
 
 
@@ -2429,12 +2428,11 @@ def _feed_context(
         }
         for row in rows
     ]
-    return rank_and_filter_library_context(
+    return library_rag_agent.retrieve(
         query,
         user_sub,
         room_id or "personal",
         items,
-        min_score=0.82,
     )
 
 
