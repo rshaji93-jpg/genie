@@ -2,11 +2,13 @@
 
 import { ArrowUp, Headphones, ImagePlus, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import EmojiPicker from "@/modules/composer/EmojiPicker";
+import ComposerEmojiPicker from "@/components/genie/composer/emoji_picker/ComposerEmojiPicker";
+import ContinuousMicDictation from "@/components/genie/composer/mic_dictation/ContinuousMicDictation";
+import PlusAttachmentMenu from "@/components/genie/composer/plus_menu/PlusAttachmentMenu";
+import ComposerInputBar from "@/components/genie/composer/text_input/ComposerInputBar";
 import StagedAudioPill from "@/modules/composer/StagedAudioPill";
 import SmartScannerModal from "@/modules/scanner_pdf/SmartScannerModal";
 import VoiceMic from "./VoiceMic";
-import PlusAttachmentMenu from "./PlusAttachmentMenu";
 
 export interface Attachment {
   mime_type: string;
@@ -23,8 +25,6 @@ interface OmniComposerProps {
   participants: string[];
   model: string;
   chatMode: ChatMode;
-  useLibrary: boolean;
-  onToggleUseLibrary: () => void;
   sending: boolean;
   availabilityError?: string;
   aiAvailability?: {
@@ -75,6 +75,8 @@ export default function OmniComposer(props: OmniComposerProps) {
   function closeGovernanceMenus() {
     window.dispatchEvent(new Event("genie:close-header-menu"));
     window.dispatchEvent(new Event("genie:close-sidebar-menu"));
+    window.dispatchEvent(new Event("genie:close-composer-popovers"));
+    window.dispatchEvent(new Event("genie:composer-typing"));
   }
   const multi = props.isMultiUserRoom && props.memberCount > 1;
   useEffect(() => setDialect(props.defaultDialect || "en-IN"), [props.defaultDialect]);
@@ -95,18 +97,6 @@ export default function OmniComposer(props: OmniComposerProps) {
       ? `${props.quoteText}\n\n${text.trim()}`.trim()
       : text.trim();
     props.onSubmit(outgoing, false, attachment, props.model, thinkingLevel, props.chatMode === "friends_only" ? "peers" : "agent");
-    props.onActivity?.("idle");
-    setText("");
-    setAttachment(undefined);
-    props.onClearQuote?.();
-  }
-
-  function relayToPeers() {
-    if ((!text.trim() && !attachment) || !multi) return;
-    const outgoing = props.quoteText
-      ? `${props.quoteText}\n\n${text.trim()}`.trim()
-      : text.trim();
-    props.onSubmit(outgoing, false, attachment, props.model, thinkingLevel, "peers");
     props.onActivity?.("idle");
     setText("");
     setAttachment(undefined);
@@ -178,32 +168,18 @@ export default function OmniComposer(props: OmniComposerProps) {
         <PlusAttachmentMenu
           onFile={props.onAttachmentFile}
           onScan={() => setScannerOpen(true)}
-          onRelayToPeers={multi ? relayToPeers : undefined}
         />
-        <button
-          aria-pressed={props.useLibrary}
-          className={`use-library-toggle ${props.useLibrary ? "active" : ""}`}
-          onClick={props.onToggleUseLibrary}
-          style={{
-            padding: "4px 10px",
-            borderRadius: "999px",
-            fontSize: "12px",
-            fontWeight: 500,
-            whiteSpace: "nowrap",
-            border: "1px solid rgba(0,0,0,0.14)",
-            lineHeight: 1.35,
-          }}
-          title="Use your Library for this request only"
-          type="button"
-        >Use Library</button>
-        <EmojiPicker onSelect={(emoji) => setText((value) => `${value}${value ? " " : ""}${emoji}`)} />
-        <textarea
-          ref={inputRef}
+        <ComposerEmojiPicker onSelect={(emoji) => setText((value) => `${value}${value ? " " : ""}${emoji}`)} />
+        <ComposerInputBar
+          inputRef={inputRef}
           value={text}
-          onFocus={closeGovernanceMenus}
-          onChange={(event) => {
-            setText(event.target.value);
-            props.onActivity?.(event.target.value ? "typing" : "idle");
+          onFocus={() => {
+            closeGovernanceMenus();
+          }}
+          onChange={(value) => {
+            closeGovernanceMenus();
+            setText(value);
+            props.onActivity?.(value ? "typing" : "idle");
           }}
           onBlur={() => props.onActivity?.("idle")}
           onPaste={(event) => {
@@ -217,22 +193,28 @@ export default function OmniComposer(props: OmniComposerProps) {
             closeGovernanceMenus();
             if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); }
           }}
-          className="flex-1 min-w-0"
           placeholder={props.chatMode === "friends_only"
             ? "⏸️ AI Standby — chat with your group or mention @Genie..."
             : props.chatMode === "private_ai"
               ? "🔒 Private to you & Genie..."
               : "Message Genie or your room..."}
-          rows={1}
-          maxLength={20_000}
-          aria-label="Message Genie"
         />
         {mentionOptions().length > 0 && (
           <div className="mention-suggestions" role="listbox" aria-label="Mention suggestions">
             {mentionOptions().map((name) => <button type="button" key={name} onClick={() => insertMention(name)}>@{name}</button>)}
           </div>
         )}
-        <VoiceMic isMultiUserRoom={multi} dialect={dialect} currentText={text} recentContext={props.recentContext} disabled={props.sending} transcribeRequest={props.transcribeRequest} wakeWordActive={Boolean(multi && props.wakeWordActive)} onWakeWordPrompt={props.onWakeWordPrompt} onActivity={(activity) => props.onActivity?.(activity)} onTranscription={(value) => setText(value)} onCallTranscript={props.onCallTranscript} onVoiceNoteRecorded={addVoiceNote} onVoiceNoteSend={sendVoiceNote} onTranscribeAudio={props.onTranscribeAudio} sharedAudioStream={props.sharedAudioStream} />
+        {multi ? (
+          <VoiceMic isMultiUserRoom dialect={dialect} currentText={text} recentContext={props.recentContext} disabled={props.sending} transcribeRequest={props.transcribeRequest} wakeWordActive={Boolean(props.wakeWordActive)} onWakeWordPrompt={props.onWakeWordPrompt} onActivity={(activity) => props.onActivity?.(activity)} onTranscription={(value) => setText(value)} onCallTranscript={props.onCallTranscript} onVoiceNoteRecorded={addVoiceNote} onVoiceNoteSend={sendVoiceNote} onTranscribeAudio={props.onTranscribeAudio} sharedAudioStream={props.sharedAudioStream} />
+        ) : (
+          <ContinuousMicDictation
+            currentText={text}
+            dialect={dialect}
+            disabled={props.sending}
+            onActivity={(activity) => props.onActivity?.(activity)}
+            onTranscription={setText}
+          />
+        )}
         {!text.trim() && multi && props.onOpenCall && (
           <button className="icon-button composer-call-button" onClick={props.onOpenCall} type="button" aria-label="Call room members" title="Call room members">
             <Headphones size={17} />

@@ -38,7 +38,7 @@ _GREETING_ALIASES = {"gud mrng": "good morning", "gud morning": "good morning"}
 _FACTUAL_QUERY_RE = re.compile(
     r"\b(?:who|what|when|where|which|how many|how much|tell me about|describe|"
     r"define|current|latest|today|"
-    r"recent|news|president|prime minister|population|capital|founded|"
+    r"recent|news|president|prime minister|chief minister|population|capital|founded|"
     r"born|died|weather|price|version|release)\b",
     re.IGNORECASE,
 )

@@ -475,7 +475,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(payload["source"], "local-fallback")
         self.assertEqual(payload["provider_status"], "unavailable")
         self.assertEqual(payload["tokens_burned"], 0)
-        self.assertIn("Live AI providers are temporarily unavailable", payload["reply"])
+        self.assertIn("I couldn't verify an answer", payload["reply"])
         with closing(main.database()) as connection:
             ledger = connection.execute(
                 "SELECT event_type, amount FROM user_token_ledger WHERE user_sub = ? ORDER BY rowid DESC LIMIT 2",
@@ -504,7 +504,7 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn('"source": "local-fallback"', response.text)
-        self.assertIn("Live AI providers are temporarily unavailable", response.text)
+        self.assertIn("I couldn't verify an answer", response.text)
         self.assertIn("event: done", response.text)
 
     def test_argon_prompt_keeps_dynamic_instruction_and_verified_grounding(self):
@@ -894,7 +894,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["source"], "local-fallback")
         self.assertEqual(response.json()["tokens_burned"], 0)
-        self.assertIn("temporarily unavailable", response.json()["reply"])
+        self.assertIn("I couldn't verify an answer", response.json()["reply"])
 
     def test_gemini_free_pool_routes_chat_only_after_admin_toggle(self):
         main.gemini_pool.set_telemetry_gemini_pool(True)
@@ -1031,6 +1031,49 @@ class BackendApiTests(unittest.TestCase):
         }
         denied = self.client.get(f"/api/rooms/{room_id}/messages")
         self.assertEqual(denied.status_code, 404)
+
+    def test_circle_feeds_and_multiplayer_games_enforce_room_membership(self):
+        room = self.client.post(
+            "/api/rooms",
+            json={"name": "Games and feeds", "invite_code": "f" * 43},
+        )
+        self.assertEqual(room.status_code, 200, room.text)
+        room_id = room.json()["id"]
+
+        feed_sync = self.client.post(
+            "/api/py/feeds/sync",
+            json={
+                "urls": ["https://example.com/feed.xml"],
+                "visibility": f"circle:{room_id}",
+            },
+        )
+        self.assertEqual(feed_sync.status_code, 403, feed_sync.text)
+
+        saved = self.client.post(
+            "/api/py/games/state",
+            json={
+                "game_id": "hand-cricket",
+                "room_id": room_id,
+                "state": {"runs": 4},
+                "expected_version": 0,
+            },
+        )
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["version"], 1)
+
+        main.app.dependency_overrides[main.current_identity] = lambda: {
+            "sub": "not-a-room-member", "name": "Other User", "email": "other@example.com"
+        }
+        game_read = self.client.get(
+            "/api/py/games/state",
+            params={"game_id": "hand-cricket", "room_id": room_id},
+        )
+        feed_read = self.client.get(
+            "/api/py/feeds/circle",
+            params={"room_id": room_id},
+        )
+        self.assertEqual(game_read.status_code, 404)
+        self.assertEqual(feed_read.status_code, 404)
 
     def test_inline_push_reply_is_encrypted_one_time_and_never_calls_ai(self):
         invitation = "p" * 43

@@ -28,6 +28,12 @@ try:
     )
     from .modules.muscle_engine import get_muscle_engine as get_muscle_engine
     from .modules.muscle_engine import fetch_real_world_context, is_factual_query, match_conversational_reflex
+    from .modules.agents.master_coordinator import (
+        answer_immediately,
+        extract_research_entity,
+        run_bounded_specialists,
+    )
+    from .modules.agents.world_knowledge_agent import fetch_live_world_context
 except ImportError:
     from modules.bone_router import (
         is_general_query,
@@ -37,6 +43,12 @@ except ImportError:
     )
     from modules.muscle_engine import get_muscle_engine as get_muscle_engine
     from modules.muscle_engine import fetch_real_world_context, is_factual_query, match_conversational_reflex
+    from modules.agents.master_coordinator import (
+        answer_immediately,
+        extract_research_entity,
+        run_bounded_specialists,
+    )
+    from modules.agents.world_knowledge_agent import fetch_live_world_context
 
 LOGGER = logging.getLogger("genie.master_brain")
 REGISTRY_PATH = Path(__file__).parent / "ai_muscle" / "registry.json"
@@ -526,7 +538,11 @@ async def fetch_live_grounding(query: str) -> str:
         return ""
     if not is_factual_query(safe_query):
         return ""
-    return await fetch_real_world_context(safe_query)
+    grounded_query = extract_research_entity(safe_query)
+    live_context = await fetch_live_world_context(grounded_query)
+    if live_context:
+        return live_context
+    return await fetch_real_world_context(grounded_query)
 
 
 def _strip_internal_agent_prefixes(text: str) -> str:
@@ -570,6 +586,7 @@ class MasterBrain:
         messages: list[dict[str, str]],
         *,
         user_sub: str,
+        user_name: str | None = None,
         model_tier: str = "genie-pro",
         future_self: bool = False,
         room_mode: bool = False,
@@ -577,6 +594,22 @@ class MasterBrain:
         public_cache_allowed: bool = True,
         bypass_local_cache: bool = False,
     ) -> dict[str, Any]:
+        latest = next(
+            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+            "",
+        )
+        instant = answer_immediately(latest, user_name)
+        if instant is not None:
+            if instant.category == "real-world":
+                learn_general_answer(latest, instant.text, category=instant.category)
+            return {
+                "reply": clean_human_response(instant.text),
+                "source": instant.source,
+                "sub_agents": [],
+                "verified": instant.verified,
+                "proposed_memory": None,
+                "tokens_burned": 0,
+            }
         local = self.deterministic_reply(messages)
         if local is not None:
             return {
@@ -588,10 +621,6 @@ class MasterBrain:
                 "tokens_burned": 0,
             }
 
-        latest = next(
-            (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
-            "",
-        )
         master = model_tier == "genie-master" or future_self
         cache_key = (
             _public_query_key(messages, model_tier)
@@ -667,16 +696,29 @@ class MasterBrain:
             }
             for message in messages[-40:]
         ]
+        specialist_results = await run_bounded_specialists(latest, messages)
         now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
             "%A, %d %B %Y, %I:%M %p IST"
         )
+        user_context = (
+            f"The logged-in user's display name is {user_name.strip()}. "
+            "Use it only when directly relevant to their request. "
+            if user_name and user_name.strip()
+            else ""
+        )
         system_context = (
-            f"Current date and time: {now_ist}. "
+            f"Current date and time: {now_ist}. {user_context}"
             + (
                 "This is a shared-room request. Protect each participant's private context."
                 if room_mode else "This is a personal chat request."
             )
         )
+        if specialist_results:
+            system_context += (
+                " Bounded read-only specialist task plan: "
+                + " ".join(specialist_results)
+                + " The master alone synthesizes one response."
+            )
         if is_rca_query(latest):
             system_context += (
                 " Apply root-cause analysis: distinguish the exact root cause from symptoms, "
@@ -738,14 +780,17 @@ class MasterBrain:
                     _PERSONAL_CACHE.popitem(last=False)
         if not verification["verified"]:
             LOGGER.info("Argon verifier flagged unsupported certainty phrasing.")
-        agents = (
-            ["Argon Cognitive Brain", "Research (read-only)", "Synthesis"]
-            if master else ["Argon Cognitive Brain"]
-        )
+        agents = ["Argon Cognitive Brain"]
+        if master:
+            agents.extend(["Research (read-only)", "Synthesis"])
         return {
             "reply": reply,
             "source": pool,
             "sub_agents": agents,
+            "specialist_agents": [
+                result.split(" ", 1)[0]
+                for result in specialist_results
+            ],
             "verified": verification["verified"],
             "verification_notes": verification["notes"],
             "proposed_memory": self.memory_sieve.propose(latest, user_sub),

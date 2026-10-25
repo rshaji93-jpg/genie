@@ -44,7 +44,21 @@ export default function SmartScannerModal({ open, onClose, onPdf }: {
   }
   return (
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section aria-label="Smart scan to PDF" aria-modal="true" className="scanner-modal" onMouseDown={(event) => event.stopPropagation()} role="dialog">
+      <section
+        aria-label="Smart scan to PDF"
+        aria-modal="true"
+        className="scanner-modal"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        style={{
+          background: "#ffffff",
+          borderRadius: 16,
+          padding: 20,
+          boxShadow: "0 20px 50px rgba(0,0,0,0.25)",
+          position: "relative",
+          zIndex: 100,
+        }}
+      >
         <h2>Smart scan to PDF</h2>
         <p>Images are deskewed by the Genie backend and converted without Gemini AI tokens.</p>
         <input accept="image/*" capture="environment" onChange={(event) => void scan(event.target.files?.[0])} ref={input} type="file" />

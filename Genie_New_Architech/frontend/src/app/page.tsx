@@ -436,7 +436,7 @@ export default function Home() {
   const wakeMessageIdsRef = useRef(new Set<string>());
   const voiceRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const voiceSubsRef = useRef<string[]>([]);
-  const sendMessageRef = useRef<(text: string, secret: boolean, attachment?: Attachment, model?: string, thinkingLevel?: string, target?: SubmitTarget, transcriptContext?: ChatMessage, voiceReply?: boolean, voiceDialect?: string, regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] }, requestChatMode?: ChatMode, liveCallResponse?: boolean, useLibraryForRequest?: boolean) => Promise<void>>(async () => {});
+  const sendMessageRef = useRef<(text: string, secret: boolean, attachment?: Attachment, model?: string, thinkingLevel?: string, target?: SubmitTarget, transcriptContext?: ChatMessage, voiceReply?: boolean, voiceDialect?: string, regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] }, requestChatMode?: ChatMode, liveCallResponse?: boolean) => Promise<void>>(async () => {});
   const [queuedAttachment, setQueuedAttachment] = useState<QueuedAttachment | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -451,7 +451,6 @@ export default function Home() {
     prompt_before_screen_share: true,
   });
   const [blockedPrivacyUsers, setBlockedPrivacyUsers] = useState<BlockedPrivacyUser[]>([]);
-  const [useLibrary, setUseLibrary] = useState(false);
   const [momEmailEnabled, setMomEmailEnabled] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteLink, setInviteLink] = useState("");
@@ -554,6 +553,15 @@ export default function Home() {
     discoverable: false,
     profile_completed: false,
   });
+  useEffect(() => {
+    const collapseSidebar = () => {
+      setSidebarCollapsed(true);
+      setMobileSidebarOpen(false);
+    };
+    window.addEventListener("genie:composer-typing", collapseSidebar);
+    return () => window.removeEventListener("genie:composer-typing", collapseSidebar);
+  }, []);
+
   useEffect(() => {
     if (!credential || !identity) return;
     let disposed = false;
@@ -1888,7 +1896,6 @@ export default function Home() {
     regenerate?: { prompt: ChatMessage; responseId: string; visibility: "private" | "group"; context: ChatMessage[] },
     requestChatMode: ChatMode = "ai_room",
     liveCallResponse = false,
-    useLibraryForRequest = false,
   ) {
     if (!identity || !credential) return;
     const content = secret ? `${SECRET_MARKER}${text}` : text;
@@ -2021,14 +2028,14 @@ export default function Home() {
         : [identity.sub],
       chat_mode: requestChatMode,
       thinking_level: thinkingLevel,
+      user_name: profileDetails.display_name || identity.name,
       response_visibility: regenerate?.visibility || (room && requestChatMode === "ai_room" ? "group" : "private"),
       is_secret: false,
       room_id: room?.id,
-      use_library: useLibraryForRequest,
     };
 
     try {
-      const response = await apiRequest("/api/chat", {
+      const response = await apiRequest("/api/py/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
         body: JSON.stringify(requestBody),
@@ -2194,7 +2201,7 @@ export default function Home() {
       }
     } catch {
       try {
-        const fallbackResponse = await apiRequest("/api/chat", {
+        const fallbackResponse = await apiRequest("/api/py/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${credential}` },
           body: JSON.stringify(requestBody),
@@ -2767,9 +2774,7 @@ export default function Home() {
       undefined,
       effectiveChatMode,
       isLiveCallResponse,
-      useLibrary,
     );
-    setUseLibrary(false);
   }
 
   function downloadScannedPdf() {
@@ -3718,6 +3723,8 @@ export default function Home() {
             activeRoom={Boolean(room)}
             isGroupRoom={Boolean(room && room.group_slot !== null && room.group_slot !== undefined)}
             isMultiUserRoom={Boolean(room)}
+            roomId={room?.id}
+            credential={credential}
             mySub={identity.sub}
             chatMode={chatMode}
             onChatModeChange={(mode) => {
@@ -3838,8 +3845,6 @@ export default function Home() {
               onSendQueuedAttachment={() => sendQueuedAttachment("genie-pro")}
               onRemoveQueuedAttachment={() => setQueuedAttachment(null)}
               chatMode={chatMode}
-              useLibrary={useLibrary}
-              onToggleUseLibrary={() => setUseLibrary((enabled) => !enabled)}
               sending={sending}
               aiAvailability={aiAvailability || undefined}
               availabilityError={aiAvailabilityError || undefined}

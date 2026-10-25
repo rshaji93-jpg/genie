@@ -78,6 +78,15 @@ export default function WhatsAppEmojiPicker({
   }, []);
 
   useEffect(() => {
+    const close = () => {
+      setOpen(false);
+      setQuery("");
+    };
+    window.addEventListener("genie:close-composer-popovers", close);
+    return () => window.removeEventListener("genie:close-composer-popovers", close);
+  }, []);
+
+  useEffect(() => {
     if (!open) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {

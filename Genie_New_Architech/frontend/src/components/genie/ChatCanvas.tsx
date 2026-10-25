@@ -6,6 +6,7 @@ import {
   Copy,
   ArrowDown,
   Bookmark,
+  Gamepad2,
   Globe2,
   RefreshCw,
   Sparkles,
@@ -20,6 +21,7 @@ import MessageInfoLedgerModal from "@/modules/messages_arrows/MessageInfoLedgerM
 import TeamsMessageReactions from "@/components/genie/modules/TeamsMessageReactions";
 import PinnableChatHeader from "@/components/genie/modules/PinnableChatHeader";
 import MessageContextActions from "@/components/genie/modules/MessageContextActions";
+import RoomGamesDrawer from "@/components/genie/games/RoomGamesDrawer";
 import IdealGLogo from "@/modules/brand/IdealGLogo";
 import type { ReactNode } from "react";
 import type { ChatMode } from "@/modules/composer/OptionAComposer";
@@ -77,6 +79,8 @@ interface ChatCanvasProps {
   activeRoom: boolean;
   isGroupRoom: boolean;
   isMultiUserRoom?: boolean;
+  roomId?: string;
+  credential?: string;
   mySub: string;
   chatMode?: ChatMode;
   onChatModeChange?: (mode: ChatMode) => void;
@@ -302,6 +306,7 @@ function Tick({ status }: { status: TickStatus }) {
 }
 
 export default function ChatCanvas(props: ChatCanvasProps) {
+  const [gamesOpen, setGamesOpen] = useState(false);
   const [auditMessage, setAuditMessage] = useState<ChatMessage | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [activeActionsId, setActiveActionsId] = useState<string | null>(null);
@@ -431,6 +436,27 @@ export default function ChatCanvas(props: ChatCanvasProps) {
         onTemporaryChange={props.onTemporaryChatChange ?? (() => undefined)}
         temporary={props.temporaryChat ?? false}
       />}
+      {props.isMultiUserRoom && props.roomId && props.credential && (
+        <div className="px-3 pt-2">
+          {gamesOpen ? (
+            <RoomGamesDrawer
+              credential={props.credential}
+              onClose={() => setGamesOpen(false)}
+              playerId={props.mySub}
+              roomId={props.roomId}
+            />
+          ) : (
+            <button
+              aria-label="Play a room game"
+              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+              onClick={() => setGamesOpen(true)}
+              type="button"
+            >
+              <Gamepad2 aria-hidden="true" size={15} /> Play Game
+            </button>
+          )}
+        </div>
+      )}
       <section className="message-scroll" aria-live="polite" onScroll={updateScrollPosition} ref={messageScrollRef}>
         {!props.messages.length && (
           <div className="welcome-card">
